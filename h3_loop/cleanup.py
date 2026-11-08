@@ -27,9 +27,10 @@ class StorageLimitError(ValueError):
     pass
 
 def default_limit_gb():
-    try: value = float(os.environ.get('AIDEN_H3_MEDIA_LIMIT_GB', '5'))
-    except ValueError: value = 5.0
-    return value if math.isfinite(value) and value > 0 else 5.0
+    # 素材占用默认上限 30 GB；仍可用 AIDEN_H3_MEDIA_LIMIT_GB 覆盖（测试/特殊部署）。
+    try: value = float(os.environ.get('AIDEN_H3_MEDIA_LIMIT_GB', '30'))
+    except ValueError: value = 30.0
+    return value if math.isfinite(value) and value > 0 else 30.0
 
 def enforce_limit():
     return os.environ.get('AIDEN_H3_MEDIA_LIMIT_ENFORCE', '1').lower() not in {'0','false','off'}
