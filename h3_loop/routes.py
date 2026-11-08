@@ -9,6 +9,7 @@ import math
 from pathlib import Path
 import re
 import shutil
+import threading
 from urllib.parse import urlsplit
 import uuid
 from collections import OrderedDict
@@ -1126,6 +1127,8 @@ def _probe_media_info(path):
         stream = container.streams.video[0] if container.streams.video else None
         if stream is None:
             raise ValueError("没有视频画面")
+        width = int(stream.width or 0)
+        height = int(stream.height or 0)
         fps = float(stream.average_rate or 24.0) or 24.0
         frames = int(stream.frames or 0)
         duration = 0.0
@@ -1135,7 +1138,8 @@ def _probe_media_info(path):
             frames = round(duration * fps)
         if not duration and frames:
             duration = frames / fps
-    return {"fps": round(fps, 3), "frames": frames, "duration": round(duration, 3)}
+    return {"fps": round(fps, 3), "frames": frames, "duration": round(duration, 3),
+            "width": width, "height": height}
 
 
 @routes.get("/aiden_h3/media_info/{origin}/{file:.*}")
@@ -1323,6 +1327,142 @@ async def media(request):
     # 以内联方式播放：避免被迅雷等下载监控组件当作“下载链接”接管
     response.headers["Content-Disposition"] = f"inline; filename*=UTF-8''{quote(path.name)}"
     response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+_PREVIEW_PROXY_LOCKS: dict[str, threading.Lock] = {}
+_PREVIEW_PROXY_LOCKS_GUARD = threading.Lock()
+_PREVIEW_PROXY_SEMAPHORE = threading.BoundedSemaphore(2)
+_PREVIEW_PROFILES = {"lite": "720p|30|crf26", "high": "native|crf18"}
+
+
+def _preview_profile(quality) -> str:
+    return "high" if str(quality or "").strip().lower() in {"high", "hq", "quality", "原画", "高画质"} else "lite"
+
+
+def _preview_proxy_key(path: Path, profile: str = "lite") -> str:
+    """内容键：源路径 + 大小 + mtime + 档位；源文件或档位变化后代理会自动重新生成。"""
+    tag = _PREVIEW_PROFILES.get(profile, _PREVIEW_PROFILES["lite"])
+    stat = path.stat()
+    return hashlib.sha256(
+        f"{path.resolve()}|{stat.st_size}|{stat.st_mtime_ns}|{tag}".encode("utf-8", "surrogatepass")
+    ).hexdigest()[:24]
+
+
+def _preview_proxy_target(path: Path, profile: str = "lite") -> Path:
+    folder = ROOT / "thumbs"
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder / f"preview_{_preview_proxy_key(path, profile)}.mp4"
+
+
+def _preview_proxy_lock(name: str) -> threading.Lock:
+    with _PREVIEW_PROXY_LOCKS_GUARD:
+        lock = _PREVIEW_PROXY_LOCKS.get(name)
+        if lock is None:
+            lock = _PREVIEW_PROXY_LOCKS[name] = threading.Lock()
+        return lock
+
+
+def _proxy_ready(path: Path) -> bool:
+    """只把已经完整发布的代理当可用；旧版本中断留下的半成品判为无效并重建。"""
+    try:
+        if not path.is_file() or path.stat().st_size < 1024:
+            return False
+        info = _probe_media_info(path)
+        return bool(info.get("width") and info.get("height"))
+    except Exception:
+        return False
+
+
+def _encode_preview_proxy(source: Path, target: Path, profile: str = "lite") -> None:
+    """lite=720p/30fps/crf26（省资源）；high=原分辨率/原帧率/yuv420p/crf18（硬件解码、接近原画）。"""
+    import subprocess
+    from .assets import ffmpeg_executable, has_audio_stream
+    executable = ffmpeg_executable()
+    if not executable:
+        raise ValueError("需要 FFmpeg 来生成预览，请将 FFmpeg 加入 PATH 或安装 imageio-ffmpeg")
+    info = _probe_media_info(source)
+    fps = float(info.get("fps") or 24.0)
+    width = int(info.get("width") or 0)
+    height = int(info.get("height") or 0)
+    if profile == "high":
+        filters = []
+        if max(width, height) > 4096:
+            filters.append("scale=w='min(4096,iw)':h='min(4096,ih)':force_original_aspect_ratio=decrease")
+        filters.append("scale=trunc(iw/2)*2:trunc(ih/2)*2")
+        crf, preset, audio_bitrate = "18", "veryfast", "160k"
+    else:
+        filters = [
+            "scale=w='min(1280,iw)':h='min(1280,ih)':force_original_aspect_ratio=decrease",
+            "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+        ]
+        if fps > 30.5:
+            filters.insert(0, "fps=30")
+        crf, preset, audio_bitrate = "26", "veryfast", "128k"
+    command = [executable, "-v", "error", "-nostdin", "-y", "-i", str(source),
+               "-vf", ",".join(filters),
+               "-c:v", "libx264", "-preset", preset, "-crf", crf, "-pix_fmt", "yuv420p",
+               "-movflags", "+faststart"]
+    command += (["-c:a", "aac", "-b:a", audio_bitrate] if has_audio_stream(source) else ["-an"])
+    # 临时文件后缀是 .part，FFmpeg 无法据此推断容器，显式指定 mp4。
+    command += ["-f", "mp4", str(target)]
+    label = "高画质" if profile == "high" else "轻量"
+    try:
+        subprocess.run(command, check=True, timeout=300, capture_output=True,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except subprocess.CalledProcessError as error:
+        detail = (error.stderr or b"").decode("utf-8", "replace").strip()[-500:]
+        raise ValueError(f"{label}预览生成失败：{detail or error}") from error
+    except subprocess.TimeoutExpired as error:
+        raise ValueError(f"{label}预览生成超时（300 秒）") from error
+
+
+def _preview_proxy_file(path: Path, profile: str = "lite") -> Path:
+    """生成/复用预览 MP4（lite=720p/30fps；high=原分辨率/原帧率、yuv420p）。
+
+    原始文件不动；只发布完整文件：先写同目录 .part，成功后 os.replace 原子改名；
+    同一内容的并发请求由文件级锁串行化，编码并发由信号量限制，避免读到半成品。
+    """
+    profile = _preview_profile(profile)
+    target = _preview_proxy_target(path, profile)
+    if _proxy_ready(target):
+        return target
+    with _preview_proxy_lock(target.name):
+        if _proxy_ready(target):
+            return target
+        if target.exists():
+            target.unlink(missing_ok=True)  # 旧版本/中断留下的半成品，重建。
+        with _PREVIEW_PROXY_SEMAPHORE:
+            temporary = target.with_name(f"{target.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.part")
+            try:
+                _encode_preview_proxy(path, temporary, profile)
+                if not _proxy_ready(temporary):
+                    raise ValueError("预览生成结果无效，请稍后重试")
+                os.replace(temporary, target)
+            finally:
+                temporary.unlink(missing_ok=True)
+    return target
+
+
+@routes.get("/aiden_h3/preview_proxy/{origin}/{file:.*}")
+@guarded
+async def preview_proxy(request):
+    """最终保存节点预览用：?quality=lite（默认，720p/30fps）或 high（原分辨率/原帧率、硬件解码友好）。"""
+    from .assets import VIDEO_EXTS
+    from urllib.parse import quote
+    origin = request.match_info["origin"]
+    name = request.match_info["file"]
+    path = _resolve_media_path(origin, name)
+    if path.suffix.lower() not in VIDEO_EXTS:
+        raise ValueError("预览代理仅用于视频")
+    quality = _preview_profile(request.query.get("quality", "lite"))
+    target = await asyncio.to_thread(_preview_proxy_file, path, quality)
+    response = web.FileResponse(target)
+    response.headers["Content-Type"] = "video/mp4"
+    response.headers["Content-Disposition"] = f"inline; filename*=UTF-8''{quote(target.name)}"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    # 代理文件名含源内容 key，但 URL 不含 key：no-store 避免同路径替换/坏响应被浏览器长期缓存。
     response.headers["Cache-Control"] = "no-store"
     return response
 

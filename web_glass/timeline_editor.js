@@ -466,18 +466,62 @@ export function updateSegmentMaterialOutputs(node, state) {
     }
     const isRefName = name => /^ref_(image|video|video_audio|audio)_\d+$/.test(name || "");
     // Snapshot outbound links by output name BEFORE any remove/reorder.
+    // 同时扫描 graph.links：转换自 widget 的输入（如 CLIPTextEncode 的文本口）在个别前端状态下
+    // 不一定及时出现在 output.links 里，只靠 output.links 快照会在重建时丢线。
     const linkSnap = new Map();
-    for (const [index, output] of (node.outputs || []).entries()) {
-        const specs = [];
+    const snapLink = (link) => {
+        if (!link || String(link.origin_id) !== String(node.id)) return;
+        const output = (node.outputs || [])[link.origin_slot];
+        if (!output) return;
+        const specs = linkSnap.get(output.name) || [];
+        if (specs.some(spec => spec.target_id === link.target_id && spec.target_slot === link.target_slot)) return;
+        specs.push({ target_id: link.target_id, target_slot: link.target_slot, type: link.type });
+        linkSnap.set(output.name, specs);
+    };
+    for (const output of (node.outputs || [])) {
         for (const id of output.links || []) {
-            const link = node.graph?.links?.get?.(id) || node.graph?.links?.[id];
-            if (!link) continue;
-            specs.push({ target_id: link.target_id, target_slot: link.target_slot, type: link.type });
+            snapLink(node.graph?.links?.get?.(id) || node.graph?.links?.[id]);
         }
-        if (specs.length) linkSnap.set(output.name, specs);
+    }
+    const graphLinks = node.graph?.links;
+    if (graphLinks) {
+        const all = typeof graphLinks.values === "function" ? [...graphLinks.values()] : Object.values(graphLinks);
+        for (const link of all) snapLink(link);
     }
     const slots = [...fixed, ...refSlots,
         {name: "mask_frames", label: "遮罩专用", localized_name: "遮罩专用", type: "IMAGE", h3_key: "name:mask_frames"}];
+    // 端口没有变化时只刷新标签/序号，绝不 removeOutput/重排/重连线。
+    // 否则画布点击、轮询等触发重建会误伤「正向提示词→转换后的文本输入」这类连线。
+    const nextSignature = slots.map(slot => `${slot.name}|${slot.type}`).join(",");
+    const currentSignature = (node.outputs || []).map(output => `${output.name}|${output.type}`).join(",");
+    if (currentSignature === nextSignature) {
+        for (const [index, output] of (node.outputs || []).entries()) {
+            const slot = slots[index];
+            if (slot) {
+                output.label = slot.label;
+                output.localized_name = slot.localized_name;
+                output.h3_key = slot.h3_key;
+            }
+            for (const id of output.links || []) {
+                const link = node.graph?.links?.get?.(id) || node.graph?.links?.[id];
+                if (link) link.origin_slot = index;
+            }
+        }
+        const countsWidget = (node.widgets || []).find(widget => widget.name === "ref_counts");
+        if (countsWidget) {
+            const value = JSON.stringify(desired);
+            if (countsWidget.value !== value) {
+                countsWidget.value = value;
+                try { countsWidget.callback?.(value); } catch {}
+            }
+        }
+        const labelSignature = slots.map(slot => `${slot.name}|${slot.label || ""}`).join(",");
+        if (node._adH3LastOutputSignature !== labelSignature) {
+            node._adH3LastOutputSignature = labelSignature;
+            node.setDirtyCanvas?.(true, true);
+        }
+        return;
+    }
     const alias = { "宽度": "width", "高度": "height", width: "width", height: "height" };
     for (const output of (node.outputs || [])) {
         const raw = output.name;
@@ -518,18 +562,46 @@ export function updateSegmentMaterialOutputs(node, state) {
         if (link) link.origin_slot = index;
     }
     // Re-apply any snapped links lost during rebuild (same slot name).
+    // 普通 node.connect 在部分“widget 转换输入”上可能静默失败；失败时用底层 link 对象恢复，确保直连提示词不丢。
+    const restoreRawLink = (index, target, targetSlot, type) => {
+        const input = target?.inputs?.[targetSlot];
+        if (!input || input.link != null) return false;
+        let nextId = 0;
+        try {
+            const links = node.graph?.links;
+            if (links && typeof links.keys === "function") for (const key of links.keys()) nextId = Math.max(nextId, Number(key) || 0);
+            else for (const key of Object.keys(links || {})) nextId = Math.max(nextId, Number(key) || 0);
+        } catch {}
+        nextId += 1;
+        const LinkCtor = globalThis.LiteGraph?.LLink;
+        const link = LinkCtor ? new LinkCtor(nextId, type, node.id, index, target.id, targetSlot) : {};
+        Object.assign(link, {id: nextId, type, origin_id: node.id, origin_slot: index, target_id: target.id, target_slot: targetSlot});
+        try {
+            const links = node.graph?.links;
+            if (links?.set) links.set(nextId, link); else if (links) links[nextId] = link;
+            (node.outputs[index].links ||= []).push(nextId);
+            input.link = nextId;
+            if (node.graph) node.graph.last_link_id = Math.max(Number(node.graph.last_link_id) || 0, nextId);
+            node.setDirtyCanvas?.(true, true);
+            return true;
+        } catch { return false; }
+    };
     for (const [index, output] of ordered.entries()) {
         const specs = linkSnap.get(output.name);
         if (!specs?.length) continue;
         for (const spec of specs) {
-            const already = (output.links || []).some(id => {
-                const link = node.graph?.links?.get?.(id) || node.graph?.links?.[id];
-                return link && link.target_id === spec.target_id && link.target_slot === spec.target_slot;
-            });
-            if (already) continue;
             const target = node.graph?.getNodeById?.(spec.target_id);
             if (!target) continue;
-            try { node.connect(index, target, spec.target_slot); } catch {}
+            const input = target.inputs?.[spec.target_slot];
+            if (input?.link != null) {
+                const current = node.graph?.links?.get?.(input.link) || node.graph?.links?.[input.link];
+                if (current && String(current.origin_id) === String(node.id)) continue;
+            }
+            let connected = false;
+            try { connected = !!node.connect(index, target, spec.target_slot); } catch {}
+            if (!connected || target.inputs?.[spec.target_slot]?.link == null) {
+                restoreRawLink(index, target, spec.target_slot, output.type || spec.type || "*");
+            }
         }
     }
     // 端口数必须与 ref_counts 同步：否则排队瞬间后端仍按旧数量切片，连线会拿到错位的数据。

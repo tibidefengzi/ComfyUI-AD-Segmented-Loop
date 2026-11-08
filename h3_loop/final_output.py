@@ -2,12 +2,41 @@
 from __future__ import annotations
 import json
 import math
+import re
 import uuid
 from fractions import Fraction
 from pathlib import Path, PurePosixPath
 
 from . import assets
 from .storage import ROOT
+
+# 母版画质下拉：4:4:4 近无损默认；不提供 CRF0（体积过大）。
+QUALITY_PRESETS = {
+    "高保真 4:4:4 CRF12（约29MB/5秒）": ("444", 12),
+    "近无损 4:4:4 CRF14（约21MB/5秒，推荐）": ("444", 14),
+    "均衡 4:4:4 CRF16（约16MB/5秒）": ("444", 16),
+    "小文件 4:2:0 CRF19（约11MB/5秒，分享）": ("420", 19),
+}
+DEFAULT_QUALITY = "近无损 4:4:4 CRF14（约21MB/5秒，推荐）"
+
+
+def quality_encoding(quality, pixel_format="yuv444p", crf=14):
+    """把母版画质下拉（或旧版像素格式/CRF 字段）换算为 (chroma, crf)。"""
+    label = str(quality or "").strip()
+    if label in QUALITY_PRESETS:
+        return QUALITY_PRESETS[label]
+    match = re.search(r"CRF\s*(\d+)", label, re.IGNORECASE)
+    chroma = "420" if "4:2:0" in label else "444" if "4:4:4" in label else None
+    if match:
+        return (chroma or ("420" if str(pixel_format or "").lower() == "yuv420p" else "444"),
+                max(10, min(51, int(match.group(1)))))
+    # 旧工作流兼容回退：没有母版画质字段时按像素格式/CRF；CRF 下限 10（不提供 0/无损）。
+    chroma = "420" if str(pixel_format or "").lower() == "yuv420p" else "444"
+    try:
+        value = int(crf)
+    except (TypeError, ValueError):
+        value = 14
+    return chroma, max(10, min(51, value))
 
 
 def parse_record(value):
@@ -44,8 +73,21 @@ def describe_record(value):
             if kind == "video":
                 stream = container.streams.video[0]
                 rate = stream.average_rate or stream.base_rate
+                duration = 0.0
+                if stream.duration is not None and stream.time_base is not None:
+                    duration = float(stream.duration * stream.time_base)
+                if duration <= 0 and stream.frames and rate:
+                    duration = float(stream.frames) / float(rate)
+                try:
+                    bitrate = int(stream.bit_rate or 0)
+                except (TypeError, ValueError):
+                    bitrate = 0
+                if bitrate <= 0 and duration > 0:
+                    # 容器没写码率时按文件大小/时长估算；前端据此判断是否走轻量预览。
+                    bitrate = int(stat.st_size * 8 / duration)
                 result.update(width=stream.width,height=stream.height,fps=float(rate) if rate else 0,
-                              codec=stream.codec_context.name,pix_fmt=stream.codec_context.pix_fmt)
+                              codec=stream.codec_context.name,pix_fmt=stream.codec_context.pix_fmt,
+                              duration=round(duration, 3), bitrate=bitrate)
             if container.streams.audio:
                 audio = container.streams.audio[0]
                 result.update(sample_rate=audio.codec_context.sample_rate,channels=audio.codec_context.channels,
@@ -127,7 +169,7 @@ def publish_final(path, kind, source, directory="", prefix="最终", suffix=""):
     record = {"origin":"media","file":path.name,"kind":kind,"label":label+suffix,
               "archive":str(target),"source_record":source,"final_id":uuid.uuid4().hex}
     if kind in {"video","audio"}:
-        record.update({k:v for k,v in describe_record(record).items() if k in {"fps","width","height","codec","pix_fmt","sample_rate","channels"}})
+        record.update({k:v for k,v in describe_record(record).items() if k in {"fps","width","height","codec","pix_fmt","sample_rate","channels","duration","bitrate"}})
     return record
 
 
@@ -161,15 +203,23 @@ def manual_final_source(source_record, prompt, unique_id):
 
 class FinalSave:
     CATEGORY = "AD-Segmented-Loop"
-    DESCRIPTION = "仅通过加工所选或继续剩余执行；普通整图运行跳过。按图片/音频/视频保存，不应用H3帧率、尺寸和帧数限制。"
+    DESCRIPTION = "仅通过加工所选或继续剩余执行；普通整图运行跳过。视频组件默认按「近无损 4:4:4 / CRF14」保存母版（约21MB/5秒，保留色度）；不提供 CRF0；VideoFromFile 原样保存。"
     @classmethod
     def INPUT_TYPES(cls):
+        # 注意：source_record 必须保持第 4 个 widget。旧工作流 widgets_values 是
+        # ["保存目录","文件名前缀","帧序列帧率","source_record","<DOM>"]，新增参数放在
+        # source_record 之后才不会把旧值错位；视频格式用 STRING 以兼容旧 DOM 控件留下的空串。
+        # 前端会把 视频格式/像素格式/CRF 隐藏，只显示「母版画质」下拉；这三个旧字段留作兼容回退。
         return {"required": {
             "保存目录":("STRING",{"default":""}),
             "文件名前缀":("STRING",{"default":"最终"}),
             "帧序列帧率":("FLOAT",{"default":0.0,"min":0.0,"step":0.001}),
-            "source_record":("STRING",{"default":"{}"})},
-            "optional":{"media":("*",{"lazy":True}),"audio":("AUDIO",{"lazy":True})},
+            "source_record":("STRING",{"default":"{}"}),
+            "视频格式":("STRING",{"default":"h264-mp4"}),
+            "像素格式":(["yuv444p","yuv420p"],{"default":"yuv444p"}),
+            "CRF":("INT",{"default":14,"min":10,"max":51,"step":1}),
+            "母版画质":(list(QUALITY_PRESETS),{"default":DEFAULT_QUALITY})},
+            "optional":{"media":("*",{"lazy":True})},
             "hidden":{"prompt":"PROMPT","unique_id":"UNIQUE_ID"}}
     RETURN_TYPES = ("*",)
     RETURN_NAMES = ("最终媒体",)
@@ -178,9 +228,11 @@ class FinalSave:
     def check_lazy_status(self, source_record="{}", prompt=None, unique_id=None, **kwargs):
         if manual_final_source(source_record, prompt, unique_id) is None:
             return []
-        return [name for name in ("media", "audio") if name in kwargs and kwargs[name] is None]
+        return [name for name in ("media",) if name in kwargs and kwargs[name] is None]
 
-    def save(self, 保存目录="", 文件名前缀="最终", 帧序列帧率=0.0, source_record="{}", media=None, audio=None, prompt=None, unique_id=None):
+    def save(self, 保存目录="", 文件名前缀="最终", 帧序列帧率=0.0, source_record="{}",
+             视频格式="h264-mp4", 像素格式="yuv444p", CRF=14, 母版画质=DEFAULT_QUALITY,
+             media=None, prompt=None, unique_id=None):
         source = manual_final_source(source_record, prompt, unique_id)
         if source is None:
             from comfy_execution.graph import ExecutionBlocker
@@ -192,7 +244,7 @@ class FinalSave:
         records = []
         identifier = "final_"+uuid.uuid4().hex
         if hasattr(media,"save_to"):
-            # VideoFromFile原样保存；组件视频保持其帧率和实际画幅。
+            # VideoFromFile原样保存；组件视频按「母版画质」重新编码（默认 4:4:4 / CRF14 近无损）。
             extension = ".mp4"
             from comfy_api.input_impl.video_types import VideoFromFile
             if isinstance(media,VideoFromFile):
@@ -203,8 +255,8 @@ class FinalSave:
             width,height = media.get_dimensions()
             kwargs = {}
             if not isinstance(media,VideoFromFile):
-                # 已经是帧组件，采用无损编码，奇数画幅用444，绝不改尺寸凑倍数。
-                kwargs.update(crf=0,chroma_subsampling="444")
+                chroma, quality_crf = quality_encoding(母版画质, 像素格式, CRF)
+                kwargs.update(crf=quality_crf, chroma_subsampling=chroma)
             media.save_to(str(path),**kwargs)
             records.append(publish_final(path,"video",source,保存目录,文件名前缀))
         elif isinstance(media,dict) and "waveform" in media:
@@ -234,8 +286,10 @@ class FinalSave:
                 fps = float(帧序列帧率 or source.get("fps") or 0)
                 if not math.isfinite(fps) or fps <= 0:
                     raise ValueError("视频帧序列需要有效帧率；请连接视频合成节点或填写帧序列帧率")
-                video = VideoFromComponents(VideoComponents(images=images,audio=audio,frame_rate=Fraction(str(fps))))
-                return self.save(保存目录,文件名前缀,帧序列帧率,source_record,video,prompt=prompt,unique_id=unique_id)
+                video = VideoFromComponents(VideoComponents(images=images,audio=None,frame_rate=Fraction(str(fps))))
+                return self.save(保存目录=保存目录,文件名前缀=文件名前缀,帧序列帧率=帧序列帧率,
+                                 source_record=source_record,视频格式=视频格式,像素格式=像素格式,CRF=CRF,
+                                 母版画质=母版画质,media=video,prompt=prompt,unique_id=unique_id)
             for index,frame in enumerate(images):
                 array = (frame.detach().cpu().float().numpy()*255).clip(0,255).astype(np.uint8)
                 if array.shape[-1] == 1: array=array[...,0]
@@ -286,8 +340,9 @@ def merge_final(records, directory="", prefix="最终合并", normalize=False):
             if kind=='audio': arguments=['-v','error','-nostdin','-n','-f','concat','-safe','0','-i',str(list_path),'-vn','-c:a','pcm_f32le']
             result=assets._exec(arguments+[str(target)])
             if result.returncode and kind=='video' and target.suffix=='.mp4':
-                # 少数源编码/奇数尺寸无法装进 MP4：回退 MKV，保证合并成功。
-                target=target.with_suffix('.mkv'); result=assets._exec(arguments+[str(target)])
+                # 少数源编码/奇数尺寸无法装进 MP4：回退 MKV，保证合并成功（清掉失败的半成品）。
+                failed=target; target=target.with_suffix('.mkv'); failed.unlink(missing_ok=True)
+                result=assets._exec(arguments+[str(target)])
             if result.returncode: raise ValueError('最终合并失败：'+result.stderr.decode('utf-8','replace')[-600:])
         finally:
             list_path.unlink(missing_ok=True)  # 仅删除本函数刚创建的可重建concat清单。
@@ -319,6 +374,7 @@ def merge_final(records, directory="", prefix="最终合并", normalize=False):
             arguments+=['-map','[aout]','-c:a','pcm_f32le'] if kind=='audio' else ['-map','[aout]','-c:a','aac','-b:a','192k']
         result=assets._exec(arguments+[str(target)])
         if result.returncode and kind=='video' and target.suffix=='.mp4':
-            target=target.with_suffix('.mkv'); result=assets._exec(arguments+[str(target)])
+            failed=target; target=target.with_suffix('.mkv'); failed.unlink(missing_ok=True)
+            result=assets._exec(arguments+[str(target)])
         if result.returncode: raise ValueError('最终合并失败：'+result.stderr.decode('utf-8','replace')[-600:])
     return publish_final(target,kind,{'label':'合并成果','kind':kind,'items':sources},directory,prefix)

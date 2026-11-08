@@ -185,8 +185,10 @@ def _allowed_relative(relative: str) -> bool:
         return bool(re.fullmatch(r'muted_[0-9a-f]{24}\.(mp4|mkv|mov|webm|avi|m4v)', name)
                     or re.fullmatch(r'[A-Za-z0-9_.-]+_[0-9]+\.wav', name))
     if parent == 'thumbs':
-        # 卡片缩略图缓存：只允许按内容摘要命名的 webp。
-        return bool(re.fullmatch(r'[0-9a-f]{64}\.webp', name))
+        # 卡片缩略图缓存：webp；轻量/高画质预览代理 mp4；以及原子发布临时半成品。
+        return bool(re.fullmatch(r'[0-9a-f]{64}\.webp', name)
+                    or re.fullmatch(r'preview_[0-9a-f]{24}\.mp4', name)
+                    or re.fullmatch(r'preview_[0-9a-f]{24}\.mp4\.\d+\.[0-9a-f]{8}\.part', name))
     if parent == 'detect-temp':
         # 智能切分的临时 wav；正常结束会主动删除，崩溃残留按可重建缓存清理。
         return bool(re.fullmatch(r'[A-Za-z0-9_.-]+\.wav', name))
