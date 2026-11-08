@@ -1,9 +1,9 @@
-"""分段循环：围绕独立 ComfyUI 节点的素材与预览控制。"""
+﻿"""分段循环：围绕独立 ComfyUI 节点的素材与预览控制。"""
 from .h3_loop.nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
 from .h3_loop import routes  # noqa: F401
 from .h3_loop import final_routes  # noqa: F401
 
-__version__ = "0.5.13"
+__version__ = "0.5.14"
 
 WEB_DIRECTORY = "./web_glass"
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "WEB_DIRECTORY"]

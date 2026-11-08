@@ -1858,13 +1858,29 @@ app.registerExtension({
             let state;
             try { const value = savedTimelineValue(queue); state = typeof value === "string" ? JSON.parse(value) : value; } catch {}
             if (!Array.isArray(state?.sources)) continue;
-            const counts = segmentRefCounts(state);
+            const previous = info.outputs || [];
+            const byName = new Map(previous.map(output => [output.name, output]));
+            // 用户 2026-11-08 确认：参考口只要已经连了线就保留，即使素材删空也不隐藏/删除。
+            // 载入时按“实际素材数 + 已连接参考口最大序号”生成端口，避免保存了空素材+连线的工作流重开后线丢失。
+            const counts = {...segmentRefCounts(state)};
+            const refCaps = {image: 9, video: 3, video_audio: 3, audio: 3};
+            const linkedRefNames = new Set();
+            for (const output of previous) if (/^ref_/.test(output.name || "") && (output.links || []).length) linkedRefNames.add(output.name);
+            for (const link of links) {
+                if (String(field(link,"origin_id",1)) !== String(info.id)) continue;
+                const name = previous[field(link,"origin_slot",2)]?.name;
+                if (/^ref_/.test(name || "")) linkedRefNames.add(name);
+            }
+            for (const name of linkedRefNames) {
+                const match = String(name).match(/^ref_(image|video_audio|video|audio)_(\d+)$/);
+                if (!match) continue;
+                const kind = match[1];
+                counts[kind] = Math.min(refCaps[kind] ?? 3, Math.max(counts[kind] || 0, Number(match[2]) + 1));
+            }
             const desired = [...AD_SEG_FIXED];
             for (const [kind, prefix] of [["image","ref_image"],["video","ref_video"],["video_audio","ref_video_audio"],["audio","ref_audio"]])
                 for (let index=0; index<counts[kind]; index++) desired.push(`${prefix}_${index}`);
             desired.push(...AD_SEG_EXTRA);
-            const previous = info.outputs || [];
-            const byName = new Map(previous.map(output => [output.name, output]));
             for (const link of links) {
                 if (String(field(link,"origin_id",1)) !== String(info.id)) continue;
                 const name = previous[field(link,"origin_slot",2)]?.name;

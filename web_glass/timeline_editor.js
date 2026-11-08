@@ -355,6 +355,38 @@ export function updateMaterialOutputs(node, state) {
 const SEGMENT_FIXED_KEYS = ["context", "index", "start_frame", "generation_frames", "fps", "width", "height", "positive_prompt", "negative_prompt", "round_image", "round_audio", "round_video", "source_video", "original_audio"];
 
 // 图片按底部横条顺序；音视频按有片段的轨道数，未上轨素材不占参考口。
+// 参考输出口：只要已经连了线就保留端口，不因素材减少而隐藏/删除（用户 2026-11-08 确认）。
+// 端口数量 = max(实际素材数, 已连接口最大序号+1, 本次重建的临时钉住数量)；未连接的空口仍按原规则隐藏。
+const REF_OUTPUT_GROUPS = { ref_image: "image", ref_video: "video", ref_video_audio: "video_audio", ref_audio: "audio" };
+function refOutputInfo(name) {
+    const match = String(name || "").match(/^(ref_image|ref_video_audio|ref_video|ref_audio)_(\d+)$/);
+    return match ? { group: REF_OUTPUT_GROUPS[match[1]], index: Number(match[2]) } : null;
+}
+function linkedRefCounts(outputs, savedOutputs = null) {
+    const counts = { image: 0, video: 0, video_audio: 0, audio: 0 };
+    const scan = list => {
+        for (const output of list || []) {
+            const info = refOutputInfo(output?.name);
+            if (!info || !(output.links || []).length) continue;
+            counts[info.group] = Math.max(counts[info.group] || 0, info.index + 1);
+        }
+    };
+    scan(outputs);
+    scan(savedOutputs);
+    return counts;
+}
+// 工作流载入期：连线还没恢复/输出口 links 还没挂上时，先保留现有参考口，
+// 等 _adH3GraphReady 后再按真实连线清理未连接的空口，避免载入瞬间把用户线删掉。
+function existingRefCounts(outputs) {
+    const counts = { image: 0, video: 0, video_audio: 0, audio: 0 };
+    for (const output of outputs || []) {
+        const info = refOutputInfo(output?.name);
+        if (!info) continue;
+        counts[info.group] = Math.max(counts[info.group] || 0, info.index + 1);
+    }
+    return counts;
+}
+
 export function segmentRefCounts(state) {
     const sources = state?.sources || [];
     // 参考图按加载位置固定编号：禁止输出也占原槽位，仅该口输出空。
@@ -403,13 +435,19 @@ export function updateSegmentMaterialOutputs(node, state) {
     }));
     const sources = state?.sources || [];
     const counts = segmentRefCounts(state);
-    // 端口数量只按当前实际素材/轨道生成：删除音轨或片段后，多余的参考口（含旧连线）一起去掉，
-    // 避免只有一条音轨/一条视频轨却还残留「参考音频2/3」「参考视频2/3」这种空端口。
+    // 端口数量：实际素材 + 已经连线的参考口。
+    // 已连接的参考口即使素材被删空也保留（输出 None），保证用户的线永远固定在原端口；
+    // 没有连线的空口仍按原规则隐藏。删除片段只让轨道内容前移，从不搬动已连好的线。
+    // 工作流载入期（_adH3GraphReady 之前）连线尚未恢复，先保留现有参考口和保存档里的连线，
+    // 等载入完成后再按真实连线清理，避免打开工作流时把用户连线删掉。
+    const loading = !!(node._adH3Configured && node._adH3GraphReady !== true);
+    const linked = linkedRefCounts(node.outputs, loading ? node._adH3SavedSchema : null);
+    const existingRefs = loading ? existingRefCounts(node.outputs) : null;
     const desired = {
-        image: counts.image,
-        video: counts.video,
-        video_audio: counts.video_audio,
-        audio: counts.audio,
+        image: Math.min(PORT_LIMITS.image, Math.max(counts.image, linked.image || 0, existingRefs?.image || 0)),
+        video: Math.min(PORT_LIMITS.video, Math.max(counts.video, linked.video || 0, existingRefs?.video || 0)),
+        video_audio: Math.min(PORT_LIMITS.video, Math.max(counts.video_audio, linked.video_audio || 0, existingRefs?.video_audio || 0)),
+        audio: Math.min(PORT_LIMITS.audio, Math.max(counts.audio, linked.audio || 0, existingRefs?.audio || 0)),
     };
     const refSlots = [];
     for (const [kind, prefix, type] of [
@@ -554,6 +592,7 @@ export function mountTimelineEditor(node) {
     const undoStack = [], redoStack = [];
     node._adH3AssignTask=(session,task)=>{T.state.session_id=session;T.state.workflow_task_id=task;};
     const pushUndo = (groupMove=false) => { const state=JSON.stringify(T.state);undoStack.push(groupMove?{state,groupMove:true}:state); if (undoStack.length > 20) undoStack.shift(); redoStack.length = 0; syncHistory(); };
+
     // Layout v3：用户拖拽优先；绝不改 parent 样式（改了会和节点框错位）
     let applyLayoutHeight = () => {};
     let layoutTimer = 0;
@@ -572,6 +611,7 @@ export function mountTimelineEditor(node) {
         }, delay);
     };
     // 撤销/重做后必须同步动态参考口与 ref_counts：outputs 传 true（afterEdit 内调用 updateMaterialOutputs → 刷新当前段参考口）。
+    // 连线固定挂在端口上，撤销/重做只恢复轨道内容，不搬任何已连接的线。
     const restoreHistory = (from,to) => {const saved=from.pop(),groupMove=typeof saved==="object"&&saved.groupMove,state=JSON.stringify(T.state);to.push(groupMove?{state,groupMove:true}:state);T.state=JSON.parse(groupMove?saved.state:saved);afterEdit(true,true,!!groupMove);};
     const doUndo = () => { if (!undoStack.length) return; restoreHistory(undoStack,redoStack);hint("已撤销上一步操作。"); };
     const doRedo = () => { if (!redoStack.length) return; restoreHistory(redoStack,undoStack);hint("已重做上一步操作。"); };
@@ -1606,9 +1646,10 @@ export function mountTimelineEditor(node) {
         if (needed + 2 > h) view.scrollTop = Math.max(0, needed + 2 - h);
     }
 
-    function compactTracks() {
-        // 压紧有片段的轨并去掉中间空壳；再补齐到 MAX_LANES 条空轨，避免后端校验「轨道数不足」
-        for (const key of ["video_tracks", "audio_tracks"]) {
+    function compactTracks(keys = ["video_tracks", "audio_tracks"]) {
+        // 压紧有片段的轨并去掉中间空壳；再补齐到 MAX_LANES 条空轨，避免后端校验「轨道数不足」。
+        // 传入 keys 时只压紧指定类型：删除片段只整理被删的那一类轨道，另一类保持原槽位。
+        for (const key of keys) {
             const flags = (T.state.muted_tracks || {})[key] || [];
             const active = (T.state[key] || []).map((lane, index) => ({lane, muted: !!flags[index], disabled: trackDisabled(T.state, key, index)}))
                 .filter(item => item.lane?.length).slice(0, MAX_LANES);
@@ -3232,14 +3273,22 @@ export function mountTimelineEditor(node) {
         hint("已在播放头处切断片段。");
     }
     function removeSelected() {
-        const ids = new Set(requireSelectedClips().map(clip=>clip.id));
+        const clips = requireSelectedClips();
+        const ids = new Set(clips.map(clip=>clip.id));
         if (!ids.size) return;
+        // 只整理被删片段所在的类型（视频或音频）；另一类轨道保持原槽位，避免误改无关轨道。
+        const compactKinds = ["video_tracks", "audio_tracks"].filter(key =>
+            (T.state[key] || []).some(lane => lane.some(clip => ids.has(clip.id))));
         pushUndo();
         for (const key of ["video_tracks", "audio_tracks"])
             T.state[key] = T.state[key].map(lane => lane.filter(clip => !ids.has(clip.id)));
         T.selected.clear();
+        // 轨道自动前移；已经连好的参考线固定挂在原端口上，不抓取、不断开、不迁移。
+        // 端口重建时 updateSegmentMaterialOutputs 会保留所有已连接的参考口，线不动；
+        // 端口内容按“当前第几条轨道”变化（删视频1后参考视频1自动输出新的视频1）。
+        compactTracks(compactKinds);
         afterEdit();
-        hint("已删除选中片段；素材文件保留。");
+        hint("已删除选中片段；同类轨道已前移，原有参考连线保持不动。");
     }
     async function mergeSelected() {
         if (!hasAvClips()) {
