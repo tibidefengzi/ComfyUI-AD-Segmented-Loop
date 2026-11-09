@@ -42,11 +42,22 @@ def prepare_final(prompt,final_id,records):
     if len({r['kind'] for r in resolved})!=1:
         raise ValueError('同一次加工请选择同一分类的图片、音频或视频')
     source_id=next(iter(previews))
-    compiled={identifier:copy.deepcopy(prompt[identifier]) for identifier in visited}
-    compiled[source_id]={'class_type':'AD_FinalSelectedMedia','inputs':{'record':json.dumps(resolved[0],ensure_ascii=False)}}
+    # 内部只读节点改用独立 id：不再复用分段预览的节点编号，画布不会把预览节点标成“运行中”。
+    compiled={identifier:copy.deepcopy(prompt[identifier]) for identifier in visited if identifier!=source_id}
+    stub_id=f"__ad_final_selected__{source_id}"
+    while stub_id in compiled: stub_id+="_"
+    compiled[stub_id]={'class_type':'AD_FinalSelectedMedia','inputs':{'record':json.dumps(resolved[0],ensure_ascii=False)}}
+    for node in compiled.values():
+        for key,value in list((node.get('inputs') or {}).items()):
+            if isinstance(value,list) and len(value)==2 and isinstance(value[1],int) and str(value[0])==source_id:
+                node['inputs'][key]=[stub_id,value[1]]
     compiled[final_id]['inputs']['source_record']=json.dumps(resolved[0],ensure_ascii=False)
+    # 追加隐藏输出节点：只有加工所选/继续剩余的编译副本才带它，普通排队不会执行最终保存分支。
+    sink_id=f"__ad_final_sink__{final_id}"
+    while sink_id in compiled: sink_id+="_"
+    compiled[sink_id]={'class_type':'AD_FinalSink','inputs':{'value':[final_id,0]}}
     # 原预览的INPUT/上下文与H3祖先不进入此图；原始工作流完全不回写。
-    return {'prompt':compiled,'source_id':source_id,'final_id':final_id,'records':resolved}
+    return {'prompt':compiled,'source_id':stub_id,'final_id':final_id,'records':resolved}
 
 
 routes=PromptServer.instance.routes

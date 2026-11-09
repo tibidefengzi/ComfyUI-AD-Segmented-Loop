@@ -81,6 +81,21 @@ export function mountFinalSave(node) {
     if (getWidget(node,"帧序列帧率")) getWidget(node,"帧序列帧率").options.tooltip="仅用于直接输入的视频帧序列；0使用所选视频原帧率。VIDEO输入始终采用自身帧率。";
     const widgetTip=(name,tip)=>{const widget=getWidget(node,name);if(widget)widget.options.tooltip=tip;};
     widgetTip("母版画质","母版文件编码：默认 4:4:4 / CRF14（约21MB/5秒，保留色度）；CRF12 更保真，CRF16 更小；小文件档为 4:2:0/CRF19，仅分享用。不提供 CRF0。");
+    // 旧工作流没有保存「母版画质」的值时，下拉可能显示默认档但实际提交空串，ComfyUI 校验会失败。
+    // 载入/重载工作流时把它归位到有效档位，并从下拉里去掉后端兼容用的空串选项。
+    const DEFAULT_QUALITY_LABEL="近无损 4:4:4 CRF14（约21MB/5秒，推荐）";
+    const normalizeQualityWidget=()=>{
+        const widget=getWidget(node,"母版画质");
+        if(!widget)return;
+        const values=Array.isArray(widget.options?.values)?widget.options.values.filter(value=>typeof value==="string"&&value):[];
+        if(!values.length)return;
+        widget.options.values=values;
+        if(!values.includes(widget.value)){
+            widget.value=values.includes(DEFAULT_QUALITY_LABEL)?DEFAULT_QUALITY_LABEL:values[0];
+            node.setDirtyCanvas?.(true,false);
+        }
+    };
+    normalizeQualityWidget();
     // 旧字段（视频格式/像素格式/CRF）保留用于旧工作流兼容，但隐藏起来，只显示「母版画质」下拉。
     for (const name of ["视频格式","像素格式","CRF"]) {
         const widget=getWidget(node,name);
@@ -531,7 +546,7 @@ export function mountFinalSave(node) {
     const scheduleLayout=()=>{if(resizeFrame)return;resizeFrame=requestAnimationFrame(()=>{resizeFrame=0;if(disposed||!root.isConnected)return;const height=node.computeSize?.()[1];if(height&&Math.abs(node.size[1]-height)>2)node.setSize([node.size[0],height]);node.setDirtyCanvas?.(true,true);});};
     const observer=new ResizeObserver(scheduleLayout);observer.observe(root);
     const executed=node.onExecuted;node.onExecuted=function(message){const result=executed?.apply(this,arguments);const incoming=(message?.ad_final||[]).filter(r=>!r.source_record?.final_task_id||!this.properties.ad_task_id||r.source_record.final_task_id===this.properties.ad_task_id);for(const record of incoming)if(!records.some(item=>key(item)===key(record)))records.push(record);if(incoming.length){kind=incoming[0].kind;followPage(incoming[0]);render();show(incoming[0]);}return result;};
-    const configured=node.onConfigure;node.onConfigure=function(){const result=configured?.apply(this,arguments);dropLegacyAudioInput();busy=false;preparing=false;finalCards.clear();pages.clear();records=this.properties.ad_final_records||[];batch=this.properties.ad_final_batch||null;kind=this.properties.ad_final_tab||'video';previewQuality=this.properties.ad_final_quality==="high"?"high":"lite";selected.clear();renderedStateKey=JSON.stringify([kind,records.map(key),batch?.cursor??-1,batch?.status||""]);render();updateQualityButton();return result;};
+    const configured=node.onConfigure;node.onConfigure=function(){const result=configured?.apply(this,arguments);dropLegacyAudioInput();busy=false;preparing=false;finalCards.clear();pages.clear();records=this.properties.ad_final_records||[];batch=this.properties.ad_final_batch||null;kind=this.properties.ad_final_tab||'video';previewQuality=this.properties.ad_final_quality==="high"?"high":"lite";selected.clear();renderedStateKey=JSON.stringify([kind,records.map(key),batch?.cursor??-1,batch?.status||""]);render();updateQualityButton();normalizeQualityWidget();return result;};
     const removed=node.onRemoved;node.onRemoved=function(){disposed=true;stopped=true;busy=false;preparing=false;observer.disconnect();if(resizeFrame)cancelAnimationFrame(resizeFrame);try{}catch{}try{if(abOpen)abResetView();}catch{}for(const media of [video,audio]){media.pause();if(media.hasAttribute("src")){media.removeAttribute("src");media.load();}}for(const image of root.querySelectorAll("img"))image.removeAttribute("src");finalCards.clear();root.remove();delete node._adFinal;return removed?.apply(this,arguments);};
     node._adFinal={root,run,selection:()=>[...selected.values()],get batch(){return batch;},resetTask(){if(abOpen)abResetView();records=[];batch=null;selected.clear();finalCards.clear();pages.clear();active=null;video.pause();audio.pause();for(const media of [video,audio,image])media.hidden=true;$("[data-idle]").hidden=false;render();}};
     render();updateQualityButton();if(batch&&batch.status!=="completed")say('上次加工记录已保留，可点击继续剩余。');

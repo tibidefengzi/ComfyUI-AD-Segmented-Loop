@@ -3,7 +3,7 @@
 // - 旧工作流：加载时把三个外部 H3Relay 节点迁移掉，保留连线/参数；之后同样走内部注入。
 // - 选择器 0 = 关闭，5/22/39 = 开启；C 直接由选择器决定。
 
-export const INTERNAL_TYPES = ["ADH3InternalBridge", "ADH3InternalSave", "ADH3InternalTrim"];
+export const INTERNAL_TYPES = ["ADH3InternalBridge", "ADH3InternalSave", "ADH3InternalTrim", "AD_FinalSink"];
 export const RELAY_LABELS = {
     0: "0 · 关闭",
     5: "5 · 上下文5帧",

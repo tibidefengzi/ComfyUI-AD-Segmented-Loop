@@ -2283,7 +2283,7 @@ class AidenH3RoundBlocked:
         raise ValueError("本轮排队被阻止：" + (str(reason or "").strip() or "未知原因"))
 
 
-from .final_output import FinalSave, SelectedResult
+from .final_output import FinalSave, FinalSink, SelectedResult
 
 # 最小内嵌潜桥（B 最小 vendor）：只使用上游 MIT 许可的桥接/存盘/裁头三块运行时，
 # 其余上游节点不注册、不暴露。上游许可证见 h3_loop/_relay_vendor/LICENSE-MIT.txt。
@@ -2298,6 +2298,7 @@ else:
 NODE_CLASS_MAPPINGS = {
     "AD_FinalSave": FinalSave,
     "AD_FinalSelectedMedia": SelectedResult,
+    "AD_FinalSink": FinalSink,
     "AidenH3EditMask": AidenH3EditMask,
     "AidenH3AudioQueue": AidenH3AudioQueue,
     "AidenH3Segment": AidenH3Segment,
@@ -2307,6 +2308,7 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "AD_FinalSave": "AD-最终保存",
     "AD_FinalSelectedMedia": "AD-已选成果读取（内部）",
+    "AD_FinalSink": "AD-加工触发（内部）",
     "AidenH3EditMask": "AD-角色替换遮罩适配",
     "AidenH3AudioQueue": "AD-素材准备",
     "AidenH3Segment": "AD-分段生成",

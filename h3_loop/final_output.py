@@ -144,6 +144,25 @@ class SelectedResult:
         return (read_selected(record),)
 
 
+class FinalSink:
+    """只出现在最终加工提交副本中的隐藏输出节点。
+
+    AD_FinalSave 平时不是输出节点，普通生成排队会被直接裁剪（只跑到分段预览）；
+    点「加工所选」时由 /aiden_h3/final/prepare 追加本节点并接到 AD_FinalSave 输出，
+    让最终保存分支只在这一刻执行。它本身不产生任何文件或界面结果。
+    """
+    CATEGORY = "AD-Segmented-Loop/内部节点"
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required":{"value":("*",)}}
+    RETURN_TYPES = ()
+    FUNCTION = "sink"
+    OUTPUT_NODE = True
+
+    def sink(self, value=None):
+        return {}
+
+
 def final_directory(value, kind):
     from .save_target import configured_directory
     names = {"image":"图片","audio":"音频","video":"视频"}
@@ -203,13 +222,14 @@ def manual_final_source(source_record, prompt, unique_id):
 
 class FinalSave:
     CATEGORY = "AD-Segmented-Loop"
-    DESCRIPTION = "仅通过加工所选或继续剩余执行；普通整图运行跳过。视频组件默认按「近无损 4:4:4 / CRF14」保存母版（约21MB/5秒，保留色度）；不提供 CRF0；VideoFromFile 原样保存。"
+    DESCRIPTION = "仅通过加工所选或继续剩余执行；普通整图运行会跳过本分支（不会再随生成一起执行/校验）。视频组件默认按「近无损 4:4:4 / CRF14」保存母版（约21MB/5秒，保留色度）；不提供 CRF0；VideoFromFile 原样保存。"
     @classmethod
     def INPUT_TYPES(cls):
         # 注意：source_record 必须保持第 4 个 widget。旧工作流 widgets_values 是
         # ["保存目录","文件名前缀","帧序列帧率","source_record","<DOM>"]，新增参数放在
         # source_record 之后才不会把旧值错位；视频格式用 STRING 以兼容旧 DOM 控件留下的空串。
         # 前端会把 视频格式/像素格式/CRF 隐藏，只显示「母版画质」下拉；这三个旧字段留作兼容回退。
+        # 母版画质的空串选项只用于旧工作流校验兼容；前端载入时会自动归位为默认档并从下拉里隐藏。
         return {"required": {
             "保存目录":("STRING",{"default":""}),
             "文件名前缀":("STRING",{"default":"最终"}),
@@ -218,13 +238,15 @@ class FinalSave:
             "视频格式":("STRING",{"default":"h264-mp4"}),
             "像素格式":(["yuv444p","yuv420p"],{"default":"yuv444p"}),
             "CRF":("INT",{"default":14,"min":10,"max":51,"step":1}),
-            "母版画质":(list(QUALITY_PRESETS),{"default":DEFAULT_QUALITY})},
+            "母版画质":(list(QUALITY_PRESETS) + [""],{"default":DEFAULT_QUALITY})},
             "optional":{"media":("*",{"lazy":True})},
             "hidden":{"prompt":"PROMPT","unique_id":"UNIQUE_ID"}}
     RETURN_TYPES = ("*",)
     RETURN_NAMES = ("最终媒体",)
     FUNCTION = "save"
-    OUTPUT_NODE = True
+    # 关键：平时不是输出节点。普通生成排队时 ComfyUI 不会执行/校验本分支，
+    # 只跑到 AD-分段预览；点「加工所选」时由编译副本追加 AD_FinalSink 强制执行。
+    OUTPUT_NODE = False
     def check_lazy_status(self, source_record="{}", prompt=None, unique_id=None, **kwargs):
         if manual_final_source(source_record, prompt, unique_id) is None:
             return []
