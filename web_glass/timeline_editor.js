@@ -586,6 +586,26 @@ export function updateSegmentMaterialOutputs(node, state) {
             return true;
         } catch { return false; }
     };
+    // 把“已经连到别口”的旧线彻底摘掉：清链接表 + 两端 links/input.link，再做按名字恢复。
+    const detachLink = (link) => {
+        if (!link) return;
+        const graph = node.graph;
+        try { graph?.removeLink?.(link.id); } catch {}
+        const links = graph?.links;
+        try {
+            if (links?.get?.(link.id) || links?.[link.id]) {
+                if (typeof links.delete === "function") links.delete(link.id);
+                else delete links[link.id];
+            }
+        } catch {}
+        const from = node.outputs?.[link.origin_slot];
+        if (Array.isArray(from?.links)) from.links = from.links.filter(id => id !== link.id);
+        const target = graph?.getNodeById?.(link.target_id);
+        const input = target?.inputs?.[link.target_slot];
+        if (input && String(input.link) === String(link.id)) input.link = null;
+    };
+    // 参考口固定：快照里的“端口名 → 目标输入”必须保持。若重建/迁移把线挂到了同类型的别的口，
+    // 当场摘掉并接回快照端口，绝不把用户连好的参考线留在别的口上。
     for (const [index, output] of ordered.entries()) {
         const specs = linkSnap.get(output.name);
         if (!specs?.length) continue;
@@ -593,9 +613,14 @@ export function updateSegmentMaterialOutputs(node, state) {
             const target = node.graph?.getNodeById?.(spec.target_id);
             if (!target) continue;
             const input = target.inputs?.[spec.target_slot];
-            if (input?.link != null) {
+            if (!input) continue;
+            if (input.link != null) {
                 const current = node.graph?.links?.get?.(input.link) || node.graph?.links?.[input.link];
-                if (current && String(current.origin_id) === String(node.id)) continue;
+                if (current && String(current.origin_id) === String(node.id)) {
+                    const currentName = node.outputs?.[current.origin_slot]?.name;
+                    if (currentName === output.name) continue; // 已在快照端口上，保持不动
+                    detachLink(current);
+                }
             }
             let connected = false;
             try { connected = !!node.connect(index, target, spec.target_slot); } catch {}

@@ -1026,6 +1026,45 @@ async def action(request):
     return web.json_response(public_state(state))
 
 
+@routes.post("/aiden_h3/purge/plan")
+@guarded
+async def purge_plan(request):
+    """彻底重置预统计：只读，不删除，供确认弹窗显示数量与体积。"""
+    from . import purge
+    data = await request.json()
+    session_id = identifier(str(data.get("session_id") or ""))
+    stats = await asyncio.to_thread(purge.plan, session_id)
+    return web.json_response(stats, headers={"Cache-Control": "no-store"})
+
+
+@routes.post("/aiden_h3/purge")
+@guarded
+async def purge_session(request):
+    """彻底重置当前工作流会话：永久删除生成进度/历史/预览文件与潜桥链。
+
+    保留素材、分段、提示词、参考图、节点参数与导出成品文件；不碰其它会话。
+    """
+    from . import purge
+    data = await request.json()
+    if data.get("confirmed") is not True:
+        raise ValueError("彻底重置需要确认")
+    session_id = identifier(str(data.get("session_id") or ""))
+    try:
+        state = await asyncio.to_thread(STORE.read, session_id)
+    except FileNotFoundError:
+        state = None
+    if state is not None:
+        if state.get("status") in {"queued", "running", "merging"}:
+            raise ValueError("当前有任务正在运行，请先点「停止」再彻底重置")
+        if state.get("draft_trial"):
+            raise ValueError("本段抽卡尚未结束，请稍后再彻底重置")
+    stats, fresh = await asyncio.to_thread(purge.purge, session_id)
+    payload = {"ok": True, "stats": stats}
+    if fresh is not None:
+        payload["state"] = public_state(fresh)
+    return web.json_response(payload, headers={"Cache-Control": "no-store"})
+
+
 @routes.get("/aiden_h3/export/{session_id}")
 @guarded
 async def export(request):

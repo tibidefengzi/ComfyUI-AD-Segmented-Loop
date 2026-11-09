@@ -45,7 +45,7 @@ ROOT = default_root()
 def blocked_state_message(status) -> str:
     """按会话状态给出准确的中文阻止原因，避免把“本轮已完成”误报成“待审核”。"""
     if status == "completed":
-        return ("本轮全部段已完成，不能再次开始；要重新开始请点「清空重置」（二次确认，保留文件与分段），"
+        return ("本轮全部段已完成，不能再次开始；要重新开始请点「彻底重置」（二次确认，会删除本会话的生成结果、历史组与中间文件；素材/分段/提示词与导出成品保留），"
                 "或对某段点「本段抽卡」；不会自动清空进度")
     if status in {"queued", "running"}:
         return "当前段有任务正在运行或排队，请等待本段完成或点「停止」；不会自动清空进度"
@@ -53,7 +53,7 @@ def blocked_state_message(status) -> str:
         return "当前段已有生成结果：点「开始」会接受该结果并继续下一段，或点「分段循环」连续生成；不会自动清空进度"
     if status == "merging":
         return "片段正在合并，请等待合并完成；不会自动清空进度"
-    return f"当前进度状态异常（{status or '未知'}），无法开始新的分段；请在「分段预览」点「清空重置」或重新打开工作流后再试；不会自动清空进度"
+    return f"当前进度状态异常（{status or '未知'}），无法开始新的分段；请在「分段预览」点「彻底重置」或重新打开工作流后再试；不会自动清空进度"
 _LOCKS: dict[str, threading.RLock] = {}
 _GUARD = threading.Lock()
 _MIGRATING = False
@@ -529,7 +529,7 @@ class SessionStore:
         for row in state["segments"]:
             row["selected"] = None
             row["reroll"] = 0
-            # 清空重置/新建一组后一切从零：旧版本归档，仅供预览/历史查看，不再参与新一轮生成与选用。
+            # 归档式重置（自动重置/新建一组/完成后再开始）后一切从零：旧版本归档，仅供预览/历史查看，不再参与新一轮生成与选用。
             for version in row.get("versions") or []:
                 if isinstance(version, dict):
                     version.setdefault("reset_id", old_reset)
@@ -545,7 +545,7 @@ class SessionStore:
     def _archive_and_start_next_round(self, state, always_next=False):
         """归档当前轮为历史组并进入下一轮；没有结果时只重置。
 
-        清空重置与新建一组共用：旧轮保留为可回抽的历史组（内部独立潜桥链），
+        归档式重置（自动/新建一组）共用：旧轮保留为可回抽的历史组（内部独立潜桥链），
         新一轮从第 1 段开始，旧结果只留在历史轮快照与预览记录里。
         """
         from . import group_history
@@ -768,7 +768,7 @@ class SessionStore:
                 raise ValueError("插件内部错误：生成结果缺少段号上下文，本次结果未纳入进度（文件已保留）。请从当前段重新开始；若反复出现请反馈日志。")
             # 唯一真正的过期：期间被“清空全部进度/重启”重置过（epoch 变化）。
             if context.get("epoch") is not None and int(context["epoch"]) != int(state.get("epoch", 0)):
-                raise ValueError("本次生成结果未纳入进度：生成期间进度被停止或清空重置。文件已保留，可在预览或会话目录查看。")
+                raise ValueError("本次生成结果未纳入进度：生成期间进度被停止或彻底重置。文件已保留，可在预览或会话目录查看。")
             active = state.get("active")
             matched = bool(active) and context.get("token") == active.get("token")
             reserved = (state.get("run_origins") or {}).get(context.get("token"), {})
@@ -1046,7 +1046,7 @@ class SessionStore:
                     if options.get("index") is not None:
                         target = int(options["index"])
                     if not 0 <= target < len(state["segments"]):
-                        raise ValueError("无效段号或当前段已结束；请先点「清空重置」或选择要运行的段。")
+                        raise ValueError("无效段号或当前段已结束；请先点「彻底重置」或选择要运行的段。")
                 current_row = state["segments"][min(max(int(state["cursor"]), 0), len(state["segments"]) - 1)] if state["segments"] else {}
                 state["run_return"] = {"cursor": state["cursor"], "status": state["status"],
                                        "segment_key": current_row["segment_key"],
@@ -1129,7 +1129,7 @@ class SessionStore:
             elif command == "clear":
                 if options.get("confirmed") is not True:
                     raise ValueError("清空进度需要二次确认")
-                # 清空重置 = 归档当前轮为历史组 + 进入下一轮；旧轮仍可回抽/恢复。
+                # clear 命令 = 归档当前轮为历史组 + 进入下一轮（自动重置/已完成后再开始等沿用）；按钮「彻底重置」另走 purge。
                 self._archive_and_start_next_round(state)
             elif command == "new_group":
                 if state.get("status") in {"queued", "running", "merging"}:

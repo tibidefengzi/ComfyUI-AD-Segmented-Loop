@@ -1803,27 +1803,6 @@ class AidenH3VideoPreview:
         if media is None and compare_media is not None:
             media, compare_media = compare_media, None
             primary_role = "B"
-        try:
-            import json as _json
-            preview_config = _json.loads(save_config) if isinstance(save_config, str) and save_config.strip() else {}
-        except Exception:
-            preview_config = {}
-        only_b = bool(preview_config.get("only_b"))
-        if compare_media is not None and only_b:
-            # 只保存B：完全跳过A，只把B作为主结果记录
-            save_index = 1
-            if isinstance(context, dict) and context.get("token"):
-                try:
-                    save_index = int(context.get("index", 0)) + 1
-                except Exception:
-                    save_index = 1
-            only = self._preview_single(compare_media, context, "{}", save_config, prompt, extra_pnginfo, save_index=save_index)
-            for record in only["ui"].get("h3_preview") or []:
-                record["role"] = "B"
-                record["segment_index"] = save_index
-            only["ui"]["h3_preview"] = only["ui"].get("h3_preview") or []
-            only["result"] = (media,)
-            return only
         result = self._preview_single(media, context, video_oasis_ui, save_config, prompt, extra_pnginfo)
         records = result["ui"].get("h3_preview") or []
         for record in records:
@@ -1863,7 +1842,7 @@ class AidenH3VideoPreview:
             # 在编码/尾帧落盘前拦截真实旧结果；登记时仍再次检查，防止处理中被重置。
             current_epoch = STORE.read(loop_context["session_id"]).get("epoch", 0)
             if loop_context.get("epoch") is not None and int(loop_context["epoch"]) != int(current_epoch):
-                raise ValueError("本次生成结果未纳入进度：生成期间进度被停止或清空重置。该结果尚未写入会话目录，请从当前段重新开始。")
+                raise ValueError("本次生成结果未纳入进度：生成期间进度被停止或彻底重置。该结果尚未写入会话目录，请从当前段重新开始。")
         if hasattr(media, "save_to") or previous_record:
             if loop_context and not previous_record:
                 from .media import normalize_video

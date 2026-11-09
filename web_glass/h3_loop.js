@@ -597,8 +597,8 @@ function mountReview(node) {
                 state=await request("/aiden_h3/action",{command:"clear",session_id:state.id,confirmed:true});
                 safeDraw(state);
                 say(batch
-                    ? "原文件批处理完成（若保存失败，预览卡片会提示）；本轮已自动清空并重置，点「开始」继续新一轮。"
-                    : "整轮分段循环已完成，已自动清空重置；点「开始」或「分段循环」开始新一轮。");
+                    ? "原文件批处理完成（若保存失败，预览卡片会提示）；本轮已自动归档并重置，点「开始」继续新一轮。"
+                    : "整轮分段循环已完成，已自动归档并重置；点「开始」或「分段循环」开始新一轮。");
                 return restart ? state : null;
             } catch (error) {
                 say((batch ? "原文件批处理完成；" : "整轮分段循环已完成；") + "自动清空失败：" + error.message, true);
@@ -804,6 +804,11 @@ function mountReview(node) {
         if(!response.ok) throw new Error(state.error || "读取本轮进度失败");
         draw(state);
         return state;
+    };
+    // 彻底重置需要会话名：即使还没有进度文件，也能清掉该会话遗留的潜桥链。
+    node._adH3SessionId = () => {
+        const segment=upstreamSegment(node);
+        return segment ? sessionId(segment) : "";
     };
     async function refresh(force=true){
         const pollRevision=actionRevision;
@@ -1104,6 +1109,8 @@ function repairSegmentLinkTypes(node) {
         const current = node.outputs?.[currentSlot];
         const currentType = current?.type || link.type;
         if (currentType === wanted) continue;
+        // 参考口（ref_*）是用户手动连的：类型修复只负责固定口，绝不把参考线搬到别的口上。
+        if (/^ref_/.test(current?.name || "")) continue;
         const candidates = (node.outputs || []).map((output, index) => ({ output, index })).filter(item => item.output?.type === wanted);
         if (candidates.length !== 1) continue;
         const target = candidates[0];
@@ -1945,7 +1952,16 @@ app.registerExtension({
                     if(!input)continue;
                     const link=graph.links?.get?.(input.link)||graph.links?.[input.link];
                     if(link&&String(link.origin_id)!==String(node.id))continue;
-                    if(link&&link.origin_slot===slot)continue;
+                    if(link){
+                        // 连线固定在保存的“端口名”上：已被重建/迁移到别的口时，先摘旧线再接回原端口。
+                        const currentName=node.outputs?.[link.origin_slot]?.name;
+                        if(currentName===output.name)continue;
+                        try{graph.removeLink?.(link.id);}catch{}
+                        try{if(graph.links?.get?.(link.id)||graph.links?.[link.id]){if(typeof graph.links.delete==="function")graph.links.delete(link.id);else delete graph.links[link.id];}}catch{}
+                        const from=node.outputs?.[link.origin_slot];
+                        if(Array.isArray(from?.links))from.links=from.links.filter(id=>id!==link.id);
+                        input.link=null;
+                    }
                     try{node.connect(slot,target,index);}catch{}
                 }
             }

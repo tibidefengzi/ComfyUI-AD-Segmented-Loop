@@ -196,8 +196,8 @@ def _plan_current_reroll(sid, parent, target, preview, relay_on, reanchor=False)
         version_chain = str(target_version.get("relay_run_id") or "")
         if version_chain and version_chain != chain:
             raise ValueError(
-                "该卡片属于清空重置前的旧批次，还没有归档为独立轮次，不能直接接到当前轮。"
-                "请先点一次「清空重置」（会把当前批次归档成历史轮），再回到该轮抽卡。")
+                "该卡片属于上一批次的旧结果，还没有归档为独立轮次，不能直接接到当前轮。"
+                "请先点一次「新建一组」（会把当前批次归档成历史轮且保留结果），再回到该轮抽卡。")
     stage = relay_parent_stage(target, reanchor)
     if stage is not None and not _stage_path(chain, stage).is_file():
         if reanchor:

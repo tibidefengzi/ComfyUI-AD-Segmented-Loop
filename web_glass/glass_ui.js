@@ -203,7 +203,6 @@ const CSS = `
 .ad-h3-save-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:8px;margin-top:8px;border:1px solid #415675;border-radius:8px;background:#222f42}
 .ad-h3-save-row input[type=text]{flex:1 1 170px;min-width:120px;height:28px;background:#28364c;border:1px solid #446590;border-radius:6px;color:#f2f6fd;padding:0 8px;font-size:12px}
 .ad-h3-save-label{font-size:12px;color:#c4d0e1;white-space:nowrap}
-.ad-h3-save-auto{display:inline-flex;align-items:center;gap:4px;font-size:12px;color:#e5eef7;white-space:nowrap}
 .ad-h3-save-row button{height:28px;min-height:28px;padding:0 10px;font-size:12px}
 
 /* 外观整理：仅调整绘制属性；保留所有布局、按钮坐标、尺寸与交互。 */

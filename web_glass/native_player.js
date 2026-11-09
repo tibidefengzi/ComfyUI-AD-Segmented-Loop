@@ -33,7 +33,7 @@ export async function togglePlayerFullscreen(target) {
 // 独立播放器。播放选择只存在于此处，绝不修改生成游标或分段选用版本。
 export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fetchApi:(...args)=>fetch(...args)}) {
     root.classList.add("aiden-h3", "ad-h3-video");
-    root.innerHTML = `<div class="ad-h3-preview-layout"><section class="ad-h3-screen"><div class="ad-h3-preview-title">生成完成后在这里预览素材</div><video playsinline preload="metadata" aria-label="时间线预览"></video><img data-media-image hidden alt="图像预览"><audio data-media-audio controls hidden></audio><div class="ad-h3-idle-hint"><span>留白，亦是序章</span><span>下一帧，属于你的想象</span></div></section><div class="ad-h3-tabs"><button type="button" data-tab="image">图片</button><button type="button" data-tab="audio">音频</button><button type="button" data-tab="video" class="active">视频</button><span class="ad-h3-tab-hint" data-tab-hint hidden></span></div><div class="ad-h3-loop-actions"><button type="button" data-loop="start">开始</button><button type="button" data-loop="pause">停止</button><button type="button" data-loop="auto">分段循环</button><button type="button" data-loop="redo" title="选中下方任意预览后只重抽该段；运行中请先点「停止」">本段抽卡</button><button type="button" data-clear-preview title="只清空本轮生成进度与选用记录（预览内容与文件保留）">清空重置</button><button type="button" data-clear-media-preview title="只清空当前分类的预览内容（不删除文件、不影响进度）">清空预览</button><div class="ad-h3-loop-hint" data-loop-hint hidden></div><span class="ad-h3-video-actions ad-h3-merge-wrap"><button type="button" data-loop="merge" title="点击选择 A合并或 B合并；Ctrl 点选片段可只合并选中内容">合并片段</button><span class="ad-h3-merge-menu" data-merge-menu hidden><button type="button" data-merge-source="A">A合并</button><button type="button" data-merge-source="B">B合并</button></span></span><button type="button" class="ad-h3-playlist-toggle" data-loop-playlist aria-pressed="false" title="按分段编号循环播放预览视频">循环播放</button></div><div class="ad-h3-panel" data-panel="video"><div class="ad-h3-media-list" data-video-list></div><div class="ad-h3-player-controls"><button data-play aria-label="播放或暂停">播放</button><button data-frame="-1" title="后退一帧" aria-label="后退一帧">上一帧</button><button data-frame="1" title="前进一帧" aria-label="前进一帧">下一帧</button><input data-seek type="range" min="0" max="0" step="1" value="0" aria-label="播放位置"><span data-time>0.00 / 0.00 秒</span><button data-mute aria-label="切换静音">取消静音</button><select data-rate aria-label="播放速度"><option value="0.5">0.5 倍速</option><option value="1" selected>1 倍速</option><option value="1.5">1.5 倍速</option><option value="2">2 倍速</option></select><button data-fullscreen aria-label="全屏预览">全屏</button></div><aside class="ad-h3-strips"><div class="ad-h3-strip-row"><span>分段生成A</span><div class="ad-h3-segments"></div></div><div class="ad-h3-strip-row"><span>分段生成B</span><div class="ad-h3-segments-b"></div></div><div class="ad-h3-strip-row"><span>合并生成</span><div class="ad-h3-merges"></div></div></aside></div><div class="ad-h3-panel" data-panel="image" hidden><aside class="ad-h3-cat-strips"><div class="ad-h3-strip-row"><span>图片A</span><div class="ad-h3-media-list" data-image-list></div></div><div class="ad-h3-strip-row"><span>图片B</span><div class="ad-h3-media-list" data-image-list-b></div></div></aside></div><div class="ad-h3-panel" data-panel="audio" hidden><aside class="ad-h3-cat-strips"><div class="ad-h3-strip-row"><span>音频A</span><div class="ad-h3-media-list" data-audio-list></div></div><div class="ad-h3-strip-row"><span>音频B</span><div class="ad-h3-media-list" data-audio-list-b></div></div></aside></div></div>`;
+    root.innerHTML = `<div class="ad-h3-preview-layout"><section class="ad-h3-screen"><div class="ad-h3-preview-title">生成完成后在这里预览素材</div><video playsinline preload="metadata" aria-label="时间线预览"></video><img data-media-image hidden alt="图像预览"><audio data-media-audio controls hidden></audio><div class="ad-h3-idle-hint"><span>留白，亦是序章</span><span>下一帧，属于你的想象</span></div></section><div class="ad-h3-tabs"><button type="button" data-tab="image">图片</button><button type="button" data-tab="audio">音频</button><button type="button" data-tab="video" class="active">视频</button><span class="ad-h3-tab-hint" data-tab-hint hidden></span></div><div class="ad-h3-loop-actions"><button type="button" data-loop="start">开始</button><button type="button" data-loop="pause">停止</button><button type="button" data-loop="auto">分段循环</button><button type="button" data-loop="redo" title="选中下方任意预览后只重抽该段；运行中请先点「停止」">本段抽卡</button><button type="button" data-clear-preview title="彻底重置当前工作流：清除进度、历史组、预览/合并/最终保存记录与潜桥链，并删除本会话中间文件；素材、分段、提示词与导出成品保留">彻底重置</button><button type="button" data-clear-media-preview title="只清空当前分类的预览内容（不删除文件、不影响进度）">清空预览</button><div class="ad-h3-loop-hint" data-loop-hint hidden></div><span class="ad-h3-video-actions ad-h3-merge-wrap"><button type="button" data-loop="merge" title="点击选择 A合并或 B合并；Ctrl 点选片段可只合并选中内容">合并片段</button><span class="ad-h3-merge-menu" data-merge-menu hidden><button type="button" data-merge-source="A">A合并</button><button type="button" data-merge-source="B">B合并</button></span></span><button type="button" class="ad-h3-playlist-toggle" data-loop-playlist aria-pressed="false" title="按分段编号循环播放预览视频">循环播放</button></div><div class="ad-h3-panel" data-panel="video"><div class="ad-h3-media-list" data-video-list></div><div class="ad-h3-player-controls"><button data-play aria-label="播放或暂停">播放</button><button data-frame="-1" title="后退一帧" aria-label="后退一帧">上一帧</button><button data-frame="1" title="前进一帧" aria-label="前进一帧">下一帧</button><input data-seek type="range" min="0" max="0" step="1" value="0" aria-label="播放位置"><span data-time>0.00 / 0.00 秒</span><button data-mute aria-label="切换静音">取消静音</button><select data-rate aria-label="播放速度"><option value="0.5">0.5 倍速</option><option value="1" selected>1 倍速</option><option value="1.5">1.5 倍速</option><option value="2">2 倍速</option></select><button data-fullscreen aria-label="全屏预览">全屏</button></div><aside class="ad-h3-strips"><div class="ad-h3-strip-row"><span>分段生成A</span><div class="ad-h3-segments"></div></div><div class="ad-h3-strip-row"><span>分段生成B</span><div class="ad-h3-segments-b"></div></div><div class="ad-h3-strip-row"><span>合并生成</span><div class="ad-h3-merges"></div></div></aside></div><div class="ad-h3-panel" data-panel="image" hidden><aside class="ad-h3-cat-strips"><div class="ad-h3-strip-row"><span>图片A</span><div class="ad-h3-media-list" data-image-list></div></div><div class="ad-h3-strip-row"><span>图片B</span><div class="ad-h3-media-list" data-image-list-b></div></div></aside></div><div class="ad-h3-panel" data-panel="audio" hidden><aside class="ad-h3-cat-strips"><div class="ad-h3-strip-row"><span>音频A</span><div class="ad-h3-media-list" data-audio-list></div></div><div class="ad-h3-strip-row"><span>音频B</span><div class="ad-h3-media-list" data-audio-list-b></div></div></aside></div></div>`;
     const video = root.querySelector("video"), title = root.querySelector(".ad-h3-preview-title");
     const imageView = root.querySelector("[data-media-image]"), audioView = root.querySelector("[data-media-audio]");
     const layout = root.querySelector(".ad-h3-preview-layout");
@@ -83,7 +83,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
     // 保存设置：目录 + 文件名模板（随工作流保存）
     const savedConfig = (node.properties && node.properties.ad_h3_save) || {};
     const cleanSaveDir = value => String(value || "").trim().replace(/^"(.*)"$/, "$1").replace(/^'(.*)'$/, "$1").trim();
-    const saveState = {dir: cleanSaveDir(savedConfig.dir), template: String(savedConfig.template || ""), onlyB: savedConfig.onlyB === undefined ? true : !!savedConfig.onlyB};
+    const saveState = {dir: cleanSaveDir(savedConfig.dir), template: String(savedConfig.template || "")};
     const saveRow = document.createElement("div");
     saveRow.className = "ad-h3-save-row";
     saveRow.innerHTML = '<span class="ad-h3-save-label">保存路径</span>'
@@ -91,27 +91,22 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         + '<button type="button" data-save-pick>选择目录</button>'
         + '<span class="ad-h3-save-label">文件名</span>'
         + '<input type="text" data-save-name placeholder="默认：AD-{index}-{date}">'
-        + '<label class="ad-h3-save-auto"><input type="checkbox" data-save-only-b> 只保存B</label>';
     layout.insertBefore(saveRow, layout.querySelector(".ad-h3-panel"));
     const dirInput = saveRow.querySelector("[data-save-dir]");
     const nameInput = saveRow.querySelector("[data-save-name]");
-    const onlyBInput = saveRow.querySelector("[data-save-only-b]");
     dirInput.value = saveState.dir; nameInput.value = saveState.template;
-    if (onlyBInput) onlyBInput.checked = saveState.onlyB;
     const syncSaveConfig = () => {
         const cleanedDir = cleanSaveDir(dirInput.value);
         if (cleanedDir !== dirInput.value.trim()) dirInput.value = cleanedDir;
         saveState.dir = cleanedDir;
         saveState.template = nameInput.value.trim();
-        saveState.onlyB = !!onlyBInput?.checked;
         node.properties ||= {};
-        node.properties.ad_h3_save = {dir: saveState.dir, template: saveState.template, onlyB: saveState.onlyB};
+        node.properties.ad_h3_save = {dir: saveState.dir, template: saveState.template};
         const widget = (node.widgets || []).find(item => item.name === "save_config");
-        if (widget) { widget.value = JSON.stringify({dir: saveState.dir, template: saveState.template, only_b: saveState.onlyB}); try { widget.callback?.(widget.value); } catch {} }
+        if (widget) { widget.value = JSON.stringify({dir: saveState.dir, template: saveState.template}); try { widget.callback?.(widget.value); } catch {} }
     };
     dirInput.addEventListener("input", syncSaveConfig);
     nameInput.addEventListener("input", syncSaveConfig);
-    onlyBInput?.addEventListener("change", syncSaveConfig);
     saveRow.querySelector("[data-save-pick]").addEventListener("click", async event => {
         event.stopPropagation();
         await chooseSaveFolder();
@@ -173,13 +168,11 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
             if (config && typeof config === "object") {
                 if ("dir" in config) saveState.dir = cleanSaveDir(config.dir);
                 if ("template" in config) saveState.template = String(config.template || "");
-                if ("only_b" in config) saveState.onlyB = !!config.only_b;
                 dirInput.value = saveState.dir;
                 nameInput.value = saveState.template;
-               
-                if (onlyBInput) onlyBInput.checked = saveState.onlyB;
             }
         } catch {}
+        // 旧工作流里的 only_b 字段一并丢弃：不再提供“只保存B”，A/B 两端都按结果记录。
         syncSaveConfig();
     };
     const previousConfigure = node.onConfigure;
@@ -1525,15 +1518,161 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         scheduleMediaResize(visiblePanel ? 200 : 240);
     }
     for (const button of tabButtons) button.onclick = () => setTab(button.dataset.tab);
-    const clearButton = root.querySelector("[data-clear-preview]");
-    if (clearButton) clearButton.addEventListener("click", async () => {
-        // 只清空本轮进度与选用记录；预览内容、素材、分段、提示词和文件都保留。
-        if (!window.confirm("归档当前轮并开始新一轮？（预览内容、素材、分段、提示词与已生成文件都保留，旧轮可在历史组回抽）")) return;
-        try { if(await node._adH3Act?.("clear", {skipConfirm:true})===false)return; } catch { return; }
-        previewPinned = false;
-        if (node._adH3ReviewStatus) node._adH3ReviewStatus("已归档当前轮并进入下一轮；旧轮可在历史组回抽，预览内容与已生成文件保留。");
+    const purgeBytesText = value => {
+        const bytes = Number(value) || 0;
+        if (bytes >= 1024 ** 3) return (bytes / 1024 ** 3).toFixed(1) + " GB";
+        if (bytes >= 1024 ** 2) return Math.round(bytes / 1024 ** 2) + " MB";
+        if (bytes >= 1024) return Math.round(bytes / 1024) + " KB";
+        return Math.round(bytes) + " B";
+    };
+    // 彻底重置（2026-11-09 用户确认）：清当前工作流全部生成数据；素材/分段/提示词/参考图与导出成品保留。
+    function resetAllResults() {
+        revision++;
+        active = null; generationKey = ""; previewPinned = false; processingRecord = null;
+        redoTarget = null; resumeTarget = null; redrawPending = null; redrawReview = null;
+        redrawRequest++; batchResume = false; stopPending = false; setPlaylistEnabled(false);
+        hydratedSession = false;
+        initialIdle = true;
+        for (const kind of ["image", "audio", "video"]) {
+            mediaRecords[kind].length = 0;
+            mediaCards[kind].clear();
+            mediaCardsB[kind]?.clear();
+            mediaPages[kind] = 0;
+            lastShown[kind] = null;
+            mediaLists[kind]?.replaceChildren();
+            mediaListsB[kind]?.replaceChildren();
+        }
+        cards.clear();
+        stripStore.segment.length = 0; stripStore.merged.length = 0;
+        stripRecords.segment.length = 0; stripRecords.segmentB.length = 0; stripRecords.merged.length = 0;
+        mergeIndex.clear(); mergeSelection.clear(); hiddenStrips.clear();
+        roundMap.clear(); showHistoryRounds = false; expandedHistoryRounds.clear(); historyPages.clear();
+        segments.replaceChildren(); segmentsB.replaceChildren(); merges.replaceChildren();
+        try { video.pause(); video.removeAttribute("src"); video.load(); } catch {}
+        try { audioView.pause(); audioView.removeAttribute("src"); audioView.load(); } catch {}
+        try { imageView.hidden = true; imageView.removeAttribute("src"); } catch {}
+        title.textContent = "生成完成后在这里预览素材";
+        setIdle(true);
+        node.properties ||= {};
+        for (const key of ["ad_execution_round", "ad_h3_media_records", "ad_h3_strip_previews", "ad_h3_merge_index",
+            "ad_h3_merged_previews", "ad_h3_round_no", "ad_h3_round_map", "ad_h3_merge_serial", "ad_h3_redraw_counts",
+            "ad_h3_hidden_strips", "ad_h3_expanded_rounds", "ad_h3_show_history", "ad_final_records", "ad_final_batch"]) {
+            delete node.properties[key];
+        }
+        node.properties.ad_h3_media_records = {image: [], audio: [], video: []};
+        node.properties.ad_h3_strip_previews = {segment: [], merged: []};
+        node.properties.ad_h3_merge_index = [];
+        node.properties.ad_h3_merged_previews = [];
+        node.properties.ad_h3_hidden_strips = [];
+        for (const item of node.graph?._nodes || []) {
+            const type = item.comfyClass || item.type;
+            if (type === "AD_FinalSave") {
+                item.properties ||= {};
+                item.properties.ad_final_records = [];
+                item.properties.ad_final_batch = null;
+                try { item._adFinal?.resetTask?.(); } catch {}
+                item.setDirtyCanvas?.(true, true);
+            } else if (type === "AidenH3VideoPreview") {
+                item.properties ||= {};
+                for (const key of ["ad_execution_round", "ad_h3_media_records", "ad_h3_strip_previews", "ad_h3_merge_index",
+                    "ad_h3_merged_previews", "ad_h3_round_no", "ad_h3_round_map", "ad_h3_merge_serial", "ad_h3_redraw_counts",
+                    "ad_h3_hidden_strips", "ad_h3_expanded_rounds", "ad_h3_show_history"]) {
+                    delete item.properties[key];
+                }
+                item.properties.ad_h3_media_records = {image: [], audio: [], video: []};
+                item.properties.ad_h3_strip_previews = {segment: [], merged: []};
+                item.properties.ad_h3_merge_index = [];
+                item.properties.ad_h3_merged_previews = [];
+                item.properties.ad_h3_hidden_strips = [];
+                // 同一工作流里若还有其它预览节点，清掉它的持久记录；重新打开工作流后即为空。
+                if (item !== node) { try { item._adH3Preview?.restoreSavedMedia?.(); } catch {} }
+                item.setDirtyCanvas?.(true, true);
+            } else if (type === "AidenH3Segment") {
+                if (item.properties) delete item.properties.ad_execution_round;
+            }
+        }
+        persistMedia(); persistStripPreviews(); persistMergeIndex(); persistHiddenStrips(); persistRoundMap();
+        renderRecords(segments, [], "segment");
+        renderRecords(segmentsB, [], "segmentB");
+        renderRecords(merges, [], "merged");
+        for (const kind of ["image", "audio", "video"]) renderMedia(kind);
         node.setDirtyCanvas?.(true, true);
-    });
+    }
+    const clearButton = root.querySelector("[data-clear-preview]");
+    if (clearButton) {
+        let purging = false;
+        clearButton.addEventListener("click", async () => {
+            if (purging) return;
+            const state = latestSessionState;
+            const session = state?.id || node._adH3SessionId?.() || "";
+            if (state && ["queued", "running", "merging"].includes(state.status)) {
+                node._adH3Hint?.("当前有任务正在运行，请先点「停止」再彻底重置。", true);
+                return;
+            }
+            if (state?.draft_trial) {
+                node._adH3Hint?.("本段抽卡尚未结束，请稍后再彻底重置。", true);
+                return;
+            }
+            purging = true;
+            try {
+                node._adH3Hint?.("正在统计将清除的数据…", false);
+                let stats = null;
+                if (session) {
+                    try {
+                        const response = await api.fetchApi("/aiden_h3/purge/plan", {
+                            method: "POST", headers: {"Content-Type": "application/json"},
+                            body: JSON.stringify({session_id: session}),
+                        });
+                        if (response.ok) stats = await response.json();
+                    } catch {}
+                }
+                let cardCount = 0;
+                for (const kind of ["image", "audio", "video"]) cardCount += mediaRecords[kind].length;
+                let finalCount = 0;
+                for (const item of node.graph?._nodes || []) {
+                    if ((item.comfyClass || item.type) === "AD_FinalSave") finalCount += (item.properties?.ad_final_records || []).length;
+                }
+                const lines = ["彻底重置当前工作流（永久删除，不可恢复）？"];
+                if (stats?.exists) {
+                    lines.push("", "将清除：",
+                        `· 进度/历史：${Number(stats.groups) || 0} 组历史、${Number(stats.versions) || 0} 个生成版本`,
+                        `· 预览与记录：${cardCount} 张预览卡、${finalCount} 条最终保存记录`,
+                        `· 删除文件：${Number(stats.files) || 0} 个会话文件 + ${Number(stats.relay_files) || 0} 个潜桥文件，共 ${purgeBytesText(stats.bytes_total)}`);
+                } else {
+                    lines.push("", "当前没有会话进度，只清空本工作流的预览与记录。");
+                }
+                lines.push("", "会保留：素材、时间线分段、提示词、参考图、节点参数；",
+                    "导出成品（AD-Segmented-Loop-output / AD-Segmented-Loop-final）与 input 源素材不删。",
+                    "", "重置后从第 1 段、编号 1 重新开始。确定继续？");
+                if (!window.confirm(lines.join("\n"))) {
+                    node._adH3Hint?.("已取消彻底重置。", false);
+                    return;
+                }
+                let payload = {ok: true};
+                if (session) {
+                    const response = await api.fetchApi("/aiden_h3/purge", {
+                        method: "POST", headers: {"Content-Type": "application/json"},
+                        body: JSON.stringify({session_id: session, confirmed: true}),
+                    });
+                    const result = await response.json().catch(() => ({}));
+                    if (!response.ok) throw new Error(result.error || "彻底重置失败");
+                    payload = result;
+                }
+                resetAllResults();
+                if (payload.state) updateState(payload.state);
+                else latestSessionState = null;
+                node.setDirtyCanvas?.(true, true);
+                node.graph?.change?.();
+                const released = payload?.stats?.bytes_total ? `，释放约 ${purgeBytesText(payload.stats.bytes_total)}` : "";
+                if (node._adH3ReviewStatus) node._adH3ReviewStatus(`已彻底重置当前工作流${released}；素材/分段/提示词与导出成品保留。请保存工作流（Ctrl+S）后重新开始。`);
+                if (typeof node._adH3RefreshState === "function") node._adH3RefreshState().catch(() => {});
+            } catch (error) {
+                node._adH3Hint?.(`彻底重置失败：${error?.message || String(error)}`, true);
+            } finally {
+                purging = false;
+            }
+        });
+    }
     const clearMediaButton = root.querySelector("[data-clear-media-preview]");
     if (clearMediaButton) clearMediaButton.addEventListener("click", () => {
         // 只清当前分类（图片/音频/视频）的预览记录，不删文件、不动进度；清空后主预览回到黑屏空闲态。

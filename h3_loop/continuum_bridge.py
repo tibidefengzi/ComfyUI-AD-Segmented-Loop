@@ -1,4 +1,4 @@
-﻿"""运行时复用 Continuum 的接缝分析/修正能力（不复制其源码）。
+"""运行时复用 Continuum 的接缝分析/修正能力（不复制其源码）。
 
 Continuum 以 custom_nodes/ComfyUI-H3-Continuum 形式安装；未安装时本模块返回不可用，
 调用方回退到插件自身的 FFmpeg 拼接。
