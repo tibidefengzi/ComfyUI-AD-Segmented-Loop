@@ -49,6 +49,9 @@ styles.textContent = `
 .ad-h3-video{pointer-events:none;overflow:hidden}.ad-h3-video button,.ad-h3-video input,.ad-h3-video select,.ad-h3-video video,.ad-h3-video img,.ad-h3-video audio,.ad-h3-video .ad-h3-media-card,.ad-h3-video .ad-h3-preview-thumb{pointer-events:auto}
 .ad-h3-preview-layout{display:flex;flex-direction:column;gap:10px;width:100%;min-width:0}
 .ad-h3-strips{display:flex;flex-direction:column;gap:6px;min-width:0;padding:2px 4px}
+.ad-h3-cat-strips{display:flex;flex-direction:column;gap:6px;min-width:0;padding:2px 4px}
+.ad-h3-cat-strips .ad-h3-strip-row{min-height:0;padding:4px 8px}
+.ad-h3-cat-strips .ad-h3-strip-row>span{flex:0 0 56px}
 .ad-h3-strip-row{display:flex;gap:8px;align-items:flex-start;min-width:0;width:100%;border:1px solid #3d5a80;border-radius:8px;background:#141b26;padding:4px 8px;min-height:104px;box-sizing:border-box}.ad-h3-strip-row>span{flex:0 0 64px;white-space:nowrap}
 .ad-h3-segments,.ad-h3-segments-b,.ad-h3-merges{display:flex;gap:6px;overflow:auto;min-width:0;flex:1;min-height:96px;align-items:flex-start;padding:2px 0}
 .aiden-h3 .ad-h3-preview-thumb{width:112px;min-width:112px;padding:4px;font-size:12px;overflow-wrap:anywhere;position:relative}

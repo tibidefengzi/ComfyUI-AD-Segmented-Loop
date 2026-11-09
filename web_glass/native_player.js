@@ -33,7 +33,7 @@ export async function togglePlayerFullscreen(target) {
 // 独立播放器。播放选择只存在于此处，绝不修改生成游标或分段选用版本。
 export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fetchApi:(...args)=>fetch(...args)}) {
     root.classList.add("aiden-h3", "ad-h3-video");
-    root.innerHTML = `<div class="ad-h3-preview-layout"><section class="ad-h3-screen"><div class="ad-h3-preview-title">生成完成后在这里预览素材</div><video playsinline preload="metadata" aria-label="时间线预览"></video><img data-media-image hidden alt="图像预览"><audio data-media-audio controls hidden></audio><div class="ad-h3-idle-hint"><span>留白，亦是序章</span><span>下一帧，属于你的想象</span></div></section><div class="ad-h3-tabs"><button type="button" data-tab="image">图片</button><button type="button" data-tab="audio">音频</button><button type="button" data-tab="video" class="active">视频</button><span class="ad-h3-tab-hint" data-tab-hint hidden></span></div><div class="ad-h3-loop-actions"><button type="button" data-loop="start">开始</button><button type="button" data-loop="pause">停止</button><button type="button" data-loop="auto">分段循环</button><button type="button" data-loop="redo" title="选中下方任意预览后只重抽该段；运行中请先点「停止」">本段抽卡</button><button type="button" data-clear-preview title="只清空本轮生成进度与选用记录（预览内容与文件保留）">清空重置</button><button type="button" data-clear-media-preview title="只清空当前分类的预览内容（不删除文件、不影响进度）">清空预览</button><div class="ad-h3-loop-hint" data-loop-hint hidden></div><span class="ad-h3-video-actions ad-h3-merge-wrap"><button type="button" data-loop="merge" title="点击选择 A合并或 B合并；Ctrl 点选片段可只合并选中内容">合并片段</button><span class="ad-h3-merge-menu" data-merge-menu hidden><button type="button" data-merge-source="A">A合并</button><button type="button" data-merge-source="B">B合并</button></span></span><button type="button" class="ad-h3-playlist-toggle" data-loop-playlist aria-pressed="false" title="按分段编号循环播放预览视频">循环播放</button></div><div class="ad-h3-panel" data-panel="video"><div class="ad-h3-media-list" data-video-list></div><div class="ad-h3-player-controls"><button data-play aria-label="播放或暂停">播放</button><button data-frame="-1" title="后退一帧" aria-label="后退一帧">上一帧</button><button data-frame="1" title="前进一帧" aria-label="前进一帧">下一帧</button><input data-seek type="range" min="0" max="0" step="1" value="0" aria-label="播放位置"><span data-time>0.00 / 0.00 秒</span><button data-mute aria-label="切换静音">取消静音</button><select data-rate aria-label="播放速度"><option value="0.5">0.5 倍速</option><option value="1" selected>1 倍速</option><option value="1.5">1.5 倍速</option><option value="2">2 倍速</option></select><button data-fullscreen aria-label="全屏预览">全屏</button></div><aside class="ad-h3-strips"><div class="ad-h3-strip-row"><span>分段生成A</span><div class="ad-h3-segments"></div></div><div class="ad-h3-strip-row"><span>分段生成B</span><div class="ad-h3-segments-b"></div></div><div class="ad-h3-strip-row"><span>合并生成</span><div class="ad-h3-merges"></div></div></aside></div><div class="ad-h3-panel" data-panel="image" hidden><div class="ad-h3-media-list" data-image-list></div></div><div class="ad-h3-panel" data-panel="audio" hidden><div class="ad-h3-media-list" data-audio-list></div></div></div>`;
+    root.innerHTML = `<div class="ad-h3-preview-layout"><section class="ad-h3-screen"><div class="ad-h3-preview-title">生成完成后在这里预览素材</div><video playsinline preload="metadata" aria-label="时间线预览"></video><img data-media-image hidden alt="图像预览"><audio data-media-audio controls hidden></audio><div class="ad-h3-idle-hint"><span>留白，亦是序章</span><span>下一帧，属于你的想象</span></div></section><div class="ad-h3-tabs"><button type="button" data-tab="image">图片</button><button type="button" data-tab="audio">音频</button><button type="button" data-tab="video" class="active">视频</button><span class="ad-h3-tab-hint" data-tab-hint hidden></span></div><div class="ad-h3-loop-actions"><button type="button" data-loop="start">开始</button><button type="button" data-loop="pause">停止</button><button type="button" data-loop="auto">分段循环</button><button type="button" data-loop="redo" title="选中下方任意预览后只重抽该段；运行中请先点「停止」">本段抽卡</button><button type="button" data-clear-preview title="只清空本轮生成进度与选用记录（预览内容与文件保留）">清空重置</button><button type="button" data-clear-media-preview title="只清空当前分类的预览内容（不删除文件、不影响进度）">清空预览</button><div class="ad-h3-loop-hint" data-loop-hint hidden></div><span class="ad-h3-video-actions ad-h3-merge-wrap"><button type="button" data-loop="merge" title="点击选择 A合并或 B合并；Ctrl 点选片段可只合并选中内容">合并片段</button><span class="ad-h3-merge-menu" data-merge-menu hidden><button type="button" data-merge-source="A">A合并</button><button type="button" data-merge-source="B">B合并</button></span></span><button type="button" class="ad-h3-playlist-toggle" data-loop-playlist aria-pressed="false" title="按分段编号循环播放预览视频">循环播放</button></div><div class="ad-h3-panel" data-panel="video"><div class="ad-h3-media-list" data-video-list></div><div class="ad-h3-player-controls"><button data-play aria-label="播放或暂停">播放</button><button data-frame="-1" title="后退一帧" aria-label="后退一帧">上一帧</button><button data-frame="1" title="前进一帧" aria-label="前进一帧">下一帧</button><input data-seek type="range" min="0" max="0" step="1" value="0" aria-label="播放位置"><span data-time>0.00 / 0.00 秒</span><button data-mute aria-label="切换静音">取消静音</button><select data-rate aria-label="播放速度"><option value="0.5">0.5 倍速</option><option value="1" selected>1 倍速</option><option value="1.5">1.5 倍速</option><option value="2">2 倍速</option></select><button data-fullscreen aria-label="全屏预览">全屏</button></div><aside class="ad-h3-strips"><div class="ad-h3-strip-row"><span>分段生成A</span><div class="ad-h3-segments"></div></div><div class="ad-h3-strip-row"><span>分段生成B</span><div class="ad-h3-segments-b"></div></div><div class="ad-h3-strip-row"><span>合并生成</span><div class="ad-h3-merges"></div></div></aside></div><div class="ad-h3-panel" data-panel="image" hidden><aside class="ad-h3-cat-strips"><div class="ad-h3-strip-row"><span>图片A</span><div class="ad-h3-media-list" data-image-list></div></div><div class="ad-h3-strip-row"><span>图片B</span><div class="ad-h3-media-list" data-image-list-b></div></div></aside></div><div class="ad-h3-panel" data-panel="audio" hidden><aside class="ad-h3-cat-strips"><div class="ad-h3-strip-row"><span>音频A</span><div class="ad-h3-media-list" data-audio-list></div></div><div class="ad-h3-strip-row"><span>音频B</span><div class="ad-h3-media-list" data-audio-list-b></div></div></aside></div></div>`;
     const video = root.querySelector("video"), title = root.querySelector(".ad-h3-preview-title");
     const imageView = root.querySelector("[data-media-image]"), audioView = root.querySelector("[data-media-audio]");
     const layout = root.querySelector(".ad-h3-preview-layout");
@@ -1050,9 +1050,11 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
     const tabButtons = [...root.querySelectorAll("[data-tab]")];
     const panels = {image: root.querySelector('[data-panel="image"]'), audio: root.querySelector('[data-panel="audio"]'), video: root.querySelector('[data-panel="video"]')};
     const mediaLists = {image: root.querySelector("[data-image-list]"), audio: root.querySelector("[data-audio-list]"), video: root.querySelector("[data-video-list]")};
+    const mediaListsB = {image: root.querySelector("[data-image-list-b]"), audio: root.querySelector("[data-audio-list-b]")};
     const mediaRecords = {image: [], audio: [], video: []};
     // 预览分类卡片按 (kind, origin, file) 复用 DOM：新结果只追加/更新一张卡，不重建整表。
     const mediaCards = {image: new Map(), audio: new Map(), video: new Map()};
+    const mediaCardsB = {image: new Map(), audio: new Map()};
     // 每页最多绘制200条；完整历史按最近10组保留，显示限额不截断历史。
     const MEDIA_DISPLAY_LIMIT = 200;
     const mediaCardKey = (kind, record) => `${kind}|${record?.role||"A"}|${record?.origin || "media"}|${record?.file || ""}`;
@@ -1374,7 +1376,6 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         try { node.properties ||= {}; node.properties.ad_h3_active_tab = kind; } catch {}
         for (const button of tabButtons) button.classList.toggle("active", button.dataset.tab === kind);
         for (const [name, panel] of Object.entries(panels)) if (panel) panel.hidden = name !== kind;
-        for (const [name, record] of Object.entries(mediaRecords)) if (mediaLists[name]) mediaLists[name].parentElement && (panels[name].hidden = name !== kind);
         markCards();
         const videoActions = root.querySelector(".ad-h3-video-actions");
         if (videoActions) videoActions.style.display = kind === "video" ? "flex" : "none";
@@ -1427,14 +1428,10 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
                                               : "该预览缺少段号，本段抽卡将重抽当前段");
         }
     }
-    function renderMedia(kind) {
-        const list = mediaLists[kind];
+    function renderMediaGroup(kind, groupKey, list, owned, recordsAll, pageStoreKey) {
         if (!list) return;
-        const owned = mediaCards[kind];
-        const current = activeRoundNo();
-        const all = mediaRecords[kind].filter(record => !current || recordRoundNo(record)===current);
-        const page = Math.max(0,Math.min(mediaPages[kind],Math.ceil(all.length/MEDIA_DISPLAY_LIMIT)-1));
-        const records = all.slice(page*MEDIA_DISPLAY_LIMIT,(page+1)*MEDIA_DISPLAY_LIMIT);
+        const page = Math.max(0, Math.min(Number(mediaPages[pageStoreKey]) || 0, Math.ceil(recordsAll.length / MEDIA_DISPLAY_LIMIT) - 1));
+        const records = recordsAll.slice(page * MEDIA_DISPLAY_LIMIT, (page + 1) * MEDIA_DISPLAY_LIMIT);
         const wanted = new Set();
         records.forEach((record, index) => {
             const key = mediaCardKey(kind, record);
@@ -1456,14 +1453,12 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
                 owned.set(key, button);
             }
             button.dataset.file = record.file || ""; button.dataset.origin = record.origin || "media";
-            // 重抽结果：编号标黄，方便和普通结果区分。
             button.classList.toggle("redraw", !!record.redraw);
             button.title = record.redraw ? "本段抽卡结果（黄色编号）" : "";
             const labelText = recordLabel(record, index);
             const media = button.firstElementChild;
             let thumbURL = "";
             if (kind === "video") {
-                // 使用后端首帧 webp 缩略图（24h 缓存）；不再为每张卡片创建 video 解码器/媒体请求。
                 thumbURL = thumbnailUrl(record.origin || "media", record.file);
             } else if (kind === "image") {
                 thumbURL = record.thumb_b64
@@ -1493,11 +1488,9 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
                 show({...record, kind, label: recordLabel(record, index), url: mediaUrl(record.origin || "media", record.file)});
                 markActiveCard(record);
                 setRedoTarget(record, button);
-                // 点选只切换素材与本段抽卡目标；试听由播放器的播放按钮触发。
             };
             list.append(button);
         });
-        // 只移除本轮不再需要的卡片；已有卡片不重建、不重新加载缩略图。
         for (const [key, button] of [...owned]) {
             if (wanted.has(key)) continue;
             button.remove(); owned.delete(key);
@@ -1512,10 +1505,24 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
             list.append(empty);
         } else if (empty) empty.remove();
         for (const stale of list.querySelectorAll(".ad-h3-history-control")) stale.remove();
-        const pageKey=`media:${kind}`;historyPages.set(pageKey,page);
-        appendHistoryPager(list,{all,page,key:pageKey,open:true},()=>{mediaPages[kind]=historyPages.get(pageKey);renderMedia(kind);});
-        const visible = mediaLists[kind]?.parentElement && !mediaLists[kind].parentElement.hidden;
-        scheduleMediaResize(visible ? 200 : 240);
+        const pageKey = `media:${kind}:${groupKey}`;
+        historyPages.set(pageKey, page);
+        appendHistoryPager(list, {all: recordsAll, page, key: pageKey, open: true}, () => {
+            mediaPages[pageStoreKey] = historyPages.get(pageKey);
+            renderMedia(kind);
+        });
+    }
+    function renderMedia(kind) {
+        const current = activeRoundNo();
+        const all = mediaRecords[kind].filter(record => !current || recordRoundNo(record) === current);
+        if (kind === "video") {
+            renderMediaGroup(kind, "all", mediaLists[kind], mediaCards[kind], all, kind);
+        } else {
+            renderMediaGroup(kind, "A", mediaLists[kind], mediaCards[kind], all.filter(record => (record.role || "A") !== "B"), kind);
+            renderMediaGroup(kind, "B", mediaListsB[kind], mediaCardsB[kind], all.filter(record => record.role === "B"), `${kind}B`);
+        }
+        const visiblePanel = !panels[kind] || !panels[kind].hidden;
+        scheduleMediaResize(visiblePanel ? 200 : 240);
     }
     for (const button of tabButtons) button.onclick = () => setTab(button.dataset.tab);
     const clearButton = root.querySelector("[data-clear-preview]");
@@ -2157,7 +2164,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
             badge.style.display = number ? "block" : "none";
         }
         for (const kind of ["image", "audio", "video"]) {
-            for (const button of mediaCards[kind].values()) {
+            for (const button of [...mediaCards[kind].values(), ...(mediaCardsB[kind]?.values?.() || [])]) {
                 button.classList.toggle("merge-selected", mergeSelection.has(`${button.dataset.origin || "media"}/${button.dataset.file}`));
             }
         }
@@ -2622,6 +2629,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
             for (const image of root.querySelectorAll("img")) image.removeAttribute("src");
             mediaInfoCache.clear();cards.clear();
             for (const owned of Object.values(mediaCards)) owned.clear();
+            for (const owned of Object.values(mediaCardsB)) owned.clear();
         }};
 }
 
