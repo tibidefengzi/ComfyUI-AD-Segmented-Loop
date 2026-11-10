@@ -43,6 +43,7 @@ EMPTY_TIMELINE = json.dumps({
     "video_tracks": [[], [], []],
     "audio_tracks": [[], [], []],
     "images": [],
+    "board_images": [],
     "split_points": [_DEFAULT_SEG_FRAMES * index / FPS for index in range(1, _DEFAULT_SEG_COUNT)],
     "segment_recipe": {"frames": _DEFAULT_SEG_FRAMES, "count": _DEFAULT_SEG_COUNT, "unit": "f"},
 }, separators=(",", ":"), ensure_ascii=False)
@@ -204,7 +205,7 @@ def validate_timeline(config):
         sources[sid] = {"id": sid, "kind": source["kind"], "origin": source["origin"],
                         "file": source["file"], "name": str(source.get("name") or source["file"]),
                         "duration": None if duration is None else float(duration)}
-        for field in ("priority", "original", "normalization", "preview", "width", "height", "fps", "frames", "has_audio", "muted", "crop_target"):
+        for field in ("priority", "original", "normalization", "preview", "width", "height", "fps", "frames", "has_audio", "muted", "crop_target", "board_only"):
             if field in source:
                 sources[sid][field] = source[field]
 
@@ -292,7 +293,9 @@ def validate_timeline(config):
         raise ValueError("总时长必须是正数；留空则自动取最远片段末端")
     injected_points = []
     has_clips = any(lane for lane in (*tracks["video_tracks"], *tracks["audio_tracks"]))
-    image_sources = [source for source in sources.values() if source["kind"] == "image"]
+    image_sources = [source for source in sources.values()
+                     if source["kind"] == "image" and not source.get("board_only")]
+    # 分镜图源是独立用途，不允许它把纯图片模式判成混合模式（否则会改走 split_points，段数被改变）。
     image_only = (not has_clips and bool(image_sources)
                   and all(source["kind"] == "image" for source in sources.values())
                   and not any(source.get("priority") for source in sources.values()))
@@ -324,9 +327,20 @@ def validate_timeline(config):
         injected_points = []
 
     split_source = forced_points if forced_points is not None else [*(config.get("split_points") or []), *injected_points]
+    board_images = []
+    raw_boards = config.get("board_images")
+    if isinstance(raw_boards, list):
+        for value in raw_boards:
+            if value is None:
+                board_images.append(None)
+            elif isinstance(value, str) and value in sources and sources[value]["kind"] == "image":
+                board_images.append(value)
+            else:
+                board_images.append(None)
     state = {"version": TIMELINE_VERSION, "duration": None if duration is None else float(duration),
              "sources": list(sources.values()), "video_tracks": tracks["video_tracks"],
              "audio_tracks": tracks["audio_tracks"], "images": images,
+             "board_images": board_images,
              "split_points": snap_points(split_source),
              "segmentation": config.get("segmentation", "markers")}
     if forced_points is not None:
@@ -486,7 +500,10 @@ def output_timeline(state):
                 enabled.update(clip["source"] for clip in lane)
             result[key].append(lane if active else [])
     excluded = placed - enabled
-    result["sources"] = [source for source in state.get("sources") or [] if source["id"] not in excluded]
+    real_sources = [source for source in state.get("sources") or [] if source["id"] not in excluded]
+    # 分镜图专用素材独立保留，不能参与参考图端口/纯图片模式，否则会把参考口撑满并让分镜口索引错位。
+    result["board_sources"] = [source for source in real_sources if source.get("board_only")]
+    result["sources"] = [source for source in real_sources if not source.get("board_only")]
     return result
 
 
@@ -516,6 +533,10 @@ def derive_segments(state):
     state = output_timeline(state)
     bounds = [t for pair in intervals for t in pair]  # [s0,e0,s1,e1,…]；空隙不入清单
     sources = {source["id"]: source for source in state["sources"]}
+    # 同一素材可能既作参考图又作分镜图：查分镜源时必须同时覆盖普通源和 board_only 源。
+    board_sources = {source["id"]: source for source in
+                     (list(state.get("sources") or []) + list(state.get("board_sources") or []))}
+    raw_boards = state.get("board_images") if isinstance(state.get("board_images"), list) else []
     entries = []
     versions = {(source["origin"], source["file"]): asset_version(source) for source in state["sources"]}
     for index, (start, end) in enumerate(intervals):
@@ -549,6 +570,9 @@ def derive_segments(state):
             "images": [{"origin": sources[image["source"]]["origin"], "file": sources[image["source"]]["file"],
                         "name": sources[image["source"]]["name"], "segment": image["segment"]}
                        for image in state["images"] if image["segment"] == index + 1],
+            # 分镜参考图参与本段生成依赖：换图/换段都要能改变 entry id 与生成签名。
+            "board_image": ({"id": raw_boards[index], **asset_version(board_sources[raw_boards[index]])}
+                            if index < len(raw_boards) and raw_boards[index] in board_sources else None),
         })
     for index, entry in enumerate(entries):
         references = [sources[image["source"]] for image in state["images"] if image["segment"] in (-1, index + 1)]
@@ -567,7 +591,7 @@ def derive_segments(state):
         start, end = intervals[index]
         content = [REVISION, index, start, end,
                    entry["timeline_audio"], entry["video_source"], entry["images"], entry["reference_images"], entry["source_versions"],
-                   entry["muted_tracks"], entry["video_audio_muted"]]
+                   entry["muted_tracks"], entry["video_audio_muted"], entry.get("board_image")]
         content.append(entry["reference_video_sources"])
         entry["id"] = digest(content)[:24]
     return {"entries": entries, "duration": duration, "bounds": bounds, "intervals": intervals}
@@ -653,7 +677,7 @@ def timeline_identity(raw):
         except Exception:
             files.append((source.get("id"), source.get("file")))
     return digest([REVISION, files, config.get("video_tracks"), config.get("audio_tracks"),
-                   config.get("images"), config.get("split_points"), config.get("duration"), config.get("segmentation"),
+                   config.get("images"), config.get("board_images"), config.get("split_points"), config.get("duration"), config.get("segmentation"),
                    config.get("muted_tracks"), config.get("disabled_tracks"), [source.get("muted", False) for source in config.get("sources") or []],
                    config.get("generation_clips")])
 

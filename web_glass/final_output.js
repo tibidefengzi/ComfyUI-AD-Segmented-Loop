@@ -24,6 +24,12 @@ style.textContent = `
 .ad-final-ab-bar [data-ab-time]{color:#dfe7f3;font-size:12px;white-space:nowrap;min-width:112px;text-align:right}
 .ad-final-ab[data-mode=image] .ad-final-ab-bar [data-ab-play],.ad-final-ab[data-mode=image] .ad-final-ab-bar [data-ab-seek],.ad-final-ab[data-mode=image] .ad-final-ab-bar [data-ab-time]{display:none}
 .ad-final-ab[data-mode=image] .ad-final-ab-bar{justify-content:flex-end;background:#0008}
+.ad-final-ab:fullscreen{width:100vw;height:100vh;border-radius:0;background:#000}
+.ad-final-ab:fullscreen .ad-final-ab-labels{font-size:14px;left:16px;right:16px;top:10px}
+.ad-final-ab:fullscreen .ad-final-ab-hint{bottom:74px;font-size:13px;left:16px;right:16px}
+.ad-final-ab:fullscreen .ad-final-ab-bar{padding:10px 16px;gap:10px;background:#000d}
+.ad-final-ab:fullscreen .ad-final-ab-bar button{min-height:32px;height:32px;padding:4px 14px;font-size:13px}
+.ad-final-ab:fullscreen .ad-final-ab-bar input[type=range]{flex:1 1 auto}
 .ad-final-status{min-height:24px;overflow-wrap:anywhere;color:var(--ad-warn,#e8c26a);font-size:15px;font-weight:700;letter-spacing:.2px}.ad-final-status.error{color:var(--ad-danger-text,#ffb4b9)}.ad-final-row{display:flex;gap:8px;align-items:flex-start;width:100%;border:1px solid var(--ad-border-soft,#3a3a3a);border-radius:8px;background:var(--ad-surface,#252525);padding:4px 8px;min-height:104px;margin-top:6px}.ad-final-row>span{flex:0 0 72px;color:var(--ad-text-dim,#aab3c2);font-size:13px;padding-top:6px}.ad-final-list{display:flex;flex-wrap:wrap;gap:6px;max-height:340px;overflow:auto;flex:1;min-height:96px;padding:2px 0}.ad-final-list>span{color:var(--ad-text-mute,#8b95a3);font-size:12px;padding:6px}.ad-final-card{position:relative;padding:0!important;background:var(--ad-surface-deep,#1e1e1e)!important;flex:0 0 160px;width:160px;min-height:96px;overflow:hidden;border-color:var(--ad-border,#454545)!important;border-radius:7px}.ad-final-card img,.ad-final-card .audio{width:158px;height:89px;object-fit:contain;background:var(--ad-screen,#0d0d0d);display:block}.ad-final-card .audio{font-size:40px;line-height:89px}.ad-final-card span:last-child{display:block;font-size:12px;overflow-wrap:anywhere;padding:2px 4px}.ad-final-card .remove{position:absolute;right:3px;top:2px;background:#151b24bb;border-radius:3px;padding:0 5px;color:#fff}.ad-final-card.selected{outline:2px solid var(--ad-accent-soft,#92b7ff)}.ad-final-title{margin-top:8px;color:var(--ad-text-dim,#aab3c2)}.ad-h3-media-card.merge-selected{outline:2px solid var(--ad-accent-soft,#92b7ff)}
 .ad-final-tools button.on{background:var(--ad-accent,#3769c7);border-color:var(--ad-accent-border,#4d7ed8);color:#fff;outline:2px solid var(--ad-accent-soft,#92b7ff)}
 `;
@@ -70,7 +76,7 @@ export function mountFinalSave(node) {
     root.innerHTML=`<div class="ad-final-screen"><img hidden><video hidden controls controlslist="nodownload" playsinline preload="metadata"></video><audio hidden controls preload="metadata"></audio><span data-idle>在来源预览中选择成果，再点加工所选</span>
 <div class="ad-final-ab" data-ab hidden><img data-ab-img-a alt="源" hidden><img data-ab-img-b class="ad-final-ab-b" alt="成品" hidden><video data-ab-video-a class="ad-final-ab-a" muted playsinline preload="auto" hidden></video><video data-ab-video-b class="ad-final-ab-b" muted playsinline preload="auto" hidden></video>
 <div class="ad-final-ab-divider" data-ab-divider></div><div class="ad-final-ab-labels"><span>源 · 分段预览</span><span>成品 · 最终保存</span></div><div class="ad-final-ab-hint" data-ab-hint hidden></div>
-<div class="ad-final-ab-bar"><button type="button" data-ab-play>播放</button><input type="range" data-ab-seek min="0" max="0" step="0.001" value="0" aria-label="对比播放位置"><span data-ab-time>0:00.00 / 0:00.00</span><button type="button" data-ab-retry hidden>重试</button><button type="button" data-ab-exit>退出对比</button></div></div>
+<div class="ad-final-ab-bar"><button type="button" data-ab-play>播放</button><input type="range" data-ab-seek min="0" max="0" step="0.001" value="0" aria-label="对比播放位置"><span data-ab-time>0:00.00 / 0:00.00</span><button type="button" data-ab-retry hidden>重试</button><button type="button" data-ab-full>全屏</button><button type="button" data-ab-exit>退出对比</button></div></div>
 </div>
 <div class="ad-final-tools"><button data-start>加工所选</button><button data-stop>停止</button><button data-resume>继续剩余</button><button data-merge>合并片段</button><button data-ab-source hidden title="对比这条成品的源预览与最终成品">源/成品 A/B</button><button data-quality title="打开后预览/对比使用原分辨率、原帧率、yuv420p 高画质代理（硬件解码，接近原画）；关闭使用 720p/30fps 轻量预览">高画质预览</button><button data-download hidden title="保存当前成果的母版文件（最终_*.mp4），不是预览代理">下载母版</button></div>
 <div class="ad-final-status" aria-live="polite"></div><div class="ad-final-tabs"><button data-kind="image">图片</button><button data-kind="audio">音频</button><button data-kind="video">视频</button></div>
@@ -127,15 +133,33 @@ export function mountFinalSave(node) {
     const abOverlay=$("[data-ab]"),abImgA=$("[data-ab-img-a]"),abImgB=$("[data-ab-img-b]");
     const abVideoA=$("[data-ab-video-a]"),abVideoB=$("[data-ab-video-b]");
     const abDivider=$("[data-ab-divider]"),abHint=$("[data-ab-hint]");
-    const abPlay=$("[data-ab-play]"),abSeek=$("[data-ab-seek]"),abTime=$("[data-ab-time]"),abExit=$("[data-ab-exit]"),abRetry=$("[data-ab-retry]");
+    const abPlay=$("[data-ab-play]"),abSeek=$("[data-ab-seek]"),abTime=$("[data-ab-time]"),abExit=$("[data-ab-exit]"),abRetry=$("[data-ab-retry]"),abFull=$("[data-ab-full]");
     let abOpen=false,abMode="",abRatio=.5,abDragging=false,abToken=0,abDuration=0;
     let abReadyA=false,abReadyB=false,abFailedA=false,abFailedB=false,abBuffering=false,abRecord=null,abSource=null;
     const qualityButton=$("[data-quality]"),downloadButton=$("[data-download]");
+    const finalScreen=$(".ad-final-screen");
+    // 与分段预览一致：点击最终成果画面 = 本条最终视频循环播放 / 暂停。
+    const togglePreviewPlayback=()=>{
+        if(!active||active.kind!=="video"||video.hidden||abOpen)return;
+        if(video.paused){video.loop=true;void video.play().catch(()=>{});}
+        else video.pause();
+    };
     const abClock=value=>{
         const total=Math.max(0,Number(value)||0),minutes=Math.floor(total/60),seconds=Math.floor(total%60),cents=Math.floor((total%1)*100);
         return `${minutes}:${String(seconds).padStart(2,"0")}.${String(cents).padStart(2,"0")}`;
     };
     const abSetHint=text=>{if(!abHint)return;abHint.textContent=text||"";abHint.hidden=!text;};
+    const abInFullscreen=()=>!!document.fullscreenElement&&!!abOverlay&&abOverlay.contains(document.fullscreenElement);
+    const abUpdateFullButton=()=>{if(!abFull)return;abFull.textContent=abInFullscreen()?"退出全屏":"全屏";};
+    const abToggleFullscreen=async()=>{
+        if(!abFull||!abOverlay)return;
+        try{
+            if(abInFullscreen())await document.exitFullscreen?.();
+            else if(abOverlay.requestFullscreen)await abOverlay.requestFullscreen();
+            else say("当前浏览器不支持全屏对比。",true);
+        }catch(error){say(`全屏失败：${error?.message||error}`,true);}
+        abUpdateFullButton();
+    };
     const abSetRatio=value=>{
         abRatio=Math.min(.95,Math.max(.05,Number(value)||.5));
         const clip=`inset(0 0 0 ${(abRatio*100).toFixed(3)}%)`;
@@ -164,7 +188,7 @@ export function mountFinalSave(node) {
             if(abRetry)abRetry.hidden=true;
             
             abTime.textContent=`0:00.00 / ${abClock(abDuration)}`;
-            abSetHint("按时间同步播放；超分/插帧后帧号不对应，可用分界线看画面差异，或点「原画细节」做 1:1 静帧对比");
+            abSetHint("按时间同步播放；超分/插帧后帧号不对应，可用分界线看画面差异；点「全屏」可全屏对比");
             return;
         }
         abPause();abToggleControls(false);
@@ -176,6 +200,8 @@ export function mountFinalSave(node) {
     };
     const abResetView=()=>{
         abOpen=false;abToken++;abPause();abDragging=false;
+        if(abInFullscreen()){try{void document.exitFullscreen?.();}catch{}}
+        abUpdateFullButton();
         
         abReadyA=false;abReadyB=false;abFailedA=false;abFailedB=false;abBuffering=false;abRecord=null;abSource=null;
         if(abRetry)abRetry.hidden=true;
@@ -221,6 +247,7 @@ export function mountFinalSave(node) {
     const show=(record,{keepTime=0,autoPlay=false}={})=>{
         if(abOpen)abResetView();
         active=record;video.pause();audio.pause();
+        video.loop=false;audio.loop=false; // 切换成果默认只播一遍；点画面后才进入本段/本条循环
         video.onerror=null;video.onloadedmetadata=null;
         for(const media of [video,audio,image])media.hidden=true;
         $("[data-idle]").hidden=true;
@@ -265,6 +292,7 @@ export function mountFinalSave(node) {
         const record=active,source=record.source_record;
         abRecord=record;abSource=source;
         abOpen=true;abToken++;abMode=record.kind;abDuration=0;
+        if(abFull){abFull.hidden=!document.fullscreenEnabled;abUpdateFullButton();}
         abReadyA=false;abReadyB=false;abFailedA=false;abFailedB=false;abBuffering=false;
         abOverlay.hidden=false;abOverlay.dataset.mode=abMode;
         video.pause();audio.pause();
@@ -298,6 +326,9 @@ export function mountFinalSave(node) {
         if(record)show(record);
     };
     abExit.onclick=()=>closeAB();
+    if(abFull)abFull.onclick=()=>void abToggleFullscreen();
+    document.addEventListener("fullscreenchange",abUpdateFullButton);
+    abUpdateFullButton();
     if(abRetry)abRetry.onclick=()=>{
         if(!abOpen||!canAB(active))return;
         abResetView();
@@ -524,6 +555,18 @@ export function mountFinalSave(node) {
         finally{preparing=false;buttons();}
     };
     $("[data-stop]").onclick=()=>{stopped=true;say('正在停止本次加工…');void interruptOwnedPrompt(api,owner).catch(error=>say(error.message,true));};
+    finalScreen.addEventListener("click",event=>{
+        if(!active||active.kind!=="video"||video.hidden||abOpen)return;
+        if(event.target.closest?.("button,input,select,a,.ad-final-ab,.ad-final-tools"))return;
+        if(event.target===video&&video.controls){
+            const rect=video.getBoundingClientRect();
+            const scale=rect.height/(video.offsetHeight||rect.height||1);
+            if(event.clientY>=rect.bottom-44*scale)return;
+        }
+        event.preventDefault();event.stopPropagation();
+        togglePreviewPlayback();
+    });
+    video.title="点击画面：本条循环播放 / 再次点击暂停";
     for(const button of root.querySelectorAll('[data-kind]'))button.onclick=()=>{if(abOpen)abResetView();video.pause();audio.pause();kind=button.dataset.kind;selected.clear();active=null;for(const media of [video,audio,image])media.hidden=true;$("[data-idle]").hidden=false;render();};
     $("[data-merge]").onclick=async()=>{
         if(busy||preparing)return;

@@ -3,7 +3,7 @@
 // - 旧工作流：加载时把三个外部 H3Relay 节点迁移掉，保留连线/参数；之后同样走内部注入。
 // - 选择器 0 = 关闭，5/22/39 = 开启；C 直接由选择器决定。
 
-export const INTERNAL_TYPES = ["ADH3InternalBridge", "ADH3InternalSave", "ADH3InternalTrim", "AD_FinalSink"];
+export const INTERNAL_TYPES = ["ADH3InternalBridge", "ADH3InternalSave", "ADH3InternalTrim", "ADH3InternalAppearanceAnchor", "AD_FinalSink"];
 export const RELAY_LABELS = {
     0: "0 · 关闭",
     5: "5 · 上下文5帧",
@@ -33,6 +33,28 @@ const num = v => {
 
 function widget(node, name) {
     return (node?.widgets || []).find(w => w.name === name);
+}
+
+// 锚定配置保存在节点 properties（不新增原生 widget，旧工作流 widget_values 不受影响）。
+// 默认：锚强度 1（全强）、外观锚每 3 段、历史锚/声锚关闭。
+export const ANCHOR_DEFAULTS = { strength: 1, appearance: 3, history: 0, voice: 0 };
+const ANCHOR_APPEARANCE_STEPS = [0, 2, 3, 5, 7, 10];
+
+export function normalizeAnchorConfig(raw) {
+    const cfg = { ...ANCHOR_DEFAULTS };
+    if (!raw || typeof raw !== "object") return cfg;
+    const strength = Number(raw.strength);
+    cfg.strength = Number.isFinite(strength) ? (strength >= 0.75 ? 1 : (strength > 0 ? 0.5 : 0)) : ANCHOR_DEFAULTS.strength;
+    const appearance = Number(raw.appearance);
+    cfg.appearance = ANCHOR_APPEARANCE_STEPS.includes(appearance) ? appearance : ANCHOR_DEFAULTS.appearance;
+    const history = Number(raw.history);
+    cfg.history = Number.isFinite(history) ? Math.max(0, Math.min(3, Math.round(history))) : ANCHOR_DEFAULTS.history;
+    cfg.voice = raw.voice === true || raw.voice === 1 || raw.voice === "1" ? 1 : 0;
+    return cfg;
+}
+
+export function anchorConfigOf(node) {
+    return normalizeAnchorConfig(node?.properties?.ad_h3_anchor);
 }
 
 function relayChoice(node) {
@@ -345,6 +367,8 @@ export function injectHiddenRelay(serialized, graph) {
         const audioLink = promptLink(create, "audio");
         const generatedAudio = originatesFromDecodedAudio(prompt, audioLink);
         const contextFrames = relayChoice(segmentNode);
+        const anchorConfig = anchorConfigOf(segmentNode);
+        const anchorJson = JSON.stringify(anchorConfig);
         const bridgeId = String(id++);
         const saveId = String(id++);
         const trimId = String(id++);
@@ -356,10 +380,33 @@ export function injectHiddenRelay(serialized, graph) {
                 context_frames: contextFrames,
                 mask_mode: "hard",
                 pin_audio: true,
+                anchor_config: anchorJson,
             },
             _meta: { title: "AD-内部潜桥桥接" },
         };
         sampler.inputs.latent_image = [bridgeId, 0];
+        // 外观锚/历史锚：把锚段开头帧作为 minimax_refs 追加进 H3 conditioning。
+        // 只改条件链，不改 latent / 帧数 / 裁头 ⇒ 接缝不跳。
+        if (anchorConfig.appearance > 0 || anchorConfig.history > 0) {
+            const guiderLink = promptLink(sampler, "guider");
+            const guider = guiderLink ? prompt[String(guiderLink[0])] : null;
+            const conditioningLink = guider ? promptLink(guider, "conditioning") : null;
+            if (guider && conditioningLink) {
+                const anchorId = String(id++);
+                prompt[anchorId] = {
+                    class_type: "ADH3InternalAppearanceAnchor",
+                    inputs: {
+                        conditioning: conditioningLink,
+                        relay_context: [segId, contextIdx],
+                        anchor_config: anchorJson,
+                    },
+                    _meta: { title: "AD-内部锚定" },
+                };
+                guider.inputs.conditioning = [anchorId, 0];
+            } else {
+                console.warn("[AD-潜桥] 外观/历史锚未生效：找不到 BasicGuider 的 conditioning 输入");
+            }
+        }
         prompt[saveId] = {
             class_type: "ADH3InternalSave",
             inputs: {

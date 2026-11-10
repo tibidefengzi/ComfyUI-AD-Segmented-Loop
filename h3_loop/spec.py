@@ -22,6 +22,19 @@ def relay_parent_stage(index, reanchor):
     return (0 if reanchor else index - 1) if index > 0 else None
 
 
+def relay_segment_context(context_frames, index):
+    """本段实际使用的潜桥上下文帧数。
+
+    第 1 段没有上一段可接，仍按 C 帧预卷生成再裁头是纯浪费（默认 22 帧 = 0.92 秒）；
+    但 H3 生成长度必须落在 5+17k 网格，输出 17n 帧不能直接生成（17n 不在网格）。
+    所以第 1 段只保留最小合法余量 5 帧：H3 生成=输出+5，裁头 5；第 2 段起才用用户选择的 C。
+    """
+    context = int(context_frames or 0)
+    if context <= 0:
+        return context
+    return 5 if int(index) <= 0 else context
+
+
 def frame_index(seconds):
     """秒 → 帧号；统一 half-up 四舍五入，与前端 Math.round 一致。"""
     return math.floor(float(seconds) * FPS + 0.5)

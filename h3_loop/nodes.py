@@ -9,7 +9,7 @@ from . import assets
 from . import compat
 from .color_match import COLOR_MATCH_CHOICES as _COLOR_MATCH_CHOICES, parse_blend as _color_match_blend, reference_frame_stats
 from .normalization import normalize_source
-from .spec import relay_reanchor_interval as _relay_reanchor_interval, relay_reanchors, relay_parent_stage
+from .spec import relay_reanchor_interval as _relay_reanchor_interval, relay_reanchors, relay_parent_stage, relay_segment_context
 from .audio import h3_window, read_audio_entry, read_pieces
 from .engine import reference_manifest, segment_signatures, template_for
 from .storage import ROOT, STORE, digest
@@ -48,8 +48,8 @@ SEGMENT_REF_NAMES = (
 )
 
 
-SEGMENT_EXTRA_NAMES = ("mask_frames",)
-SEGMENT_EXTRA_TYPES = ("IMAGE",)
+SEGMENT_EXTRA_NAMES = ("mask_frames", "board_image")
+SEGMENT_EXTRA_TYPES = ("IMAGE", "IMAGE")
 
 # 潜桥前置预卷：H3 生成帧必须落在 5+17k 网格；T 是最终目标帧数，C 是桥上下文帧数。
 # G = 最小 5+17k >= T+C，E = G-T-C；动作迁移模式把源窗口向前多取 C+E 帧，
@@ -139,6 +139,7 @@ def _active_image_sources(state, index=None):
     """参与输出的图片素材：路径优先素材独占；否则跳过“禁止输出”(-2)。"""
     scopes = {image.get("source"): image.get("segment", -1) for image in (state.get("images") or [])}
     images = [source for source in (state.get("sources") or []) if source.get("kind") == "image"
+              and not source.get("board_only")
               and scopes.get(source.get("id"), -1) != -2
               and (index is None or scopes.get(source.get("id"), -1) in (-1, 0, index + 1))]
     priority = [source for source in images if source.get("priority")]
@@ -173,7 +174,7 @@ def _single_kind_only(state, kind):
             continue
         if any(lane for lane in lanes):
             return False
-    sources = state.get("sources") or []
+    sources = [source for source in state.get("sources") or [] if not source.get("board_only")]
     return bool(sources) and all(source.get("kind") == kind for source in sources)
 
 
@@ -194,7 +195,8 @@ def _round_image(state, index):
     if _single_kind_only(state, "image"):
         scopes = {image.get("source"): image.get("segment", -1) for image in (state.get("images") or [])}
         images = [source for source in (state.get("sources") or [])
-                  if source.get("kind") == "image" and scopes.get(source.get("id"), -1) != -2]
+                  if source.get("kind") == "image" and not source.get("board_only")
+                  and scopes.get(source.get("id"), -1) != -2]
         if images:
             # 纯图片模式也遵守「第 N 段参考」：本段指定图优先；否则用全局参考；都没有时保留按图片顺序逐段取。
             scoped = any(scopes.get(source.get("id"), -1) > 0 for source in images)
@@ -957,7 +959,8 @@ def _timeline_material_values(queue, used=None, index=None, window=None, *,
     from .spec import frame_index
     state = output_timeline(queue.get("timeline") or {})
     sources = state.get("sources") or []
-    image_sources = [source for source in sources if source.get("kind") == "image"]
+    image_sources = [source for source in sources
+                     if source.get("kind") == "image" and not source.get("board_only")]
     image_scopes = {image.get("source"): image.get("segment", -1) for image in (state.get("images") or [])}
     segment_index = int(index or 0)
     # 参考视频/音频按轨道位置固定（视频1→参考视频1…），空轨也保留位置。
@@ -1065,6 +1068,25 @@ def _timeline_material_values(queue, used=None, index=None, window=None, *,
                     print("[AD-颜色] 读取本段参考色彩失败：%r" % (exc,))
             media_details["color_match_reference"] = color_stats or None
     return values
+
+
+def _board_image(state, source_map, index):
+    """当前段的分镜参考图：按 board_images[段号] 找图片素材；缺失/读不到返回 None。"""
+    board = state.get("board_images")
+    if not isinstance(board, list):
+        return None
+    try:
+        source_id = board[int(index)]
+    except (IndexError, TypeError, ValueError):
+        return None
+    source = source_map.get(source_id) if source_id else None
+    if not source or source.get("kind") != "image":
+        return None
+    try:
+        return assets.load_image_tensor(source)
+    except Exception as exc:
+        print("[AD-分镜] 读取第 %d 段分镜参考图失败：%r" % (int(index) + 1, exc))
+        return None
 
 
 # 清单库只暴露分段清单；参考口改由当前段动态挂载。
@@ -1307,7 +1329,7 @@ class AidenH3Segment:
     def INPUT_TYPES(cls):
         return {"required": {},
                 "optional": {"queue": ("H3_AUDIO_QUEUE",),
-                             "潜桥续接": (list(RELAY_CHOICES), {"default": "0 · 关闭", "tooltip": "0=关闭潜桥；5/22/39=开启潜桥，C为上下文帧数。开启后每段输出=17的倍数，H3生成=输出+C，裁头=C"}),
+                             "潜桥续接": (list(RELAY_CHOICES), {"default": "0 · 关闭", "tooltip": "0=关闭潜桥；5/22/39=开启潜桥，C为上下文帧数。开启后每段输出=17的倍数，H3生成=输出+C，裁头=C；第1段无前序上下文，只按 H3 网格最小合法余量加5帧（生成=输出+5，裁头5），不按 C 预卷"}),
                              "aspect_ratio": (list(ASPECT_CHOICES), {"default": DEFAULT_ASPECT}),
                              "megapixels": ("FLOAT", {"default": 0.5, "min": 0.05, "max": 64.0, "step": 0.1, "tooltip": "百万像素，自由填写"}),
                              "multiple": ("INT", {"default": 32, "min": 1, "max": 64, "tooltip": "倍数（宽高按此倍数对齐）"}),
@@ -1396,7 +1418,7 @@ class AidenH3Segment:
             total = 0
             for size, count in zip(sizes, wanted):
                 total += min(size, count) if isinstance(count, int) and count >= 0 else size
-            return fixed + tuple([None] * total) + (None,)
+            return fixed + tuple([None] * total) + (None, None)
         declared_session = ((prompt.get(str(unique_id)) or {}).get('inputs') or {}).get('session_id') if isinstance(prompt,dict) else None
         session_id = str(kwargs.get("session_id") or declared_session or state.get("session_id") or (f"AD-H3-{unique_id}" if unique_id is not None else "AD-H3-session"))
         fps = float(FPS)
@@ -1459,6 +1481,7 @@ class AidenH3Segment:
         relay_raw = kwargs.get("潜桥续接")
         relay_context = _relay_choice_value(relay_raw)
         relay_active = bool(relay_context > 0 and not batch_source)
+        effective_context = relay_context
         relay_pre_roll = 0
         relay_trim_frames = 0
         relay_reanchor_every = 0
@@ -1472,16 +1495,21 @@ class AidenH3Segment:
             relay_target = _relay_targets_for_entries(entries)[index]
             if relay_target < 17:
                 raise ValueError("潜桥开启时每段至少需要 17 帧目标长度")
-            if relay_target <= relay_context:
-                raise ValueError(f"潜桥上下文 C={relay_context} 必须小于本段输出帧数 {relay_target}")
-            plan = relay_plan(relay_target, relay_context)
+            effective_context = relay_segment_context(relay_context, int(index))
+            if relay_target <= effective_context:
+                raise ValueError(f"潜桥上下文 C={effective_context} 必须小于本段输出帧数 {relay_target}")
+            plan = relay_plan(relay_target, effective_context)
+            if int(index) == 0 and effective_context != relay_context:
+                print("[AD-潜桥] 第 1 段无前序上下文：只加 %d 帧（生成 %d → 输出 %d，裁头 %d），不按 C=%d 预卷"
+                      % (effective_context, plan["generation_frames"], relay_target,
+                         plan["trim_frames"], relay_context))
             # 潜桥输出 L 与上下文 C 都确定后，必须按最终生成帧数 G=L+C 重新核对单段上限，
             # 不能只沿用 h3_window 里按 L 算的旧上限（否则 G 会静默超限）。
             limit_frames = int(settings.get("max_frames") or DEFAULT_SEGMENT_MAX_FRAMES)
             need_frames = int(plan["generation_frames"])
             if need_frames > limit_frames:
                 raise ValueError(
-                    f"潜桥开启后本段需要生成 {need_frames} 帧（输出 {relay_target} 帧 + 上下文 C={relay_context} 帧），"
+                    f"潜桥开启后本段需要生成 {need_frames} 帧（输出 {relay_target} 帧 + 上下文 C={effective_context} 帧），"
                     f"超过单段上限 {limit_frames} 帧；请缩短本段、降低上下文 C，或提高单段上限后再运行。")
             window["target_frames"] = relay_target
             window["frame_count"] = plan["generation_frames"]
@@ -1518,6 +1546,7 @@ class AidenH3Segment:
         active_sizes = [min(size, count) if isinstance(count, int) and count >= 0 else size
                         for size, count in zip(sizes, wanted)]
         extra_slot = len(SEGMENT_FIXED_TYPES) + sum(active_sizes)
+        board_slot = extra_slot + 1
         timeline_video = entry.get("video_source")
         if timeline_video is not None and not batch_source:
             mapped = {"start_frame": round(timeline_video["src_in"] * FPS),
@@ -1547,7 +1576,7 @@ class AidenH3Segment:
                    "relay_stage_index": relay_stage_index,
                    # 裁头必须从 context 拿到 C，否则内部裁头会静默按 0 帧处理（v0.5.4 音频/画面裁切失效的根因）。
                    "relay_trim_frames": int(relay_trim_frames),
-                   "relay_context_frames": int(relay_context),
+                   "relay_context_frames": int(effective_context),
                    "relay_pre_roll_frames": int(relay_pre_roll),
                    "relay_reanchor": bool(relay_reanchor),
                    "relay_reanchor_every": int(relay_reanchor_every),
@@ -1628,7 +1657,11 @@ class AidenH3Segment:
                 extra_frames = _relay_mask_frames(segment_source, window, width, height, relay_pre_roll)
             else:
                 extra_frames = _canvas_mask_frames(segment_source, window, width, height)
-        return fixed + tuple(out_refs) + (extra_frames,)
+        board_source_map = {source["id"]: source
+                            for source in (list(state.get("sources") or []) + list(state.get("board_sources") or []))}
+        board_image = (_board_image(state, board_source_map, index)
+                       if need(board_slot) and not batch_source else None)
+        return fixed + tuple(out_refs) + (extra_frames, board_image)
 
 
 class AidenH3SegmentMedia:
@@ -2316,6 +2349,205 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "AD_RoundBlocked": "AD-本轮排队保护（内部）",
 }
 
+# ---- 潜桥锚定（锚强度 / 外观锚 / 历史锚 / 声锚） ----
+# 上游 H3-Latent-Relay 的这几项能力原本没有接进 AD 的内部桥：
+#   · 锚强度 = anchor_latent(第 1 段) + anchor_blend，把拷入前缀的逐通道统计拉回第 1 段；
+#   · 外观锚 = 第 1 段开头 5 帧作为 minimax_refs 参考块常驻 conditioning；
+#   · 历史锚 = 前 N 段开头 5 帧作为 minimax_refs 参考块（TIHA 的简化实现）；
+#   · 声锚   = voice_anchor_stage=0，用第 1 段的音频 latent 作为音色锚。
+ANCHOR_DEFAULTS = {"strength": 1.0, "appearance": 3, "history": 0, "voice": 0}
+ANCHOR_APPEARANCE_STEPS = (0, 2, 3, 5, 7, 10)
+_ANCHOR_STAGE_CACHE = {}
+
+
+def parse_anchor_config(raw):
+    """解析前端注入的锚定配置；坏值回退默认，不阻断生成。"""
+    data = dict(ANCHOR_DEFAULTS)
+    if raw is None or raw == "":
+        return data
+    try:
+        parsed = json.loads(raw) if isinstance(raw, str) else dict(raw)
+    except Exception:
+        return data
+    if not isinstance(parsed, dict):
+        return data
+    try:
+        strength = float(parsed.get("strength", data["strength"]))
+    except (TypeError, ValueError):
+        strength = float(data["strength"])
+    data["strength"] = 1.0 if strength >= 0.75 else (0.5 if strength > 0 else 0.0)
+    try:
+        appearance = int(parsed.get("appearance", data["appearance"]))
+    except (TypeError, ValueError):
+        appearance = int(data["appearance"])
+    data["appearance"] = appearance if appearance in ANCHOR_APPEARANCE_STEPS else 0
+    try:
+        history = int(parsed.get("history", data["history"]))
+    except (TypeError, ValueError):
+        history = int(data["history"])
+    data["history"] = max(0, min(3, history))
+    voice = parsed.get("voice", data["voice"])
+    data["voice"] = 1 if voice in (True, 1, "1", "true", "True", "on", "开启") else 0
+    return data
+
+
+def _anchor_stage_latent(run_id, stage_index):
+    """读某段稳定 stage 的 AV latent（带缓存，6.1MB/份，避免每段重复读盘）。"""
+    path = _relay_stage_file(run_id, int(stage_index))
+    if not path.is_file():
+        raise FileNotFoundError(str(path))
+    stat = path.stat()
+    key = (str(path), int(stat.st_mtime_ns), int(stat.st_size))
+    cached = _ANCHOR_STAGE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    from ._relay_vendor import relay_core as _relay_core
+    latent = _relay_core.load_av_latent(str(path))
+    if len(_ANCHOR_STAGE_CACHE) >= 8:
+        _ANCHOR_STAGE_CACHE.clear()
+    _ANCHOR_STAGE_CACHE[key] = latent
+    return latent
+
+
+def _anchor_ref_block(run_id, stage_index, frames=5):
+    """把某段开头 frames 帧构建为 H3 原生 minimax_refs 视频参考块。"""
+    from ._relay_vendor import relay_core as _relay_core
+    return _relay_core.build_anchor_ref(_anchor_stage_latent(run_id, int(stage_index)), int(frames))
+
+
+def _relay_audio_pin_state(target):
+    """音频钉住判定：返回 (audio, 规整后的音频 noise_mask)。
+
+    只有目标 latent 带嵌套掩码、且音频掩码存在 <1（被钉住）时才返回；纯视频、
+    无掩码、音频掩码全 1（普通生成）都返回 (None, None)。桥接节点与音频修复
+    共用这一判据，避免两处对“是否钉住”判断不一致。
+    """
+    try:
+        import torch
+        from comfy.nested_tensor import NestedTensor  # noqa: F401
+        import comfy.utils as _comfy_utils
+    except Exception:
+        return None, None
+    if not isinstance(target, dict):
+        return None, None
+    samples = target.get("samples")
+    if samples is None or not getattr(samples, "is_nested", False):
+        return None, None
+    try:
+        _, audio = samples.unbind()
+    except Exception:
+        return None, None
+    source_mask = target.get("noise_mask")
+    audio_mask = None
+    if source_mask is not None and getattr(source_mask, "is_nested", False):
+        try:
+            _, audio_mask = source_mask.unbind()
+        except Exception:
+            audio_mask = None
+    if audio_mask is None:
+        return None, None
+    try:
+        audio_mask = _comfy_utils.reshape_mask(audio_mask.to(audio.device), audio.shape)
+        pinned = not bool((audio_mask.to(torch.float32) >= 1.0 - 1e-3).all())
+    except Exception:
+        return None, None
+    return (audio, audio_mask) if pinned else (None, None)
+
+
+def _relay_audio_fix(bridge_out, target, ctx, stage, reanchor=False, voice_on=False):
+    """潜桥音频钉住/对齐修复：保留音频条件，并把音频内容前置 pre_roll 帧。
+
+    背景：Viggle Remake / VAEEncodeAudio 一类工作流把源音轨编码进 AV latent，并用
+    嵌套 noise_mask=(视频, 音频 0) 把音频钉成“干净目标音频”，口型由它驱动。上游拷贝桥
+    返回时只带视频 noise_mask，会把这层音频钉住覆盖成全生成（H3 改自己编音频），同时
+    音频内容没有随画面一起前置 pre_roll 帧 —— 两件事都会让口型与成片源音轨对不上。
+    这里统一修两件事：
+      1) 输出仍用嵌套 noise_mask：视频沿用桥的拷贝窗掩码，音频沿用输入的钉住掩码；
+      2) 音频内容右移 pre_roll 帧：头部换成上一段音频尾（重锚定/声锚用第 1 段，
+         第 1 段用静音占位），尾部截掉等量。与画面裁头同步 ⇒ 裁头后画面第 0 帧
+         正好对应该段音频第 0 帧，口型不会整体超前。
+    输入没有钉住音频（无嵌套掩码或音频掩码全 1）时原样返回；调用方
+    （ADH3InternalBridge）也会在这之前保持旧的上游参数与旧路径，旧工作流零变化。
+    """
+    try:
+        import torch
+        from comfy.nested_tensor import NestedTensor
+        from ._relay_vendor import relay_core as _relay_core
+    except Exception as exc:
+        print("[AD-潜桥] 音频钉住修复跳过（依赖不可用）：%r" % (exc,))
+        return bridge_out
+    if not isinstance(bridge_out, dict) or not isinstance(target, dict):
+        return bridge_out
+    samples = bridge_out.get("samples")
+    if samples is None or not getattr(samples, "is_nested", False):
+        return bridge_out
+    try:
+        video, audio = samples.unbind()
+    except Exception:
+        return bridge_out
+    # 与桥接节点共用同一钉住判据；未钉住时原样返回，调用方保持旧路径。
+    _, audio_mask = _relay_audio_pin_state(target)
+    if audio_mask is None:
+        return bridge_out
+    try:
+        pre = int(ctx.get("relay_pre_roll_frames") or ctx.get("relay_trim_frames") or 0)
+    except Exception:
+        pre = 0
+    total = int(audio.shape[-1])
+    if pre <= 0 or total <= 1:
+        return bridge_out
+    shift = min(int(math.ceil(pre * float(_relay_core.AUDIO_HZ) / 24.0)), total - 1)
+    run_id = str(ctx.get("relay_run_id") or "ad_relay")
+    head = None
+    note = "静音"
+    if stage > 0:
+        head_stage = 0 if (reanchor or voice_on) else stage - 1
+        try:
+            parent = _anchor_stage_latent(run_id, int(head_stage))
+            tail, take = _relay_core.audio_tail_from_latent(
+                parent, pre,
+                _relay_core.pixel_frames(int(_relay_core.video_from_latent(parent).shape[2])))[:2]
+            take = int(take)
+            if take > 0:
+                shift = min(shift, take, total - 1)
+                head = tail[..., take - shift:]
+                note = "第 %d 段音频尾" % (int(head_stage) + 1)
+        except Exception as exc:
+            print("[AD-潜桥] 音频前导读取失败，改用静音占位（%r）" % (exc,))
+            head = None
+    if shift <= 0:
+        return bridge_out
+    if head is None:
+        head = torch.zeros_like(audio[..., :shift])
+    elif int(head.shape[0]) != int(audio.shape[0]):
+        # 父段 stage 通常 batch=1；目标 batch>1 时旧桥靠切片广播，这里显式广播，
+        # 否则 torch.cat 会报 “Sizes of tensors must match”。
+        try:
+            head = head.expand(audio.shape[0], *head.shape[1:])
+        except RuntimeError as exc:
+            raise ValueError(
+                "潜桥音频前导与本段音频 batch 不一致：前导 %d、本段 %d，无法拼接"
+                % (int(head.shape[0]), int(audio.shape[0]))) from exc
+    new_audio = torch.cat((head.to(device=audio.device, dtype=audio.dtype),
+                           audio[..., :total - shift]), dim=-1)
+    new_mask = torch.cat((torch.zeros_like(audio_mask[..., :shift]),
+                          audio_mask[..., :total - shift]), dim=-1)
+    video_mask = bridge_out.get("noise_mask")
+    if video_mask is not None and getattr(video_mask, "is_nested", False):
+        try:
+            video_mask = video_mask.unbind()[0]
+        except Exception:
+            video_mask = None
+    if video_mask is None:
+        video_mask = torch.ones_like(video)
+    out = dict(bridge_out)
+    out["samples"] = NestedTensor((video, new_audio))
+    out["noise_mask"] = NestedTensor((video_mask, new_mask))
+    print("[AD-潜桥] 音频钉住保留 + 前导 %d tick（%s，%d→%d）"
+          % (shift, note, total, int(new_audio.shape[-1])))
+    return out
+
+
 class ADH3InternalBridge:
     """内部桥：从 AD 分段节点的 context 输出读取 run_id/stage，不接受用户接线。"""
     @classmethod
@@ -2327,18 +2559,38 @@ class ADH3InternalBridge:
         }, "optional": {
             "mask_mode": (["hard", "taper", "ramp", "blend", "window"], {"default": "hard"}),
             "pin_audio": ("BOOLEAN", {"default": True}),
+            "anchor_config": ("STRING", {"default": "{\"strength\":0,\"voice\":0}"}),
         }}
     RETURN_TYPES = ("LATENT",)
     FUNCTION = "run"
     CATEGORY = CATEGORY
     OUTPUT_NODE = False
 
-    def run(self, latent, relay_context, context_frames=22, mask_mode="hard", pin_audio=True):
+    def run(self, latent, relay_context, context_frames=22, mask_mode="hard", pin_audio=True,
+            anchor_config="{}"):
         ctx = relay_context if isinstance(relay_context, dict) else {}
         run_id = str(ctx.get("relay_run_id") or "ad_relay")
         stage = int(ctx.get("relay_stage_index") or 0)
+        cfg = parse_anchor_config(anchor_config)
+        strength = float(cfg.get("strength") or 0.0)
+        voice_on = bool(cfg.get("voice"))
+        anchor_latent = None
+        anchor_blend = strength
+        if stage > 0 and strength > 0:
+            try:
+                anchor_latent = _anchor_stage_latent(run_id, 0)
+            except Exception as exc:
+                print("[AD-潜桥] 锚强度未生效：读第 1 段 stage 失败（%r）" % (exc,))
+                anchor_latent = None
         upstream = _relay_vendor_runtime.H3RelayCopyBridge()
-        if ctx.get("relay_reanchor"):
+        # 只有目标 latent 的音频确实被钉住时才改走 AD 侧音频对齐；否则保持旧路径，
+        # 上游仍按 pin_audio 原参数处理（旧工作流字面零变化；v0.5.46）。
+        audio_pinned = _relay_audio_pin_state(latent)[1] is not None
+        upstream_pin = False if audio_pinned else bool(pin_audio)
+        # 音频被钉住时统一交给 _relay_audio_fix：上游只拷视频窗（pin_audio=False），
+        # 否则上游会把上一段音频覆盖到音频头部，之后无法再做“整体前移”的裁头对齐。
+        reanchor = bool(ctx.get("relay_reanchor"))
+        if reanchor:
             # 分段重锚定：不再读“上一段”的尾 latent，但仍用第 1 段的稳定 stage 作为
             # 全局外观锚（人物身份/服装/环境）。失败时明确停止，避免本段丢失角色身份。
             _require_parent_relay_stage(run_id, stage, reanchor=True)
@@ -2349,14 +2601,76 @@ class ADH3InternalBridge:
                 result = upstream.bridge(latent, context_latent=anchor,
                                          context_frames=int(context_frames),
                                          mask_mode=str(mask_mode or "hard"),
-                                         pin_audio=bool(pin_audio),
+                                         pin_audio=upstream_pin,
                                          run_id=run_id, stage_index=stage)
             except Exception as exc:
                 raise ValueError(f"潜桥重锚定失败，本轮第 1 段外观锚无法读取或无法与本段续接：{exc}") from exc
-            return (result[0],)
+            if not audio_pinned:
+                return (result[0],)
+            return (_relay_audio_fix(result[0], latent, ctx, stage, reanchor=True, voice_on=voice_on),)
+        bridge_kwargs = {}
+        if anchor_latent is not None:
+            bridge_kwargs["anchor_latent"] = anchor_latent
+            bridge_kwargs["anchor_blend"] = anchor_blend
         result = upstream.bridge(latent, context_frames=int(context_frames), mask_mode=str(mask_mode or "hard"),
-                                 pin_audio=bool(pin_audio), run_id=run_id, stage_index=stage)
-        return (result[0],)
+                                 pin_audio=upstream_pin, run_id=run_id, stage_index=stage,
+                                 **bridge_kwargs)
+        if not audio_pinned:
+            return (result[0],)
+        return (_relay_audio_fix(result[0], latent, ctx, stage, reanchor=False, voice_on=voice_on),)
+
+
+class ADH3InternalAppearanceAnchor:
+    """内部外观/历史锚：把锚段开头几帧追加进 H3 conditioning（不改 latent，不跳）。"""
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "conditioning": ("CONDITIONING",),
+            "relay_context": ("H3_LOOP_CONTEXT",),
+        }, "optional": {
+            "anchor_config": ("STRING", {"default": "{}"}),
+        }}
+    RETURN_TYPES = ("CONDITIONING",)
+    FUNCTION = "run"
+    CATEGORY = CATEGORY
+    OUTPUT_NODE = False
+
+    def run(self, conditioning, relay_context, anchor_config="{}"):
+        ctx = relay_context if isinstance(relay_context, dict) else {}
+        run_id = str(ctx.get("relay_run_id") or "ad_relay")
+        stage = int(ctx.get("relay_stage_index") or 0)
+        cfg = parse_anchor_config(anchor_config)
+        appearance = int(cfg.get("appearance") or 0)
+        history = int(cfg.get("history") or 0)
+        if stage <= 0 or (appearance <= 0 and history <= 0):
+            return (conditioning,)
+        refs = []
+        notes = []
+        if appearance > 0 and (stage + 1) % appearance == 0:
+            try:
+                refs.append(_anchor_ref_block(run_id, 0))
+                notes.append("外观锚=第1段")
+            except Exception as exc:
+                print("[AD-潜桥] 外观锚未生效（%r）" % (exc,))
+        for offset in range(1, history + 1):
+            anchor_index = stage - offset
+            if anchor_index < 0:
+                continue
+            try:
+                refs.append(_anchor_ref_block(run_id, anchor_index))
+                notes.append("历史锚=第%d段" % (anchor_index + 1))
+            except Exception as exc:
+                print("[AD-潜桥] 历史锚第 %d 段未生效（%r）" % (anchor_index + 1, exc))
+        if not refs:
+            return (conditioning,)
+        try:
+            import node_helpers
+            out = node_helpers.conditioning_set_values(conditioning, {"minimax_refs": refs}, append=True)
+        except Exception as exc:
+            print("[AD-潜桥] 锚定参考块注入失败，保持原条件（%r）" % (exc,))
+            return (conditioning,)
+        print("[AD-潜桥] 第 %d 段锚定：追加 %d 个参考块（%s）" % (stage + 1, len(refs), "、".join(notes)))
+        return (out,)
 
 
 class ADH3InternalSave:
@@ -2448,6 +2762,7 @@ _INTERNAL_RELAY_KEYS = {
     "ADH3InternalBridge": "bridge",
     "ADH3InternalSave": "save",
     "ADH3InternalTrim": "trim",
+    "ADH3InternalAppearanceAnchor": "anchor",
 }
 if _relay_vendor_runtime is not None:
     for _key, _kind in _INTERNAL_RELAY_KEYS.items():
@@ -2460,6 +2775,9 @@ if _relay_vendor_runtime is not None:
         elif _kind == "trim":
             NODE_CLASS_MAPPINGS[_key] = ADH3InternalTrim
             NODE_DISPLAY_NAME_MAPPINGS[_key] = "AD-内部潜桥裁头"
+        elif _kind == "anchor":
+            NODE_CLASS_MAPPINGS[_key] = ADH3InternalAppearanceAnchor
+            NODE_DISPLAY_NAME_MAPPINGS[_key] = "AD-内部锚定"
 
     # 旧工作流无感加载：外部插件未安装时，注册上游三个旧类型为兼容层。
     # 外部插件已安装时跳过，避免同名类型重复注册。

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import time
 import uuid
 from fractions import Fraction
 from pathlib import Path, PurePosixPath
@@ -275,11 +276,32 @@ class FinalSave:
                     extension = Path(original).suffix.lower()
             path = directory/(identifier+extension)
             width,height = media.get_dimensions()
+            frames = None
+            try:
+                frames = int(media.get_components().images.shape[0])
+            except Exception:
+                pass
             kwargs = {}
-            if not isinstance(media,VideoFromFile):
+            copying = isinstance(media,VideoFromFile)
+            if not copying:
                 chroma, quality_crf = quality_encoding(母版画质, 像素格式, CRF)
+                # 组件视频默认是要从 RGB 张量整段重编码的：PyAV 不传 preset 会落到 libx264 medium，
+                # 4K/4:4:4 时非常吃力。统一用 veryfast（同 CRF 下画质基本不变、体积略增），
+                # 把「加工保存」的编码时间压下来；需要极限压缩时仍由 CRF/色度档控制。
                 kwargs.update(crf=quality_crf, chroma_subsampling=chroma)
+                # 旧版 ComfyUI 的 save_to 可能没有 preset 参数：有才传，避免 TypeError。
+                import inspect as _inspect
+                if "preset" in _inspect.signature(media.save_to).parameters:
+                    kwargs["preset"] = "veryfast"
+            started = time.perf_counter()
             media.save_to(str(path),**kwargs)
+            elapsed = time.perf_counter()-started
+            media_label = "组件视频重编码" if not copying else "原视频文件直接复制"
+            frame_text = (" %d 帧" % frames) if frames else ""
+            print("[AD-最终保存] %s：%dx%d%s，%s，用时 %.1fs"
+                  % (media_label, int(width), int(height), frame_text,
+                     ("CRF%s/%s veryfast" % (kwargs.get("crf"), kwargs.get("chroma_subsampling"))) if not copying else "无重编码",
+                     elapsed))
             records.append(publish_final(path,"video",source,保存目录,文件名前缀))
         elif isinstance(media,dict) and "waveform" in media:
             from scipy.io import wavfile

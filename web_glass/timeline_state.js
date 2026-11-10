@@ -81,13 +81,17 @@ export function imageOnlyClips(state, frames, options = {}) {
     if (!Number.isFinite(raw) || raw < 1) return null;
     const sources = state?.sources || [];
     if (!sources.length || sources.some(source => !source || source.kind !== "image" || source.priority)) return null;
+    // 分镜参考图是独立用途的图片源（board_only），不能算进纯图片模式的参考图数量，
+    // 否则载入 1 张分镜就会把“自动跟随图片数量”的段数改掉。
+    const imageSources = sources.filter(source => !source.board_only);
+    if (!imageSources.length) return null;
     const hasClips = [...(state.video_tracks || []), ...(state.audio_tracks || [])].some(lane => lane?.length);
     if (hasClips) return null;
     const defaultFrames = Math.max(5, Math.round(raw));
     const defaultLength = Math.round((defaultFrames / FPS) * FPS) / FPS;
     const snap = value => Math.round(Number(value || 0) * FPS) / FPS;
-    const requested = options.count == null ? sources.length : Math.round(Number(options.count));
-    const count = Number.isInteger(requested) && requested >= 1 && requested <= 1000 ? requested : sources.length;
+    const requested = options.count == null ? imageSources.length : Math.round(Number(options.count));
+    const count = Number.isInteger(requested) && requested >= 1 && requested <= 1000 ? requested : imageSources.length;
     const existing = (Array.isArray(state.generation_clips) ? state.generation_clips : [])
         .filter(clip => clip && Number(clip.src_out) > Number(clip.src_in || 0))
         .sort((left, right) => Number(left.tl_start || 0) - Number(right.tl_start || 0));
@@ -129,6 +133,20 @@ export function clearImageSources(state) {
     state.sources = sources.filter(source => !ids.has(source.id));
     state.images = (state.images || []).filter(item => !item || !ids.has(item.source));
     return ids.size;
+}
+
+/**
+ * 分镜素材归一：同一物理图片可能同时被参考图和分镜引用（服务端内容去重返回同一 source id）。
+ * 当某张图片仍被 board_images 引用、但已不在参考记录 images 里时，把它改成 board_only，
+ * 否则它会被继续当成参考图（参考口仍输出、纯图片自动段数仍计数）。
+ * 只改“被分镜引用且已不是参考图”的源；正常参考/正常分镜不受影响。返回新数组，不改入参。
+ */
+export function normalizeBoardSources(sources, boardImages, images) {
+    const boardIds = new Set((Array.isArray(boardImages) ? boardImages : []).filter(Boolean));
+    const referenceIds = new Set((Array.isArray(images) ? images : []).map(image => image && image.source).filter(Boolean));
+    return (Array.isArray(sources) ? sources : []).map(source => (
+        source && source.kind === "image" && !source.board_only && boardIds.has(source.id) && !referenceIds.has(source.id)
+            ? {...source, board_only: true} : source));
 }
 
 export function timelineDuration(state) {
@@ -254,4 +272,57 @@ export function framePlan(state, settings = {}) {
         const request = Math.max(5, target <= 5 ? 5 : 5 + 17 * Math.ceil((target - 5) / 17));
         return {target, request, overlap:0, guard:0, valid:target >= 1 && request <= (settings.max_frames ?? 362)};
     });
+}
+
+/**
+ * 解析“时间行 + 正文”文本（兼容标准 SRT 序号行）。
+ * 每块正文应以行首 # 开头（该行同时作为下一段提示词的分隔符）；返回按 24FPS 吸附后的块。
+ */
+export function parseTimedText(raw) {
+    const text = String(raw ?? "").replace(/^\uFEFF/, "").replace(/\r\n?/g, "\n");
+    const timeRe = /^[ \t]*(\d{1,2}):(\d{2}):(\d{2})[,.](\d{1,3})[ \t]*-->[ \t]*(\d{1,2}):(\d{2}):(\d{2})[,.](\d{1,3})[ \t]*$/gm;
+    const seconds = (h, m, s, ms) => Number(h) * 3600 + Number(m) * 60 + Number(s) +
+        Number(String(ms).padEnd(3, "0").slice(0, 3)) / 1000;
+    const hits = [];
+    let match;
+    while ((match = timeRe.exec(text))) {
+        hits.push({index: match.index, end: match.index + match[0].length,
+                   startSec: seconds(match[1], match[2], match[3], match[4]),
+                   endSec: seconds(match[5], match[6], match[7], match[8])});
+    }
+    if (!hits.length) throw new Error("没有识别到时间行；需要形如 00:00:00,000 --> 00:00:05,075 的块头。");
+    const blocks = [];
+    for (let index = 0; index < hits.length; index++) {
+        const hit = hits[index];
+        let body = text.slice(hit.end, index + 1 < hits.length ? hits[index + 1].index : text.length);
+        body = body.replace(/^\s*\n/, "").replace(/\n[ \t]*\d+[ \t]*\n?$/, "").trim();
+        if (!body) throw new Error(`第 ${index + 1} 块没有正文。`);
+        const hashLines = body.split("\n").filter(line => /^[ \t]*#/.test(line));
+        if (hashLines.length > 1) throw new Error(`第 ${index + 1} 块正文里有多个行首 #，会被当成多段；请清理。`);
+        if (hashLines.length === 1 && !/^[ \t]*#/.test(body.split("\n").find(line => line.trim()) || ""))
+            throw new Error(`第 ${index + 1} 块的行首 # 不在正文第一行；请把 # 开头的标题放到块首。`);
+        const startFrame = Math.max(0, Math.round(hit.startSec * FPS));
+        const endFrame = Math.max(startFrame + 1, Math.round(hit.endSec * FPS));
+        blocks.push({startFrame, endFrame, body, startSec: startFrame / FPS, endSec: endFrame / FPS});
+    }
+    for (let index = 0; index < blocks.length; index++) {
+        if (blocks[index].endFrame <= blocks[index].startFrame) throw new Error(`第 ${index + 1} 块结束时间不大于开始时间。`);
+        if (!index) continue;
+        const previous = blocks[index - 1], gap = blocks[index].startFrame - previous.endFrame;
+        if (gap !== 0) {
+            if (Math.abs(gap) <= 1) blocks[index].startFrame = previous.endFrame;
+            else throw new Error(`第 ${index} 块与第 ${index + 1} 块${gap > 0 ? "之间有空隙" : "之间重叠"} ${Math.abs(gap)} 帧；时间文本必须首尾相连。`);
+        }
+        blocks[index].startSec = blocks[index].startFrame / FPS;
+        blocks[index].endSec = blocks[index].endFrame / FPS;
+    }
+    return blocks;
+}
+
+/** 把时间块正文拼成 AD 的「# 每行一段」提示词：每个块保留其开头的 # 作为分隔符。 */
+export function timedPromptFromBlocks(blocks) {
+    return (blocks || []).map(block => {
+        const body = String(block?.body || "").trim();
+        return /^[ \t]*#/.test(body) ? body : `#\n${body}`;
+    }).join("\n");
 }

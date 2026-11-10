@@ -65,8 +65,8 @@ const CSS = `
 .ad-glass .h3-recipe-preview{max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .ad-glass .h3-glass-library{display:grid;gap:10px;padding:12px!important}
 .ad-glass .h3-library-title{display:flex;justify-content:space-between;align-items:center;gap:12px}
-.ad-glass .h3-library-title>button[data-clear-images]{padding:4px 12px;min-height:26px;font-size:12px;color:#e5edf7;background:#334155;border:1px solid #475569;border-radius:6px;cursor:pointer}
-.ad-glass .h3-library-title>button[data-clear-images]:hover{background:#475569}
+.ad-glass .h3-library-title>button[data-clear-images],.ad-glass .h3-library-tabs>button[data-clear-images]{padding:4px 12px;min-height:26px;font-size:12px;color:#e5edf7;background:#334155;border:1px solid #475569;border-radius:6px;cursor:pointer;pointer-events:auto}
+.ad-glass .h3-library-title>button[data-clear-images]:hover,.ad-glass .h3-library-tabs>button[data-clear-images]:hover{background:#475569}
 .ad-glass .h3-library-title>[data-load=image]{padding:6px 15px;min-height:32px;color:#f0f7ff;background:#385f92;border-color:#5880b2}
 .ad-glass .h3-pool,.ad-glass .h3-pool.is-empty{border:0!important;background:transparent!important;border-radius:0!important;display:flex!important;flex-direction:row!important;flex-wrap:nowrap!important;gap:10px!important;padding:2px!important;min-height:0!important;max-height:none!important;overflow-x:auto!important;overflow-y:hidden!important;align-items:flex-start!important;justify-content:flex-start!important}
 .ad-glass .h3-shot{position:relative!important;width:132px!important;flex:0 0 132px!important;min-width:132px!important;max-width:132px!important;border:1px solid #4f5f78!important;background:#354051!important;border-radius:9px!important;overflow:hidden!important;padding:5px!important;box-sizing:border-box;align-self:start}

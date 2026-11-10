@@ -33,7 +33,7 @@ export async function togglePlayerFullscreen(target) {
 // 独立播放器。播放选择只存在于此处，绝不修改生成游标或分段选用版本。
 export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fetchApi:(...args)=>fetch(...args)}) {
     root.classList.add("aiden-h3", "ad-h3-video");
-    root.innerHTML = `<div class="ad-h3-preview-layout"><section class="ad-h3-screen"><div class="ad-h3-preview-title">生成完成后在这里预览素材</div><video playsinline preload="metadata" aria-label="时间线预览"></video><img data-media-image hidden alt="图像预览"><audio data-media-audio controls hidden></audio><div class="ad-h3-idle-hint"><span>留白，亦是序章</span><span>下一帧，属于你的想象</span></div></section><div class="ad-h3-tabs"><button type="button" data-tab="image">图片</button><button type="button" data-tab="audio">音频</button><button type="button" data-tab="video" class="active">视频</button><span class="ad-h3-tab-hint" data-tab-hint hidden></span></div><div class="ad-h3-loop-actions"><button type="button" data-loop="start">开始</button><button type="button" data-loop="pause">停止</button><button type="button" data-loop="auto">分段循环</button><button type="button" data-loop="redo" title="选中下方任意预览后只重抽该段；运行中请先点「停止」">本段抽卡</button><button type="button" data-clear-preview title="彻底重置当前工作流：清除进度、历史组、预览/合并/最终保存记录与潜桥链，并删除本会话中间文件；素材、分段、提示词与导出成品保留">彻底重置</button><button type="button" data-clear-media-preview title="只清空当前分类的预览内容（不删除文件、不影响进度）">清空预览</button><div class="ad-h3-loop-hint" data-loop-hint hidden></div><span class="ad-h3-video-actions ad-h3-merge-wrap"><button type="button" data-loop="merge" title="点击选择 A合并或 B合并；Ctrl 点选片段可只合并选中内容">合并片段</button><span class="ad-h3-merge-menu" data-merge-menu hidden><button type="button" data-merge-source="A">A合并</button><button type="button" data-merge-source="B">B合并</button></span></span><button type="button" class="ad-h3-playlist-toggle" data-loop-playlist aria-pressed="false" title="按分段编号循环播放预览视频">循环播放</button></div><div class="ad-h3-panel" data-panel="video"><div class="ad-h3-media-list" data-video-list></div><div class="ad-h3-player-controls"><button data-play aria-label="播放或暂停">播放</button><button data-frame="-1" title="后退一帧" aria-label="后退一帧">上一帧</button><button data-frame="1" title="前进一帧" aria-label="前进一帧">下一帧</button><input data-seek type="range" min="0" max="0" step="1" value="0" aria-label="播放位置"><span data-time>0.00 / 0.00 秒</span><button data-mute aria-label="切换静音">取消静音</button><select data-rate aria-label="播放速度"><option value="0.5">0.5 倍速</option><option value="1" selected>1 倍速</option><option value="1.5">1.5 倍速</option><option value="2">2 倍速</option></select><button data-fullscreen aria-label="全屏预览">全屏</button></div><aside class="ad-h3-strips"><div class="ad-h3-strip-row"><span>分段生成A</span><div class="ad-h3-segments"></div></div><div class="ad-h3-strip-row"><span>分段生成B</span><div class="ad-h3-segments-b"></div></div><div class="ad-h3-strip-row"><span>合并生成</span><div class="ad-h3-merges"></div></div></aside></div><div class="ad-h3-panel" data-panel="image" hidden><aside class="ad-h3-cat-strips"><div class="ad-h3-strip-row"><span>图片A</span><div class="ad-h3-media-list" data-image-list></div></div><div class="ad-h3-strip-row"><span>图片B</span><div class="ad-h3-media-list" data-image-list-b></div></div></aside></div><div class="ad-h3-panel" data-panel="audio" hidden><aside class="ad-h3-cat-strips"><div class="ad-h3-strip-row"><span>音频A</span><div class="ad-h3-media-list" data-audio-list></div></div><div class="ad-h3-strip-row"><span>音频B</span><div class="ad-h3-media-list" data-audio-list-b></div></div></aside></div></div>`;
+    root.innerHTML = `<div class="ad-h3-preview-layout"><section class="ad-h3-screen"><div class="ad-h3-preview-title">生成完成后在这里预览素材</div><video playsinline preload="metadata" aria-label="时间线预览"></video><img data-media-image hidden alt="图像预览"><audio data-media-audio controls hidden></audio><div class="ad-h3-idle-hint"><span>留白，亦是序章</span><span>下一帧，属于你的想象</span></div></section><div class="ad-h3-tabs"><button type="button" data-tab="image">图片</button><button type="button" data-tab="audio">音频</button><button type="button" data-tab="video" class="active">视频</button><span class="ad-h3-tab-hint" data-tab-hint hidden></span></div><div class="ad-h3-loop-actions"><button type="button" data-loop="start">开始</button><button type="button" data-loop="pause">停止</button><button type="button" data-loop="auto">分段循环</button><button type="button" data-loop="redo" title="选中下方任意预览后只重抽该段；运行中请先点「停止」">本段抽卡</button><button type="button" data-clear-preview title="彻底重置当前工作流：清除进度、历史组、预览/合并/最终保存记录与潜桥链，并删除本会话中间文件；素材、分段、提示词与导出成品保留">彻底重置</button><button type="button" data-clear-media-preview title="只清空当前分类的预览内容（不删除文件、不影响进度）">清空预览</button><div class="ad-h3-loop-hint" data-loop-hint hidden></div><span class="ad-h3-video-actions ad-h3-merge-wrap"><button type="button" data-loop="merge" title="点击选择 A合并或 B合并；Ctrl 点选片段可只合并选中内容">合并片段</button><span class="ad-h3-merge-menu" data-merge-menu hidden><button type="button" data-merge-source="A">A合并</button><button type="button" data-merge-source="B">B合并</button></span></span><button type="button" class="ad-h3-playlist-toggle" data-loop-playlist aria-pressed="false" title="循环播放：按编号顺序播放本轮所有分段结果，到末尾回到开头">循环播放</button></div><div class="ad-h3-panel" data-panel="video"><div class="ad-h3-media-list" data-video-list></div><div class="ad-h3-player-controls"><button data-play aria-label="播放或暂停">播放</button><button data-frame="-1" title="后退一帧" aria-label="后退一帧">上一帧</button><button data-frame="1" title="前进一帧" aria-label="前进一帧">下一帧</button><input data-seek type="range" min="0" max="0" step="1" value="0" aria-label="播放位置"><span data-time>0.00 / 0.00 秒</span><button data-mute aria-label="切换静音">取消静音</button><select data-rate aria-label="播放速度"><option value="0.5">0.5 倍速</option><option value="1" selected>1 倍速</option><option value="1.5">1.5 倍速</option><option value="2">2 倍速</option></select><button data-fullscreen aria-label="全屏预览">全屏</button></div><aside class="ad-h3-strips"><div class="ad-h3-strip-row"><span>分段生成A</span><div class="ad-h3-segments"></div></div><div class="ad-h3-strip-row"><span>分段生成B</span><div class="ad-h3-segments-b"></div></div><div class="ad-h3-strip-row"><span>合并生成</span><div class="ad-h3-merges"></div></div></aside></div><div class="ad-h3-panel" data-panel="image" hidden><aside class="ad-h3-cat-strips"><div class="ad-h3-strip-row"><span>图片A</span><div class="ad-h3-media-list" data-image-list></div></div><div class="ad-h3-strip-row"><span>图片B</span><div class="ad-h3-media-list" data-image-list-b></div></div></aside></div><div class="ad-h3-panel" data-panel="audio" hidden><aside class="ad-h3-cat-strips"><div class="ad-h3-strip-row"><span>音频A</span><div class="ad-h3-media-list" data-audio-list></div></div><div class="ad-h3-strip-row"><span>音频B</span><div class="ad-h3-media-list" data-audio-list-b></div></div></aside></div></div>`;
     const video = root.querySelector("video"), title = root.querySelector(".ad-h3-preview-title");
     const imageView = root.querySelector("[data-media-image]"), audioView = root.querySelector("[data-media-audio]");
     const layout = root.querySelector(".ad-h3-preview-layout");
@@ -1008,6 +1008,8 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
 
     // 走 ComfyUI 原生“运行”按钮，保证顶部队列/活动任务状态同步显示
     node._adH3Run = () => {
+        // v0.5.47：点「开始」走原生运行按钮前，先让素材清单把潜桥段长对齐 17n（幂等）。
+        try { node._adH3EnsureRelayPlan?.(); } catch (_error) {}
         if (node._adH3AffectedRunning) { node._adH3Hint?.("正在运行所选段，请等待完成或先点停止。", true); return false; }
         node._adH3FollowCurrent?.();
         previewPinned = false;
@@ -1892,6 +1894,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
     }
     function setPlaylistEnabled(enabled) {
         playlistEnabled=!!enabled;
+        if (playlistEnabled) video.loop = false;
         if (!playlistEnabled) { playlistRevision++; playlistKey=""; }
         playlistButton?.classList.toggle("active",playlistEnabled);
         playlistButton?.setAttribute("aria-pressed",String(playlistEnabled));
@@ -2072,6 +2075,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
             mute.textContent = video.muted ? "取消静音" : "静音";
             if (video.getAttribute("src") !== info.url) { video.src = info.url; video.load(); }
             else video.currentTime = 0;
+            video.loop = false; // 切到新素材默认只播一遍；点画面开始后才进入本段循环
             armVideoWatchdog();
             const mediaRef = {origin: info.origin || "media", file: info.file || ""};
             fetchMediaFps(mediaRef).then(fps => { activeFps = fps > 0 ? fps : 24; updateTime(); });
@@ -2102,12 +2106,16 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
     audioView.onplay = () => { play.textContent = "暂停"; };
     audioView.onpause = audioView.onended = () => { play.textContent = "播放"; };
     video.onerror = () => { title.textContent = `${active?.label || "预览"} · 文件暂时无法播放：请重试播放或下载文件检查；仍无法播放再考虑重新生成。`; };
-    play.onclick = () => {
+    // 点画面/「播放」按钮：本段循环播放，再点暂停；整轮连续播放仍由「循环播放」按钮控制。
+    const togglePlayback = () => {
         if (!active) return;
         const media = playingMedia();
-        if (media.paused) void media.play().catch(() => { title.textContent = "暂时无法播放，请重新选择片段"; });
-        else media.pause();
+        if (media.paused) {
+            if (media === video && !playlistEnabled) video.loop = true;
+            void media.play().catch(() => { title.textContent = "暂时无法播放，请重新选择片段"; });
+        } else media.pause();
     };
+    play.onclick = togglePlayback;
     // 整个视频画面（含留黑区域）可点按；原生控制条仍由浏览器处理，避免一次点击反复切换。
     root.querySelector(".ad-h3-screen").addEventListener("click", event => {
         if (event.defaultPrevented || event.button !== 0 || !active || active.kind !== "video" || video.hidden || !abOverlay.hidden) return;
@@ -2118,9 +2126,10 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
             if (event.clientY >= rect.bottom - 44 * scale) return;
         }
         event.preventDefault(); event.stopPropagation();
-        play.onclick();
+        togglePlayback();
     });
     video.style.cursor = "pointer";
+    video.title = "点击画面：本段循环播放 / 再次点击暂停";
     imageView.style.cursor = "default";
     root.querySelectorAll("[data-frame]").forEach(button => button.onclick = () => {
         const fps = activeFps > 0 ? activeFps : 24;

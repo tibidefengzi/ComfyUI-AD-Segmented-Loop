@@ -17,7 +17,7 @@ import { installVueNodesGuard } from "./compat_nodes2.js";
 import { mountNodeProgress, updateSessionProgress, installProgressEvents } from "./run_progress.js";
 
 import { installRoundQueue } from "./round_queue.js";
-import { migrateLegacyRelay, hideInternalNodeTypes, hideLegacyTypesAfterLoad, restoreLegacyTypesForGraph, prepareSegmentNode, hideLegacyWidgets, normalizeRelayWidget, relayValue } from "./relay_hidden.js";
+import { migrateLegacyRelay, hideInternalNodeTypes, hideLegacyTypesAfterLoad, restoreLegacyTypesForGraph, prepareSegmentNode, hideLegacyWidgets, normalizeRelayWidget, relayValue, anchorConfigOf, normalizeAnchorConfig } from "./relay_hidden.js";
 installRoundQueue(api, app);
 installProgressEvents(api);
 
@@ -162,7 +162,8 @@ function adSetWidgetReadOnly(widget, value){
 
 const SEGMENT_DEFAULT_WIDTH = 390;
 const SEGMENT_MIN_RESTORE_WIDTH = 350; // 保留旧版默认宽度及更宽的自定义尺寸。
-const RELAY_PANEL_HEIGHT = 164;
+const RELAY_PANEL_HEIGHT = 334;          // 潜桥续接 + 高级设置展开（重锚定/色彩匹配/锚强度/外观锚/历史锚/声锚）
+const RELAY_ADVANCED_COLLAPSED_HEIGHT = 118; // 只显示「潜桥续接」+ 高级设置开关（三块统一 30px）
 const LEGACY_RELAY_HINT_HEIGHT = 30;
 const AD_INITIAL_SIZES = {AidenH3AudioQueue: [1120, 1411], AidenH3Segment: [SEGMENT_DEFAULT_WIDTH, 0], AidenH3VideoPreview: [760, 785]};
 function applyInitialNodeSize(node) {
@@ -302,6 +303,21 @@ function upstreamSegment(viewer) {
     return segment?.comfyClass==="AidenH3Segment" ? segment : null;
 }
 
+function upstreamQueueNode(segment) {
+    const graph = segment?.graph;
+    const input = (segment?.inputs || []).find(item => item.name === "queue");
+    const link = input?.link != null ? (graph?.links?.get?.(input.link) || graph?.links?.[input.link]) : null;
+    return link && graph?.getNodeById ? (graph.getNodeById(link.origin_id) || null) : null;
+}
+// v0.5.47：点开始/分段循环/运行此段前，让素材清单把潜桥段长对齐 17 帧网格（幂等；无潜桥或已对齐时无操作）。
+function ensureRelayPlan(segment) {
+    try {
+        const queue = upstreamQueueNode(segment);
+        if (queue && typeof queue._adH3EnsureRelayPlan === "function") return !!queue._adH3EnsureRelayPlan();
+    } catch (_error) {}
+    return false;
+}
+
 function runSelectedSegments(segment, options = {}) {
     const viewer = (segment.graph?._nodes || []).find(candidate =>
         candidate.comfyClass === "AidenH3VideoPreview" && upstreamSegment(candidate) === segment);
@@ -399,6 +415,9 @@ function mountReview(node) {
         node._adH3LastActionError="";
         busy=true;say("正在处理…");
         try{
+            // v0.5.47：任何会排队的操作之前，先把潜桥段长对齐到 17n（124/17k+5 会让段间重复或跳过）。
+            if (["start", "auto", "run_segment", "run_pending", "redo", "redo_preview", "approve"].includes(command)
+                    && typeof ensureRelayPlan === "function") ensureRelayPlan(segment);
             const serialized=await app.graphToPrompt();
             if(operation!==actionRevision)return false;
             let result=null;
@@ -529,15 +548,18 @@ function mountReview(node) {
     node._adH3QueueOwned = async () => {
         const segment = upstreamSegment(node);
         if (!segment) return false;
+        if (typeof ensureRelayPlan === "function") ensureRelayPlan(segment);
         const epoch = Number(node._adH3StopEpoch) || 0;
         await executeQueueOnce(app, api, segment.id, {owner:node, waitForCompletion:false,
             isStopped:()=>(Number(node._adH3StopEpoch)||0)!==epoch});
         return true;
     };
+    node._adH3EnsureRelayPlan = () => ensureRelayPlan(upstreamSegment(node));
 
     async function batchRun({resumeSelection=true}={}) {
         const segment=upstreamSegment(node);
         if(!segment) throw new Error("请先连接当前段上下文");
+        if (typeof ensureRelayPlan === "function") ensureRelayPlan(segment);
         node._adH3BatchStop=false;
         const stopped=()=>!!node._adH3BatchStop;
         // 后台继续运行：循环只依赖启动时序列化的队列副本和已捕获的节点，不依赖当前激活画布。
@@ -682,6 +704,7 @@ function mountReview(node) {
         const segment = upstreamSegment(node);
         if (!segment) { say("请先连接当前段上下文。", true); return; }
         if (!segment.inputs?.find(item => item.name === "queue")?.link) { say("请先连接素材清单后再使用运行此段。", true); return; }
+        if (typeof ensureRelayPlan === "function") ensureRelayPlan(segment);
         const queueNodeOf = () => {
             const input = (segment.inputs || []).find(item => item.name === "queue");
             const link = input?.link != null ? (node.graph?.links?.[input.link] || node.graph?.links?.get?.(input.link)) : null;
@@ -914,12 +937,12 @@ const AD_SEG_REF_NAMES = [
     ...Array.from({length: 3}, (_, i) => `ref_video_audio_${i}`),
     ...Array.from({length: 3}, (_, i) => `ref_audio_${i}`),
 ];
-const AD_SEG_EXTRA = ["mask_frames"];
+const AD_SEG_EXTRA = ["mask_frames", "board_image"];
 const AD_SEG_OUTPUTS = [...AD_SEG_FIXED, ...AD_SEG_REF_NAMES, ...AD_SEG_EXTRA];
 const AD_SEG_TYPES = [
     "H3_LOOP_CONTEXT", "INT", "IMAGE", "INT", "FLOAT", "INT", "INT", "STRING", "STRING", "IMAGE", "AUDIO", "VIDEO", "VIDEO", "AUDIO",
     ...AD_SEG_REF_NAMES.map(name => name.startsWith("ref_image") || (name.startsWith("ref_video") && !name.startsWith("ref_video_audio")) ? "IMAGE" : "AUDIO"),
-    "IMAGE",
+    "IMAGE", "IMAGE",
 ];
 function repairSegmentPromptLinks(node) {
     // 按采样器的 positive/negative 条件链反推：应当来自第 9/10 口，错了就自动纠正
@@ -1001,7 +1024,7 @@ function applySegmentOutputLabels(node) {
         generation_frames: "本段帧数", fps: "帧率", width: "画面宽度", height: "画面高度",
         positive_prompt: "正向提示词", negative_prompt: "反向提示词",
         round_image: "本段图像", round_audio: "本段音频", round_video: "本段视频",
-        source_video: "源视频", original_audio: "源音频", mask_frames: "遮罩专用",
+        source_video: "源视频", original_audio: "源音频", mask_frames: "遮罩专用", board_image: "分镜参考图",
         };
     const refLabel = name => {
         const match = String(name || "").match(/^ref_(image|video_audio|video|audio)_(\d+)$/);
@@ -1393,12 +1416,73 @@ function mountRelayHint(node) {
     const messages = {
         0: "关闭：按原有逐段生成，不启用潜桥。",
         5: "开启 C=5：每段输出=17n，H3生成=输出+5，裁头5帧。",
-        22: "开启 C=22（推荐）：每段输出=17n，H3生成=输出+22，裁头22帧。",
-        39: "开启 C=39：每段输出=17n，H3生成=输出+39，裁头39帧。",
+        22: "C=22：每段输出17n，生成+22、裁头22；第1段只+5（124→119）。",
+        39: "C=39：每段输出17n，生成+39、裁头39；第1段只+5（124→119）。",
     };
     const relayOptions = ["0 · 关闭", "5 · 上下文5帧", "22 · 上下文22帧（推荐）", "39 · 上下文39帧"];
     const reanchorOptions = ["0 · 不重锚定", "2 · 每2段", "3 · 每3段", "5 · 每5段", "7 · 每7段", "10 · 每10段"];
     const colorOptions = ["0 · 关闭", "0.5 · 半强", "1 · 全强"];
+    // ---- 潜桥锚定（锚强度 / 外观锚 / 历史锚 / 声锚）：存在 node.properties，不新增原生 widget ----
+    let anchorCfg = anchorConfigOf(node);
+    const anchorOptionSpec = {
+        strength: [[0, "0 · 关闭"], [0.5, "0.5 · 半强"], [1, "1 · 全强"]],
+        appearance: [[0, "0 · 关闭"], [2, "2 · 每2段"], [3, "3 · 每3段"], [5, "5 · 每5段"], [7, "7 · 每7段"], [10, "10 · 每10段"]],
+        history: [[0, "0 · 关闭"], [1, "1 · 近1段"], [2, "2 · 近2段"], [3, "3 · 近3段"]],
+        voice: [[0, "0 · 关闭"], [1, "1 · 开启"]],
+    };
+    const anchorRows = [];
+    const anchorHints = {
+        strength: "软锚定：每段把拷入前缀的颜色/亮度统计拉回第 1 段；只影响被裁掉的上下文，不增加跳动。",
+        appearance: "每 N 段把第 1 段开头 5 帧作为参考块追加进 H3 条件，缓解人物质感累积劣化；不改 latent/帧数。",
+        history: "每段把前 N 段开头 5 帧也作为参考块追加（历史锚简化版）；段数越多条件越重，默认关闭。",
+        voice: "用第 1 段音频 latent 作为音色锚替换本段音频前缀；默认关闭，先试听口型/音色。",
+    };
+    const saveAnchorConfig = () => {
+        try {
+            node.properties ||= {};
+            node.properties.ad_h3_anchor = normalizeAnchorConfig(anchorCfg);
+            node.graph?.change?.();
+        } catch (_error) {}
+        node.setDirtyCanvas?.(true, true);
+    };
+    const addAnchorRow = (labelText, key) => {
+        const row = document.createElement("div");
+        row.style.cssText = "display:grid;grid-template-columns:76px minmax(0,1fr);align-items:center;gap:8px;min-height:28px";
+        const label = document.createElement("span");
+        label.textContent = labelText;
+        label.style.cssText = "font:12px/1.3 'Microsoft YaHei',system-ui,sans-serif;color:#c7d3e3;white-space:nowrap";
+        const select = document.createElement("select");
+        select.style.cssText = [
+            "width:100%", "min-width:0", "height:30px", "box-sizing:border-box", "padding:2px 8px",
+            "border-radius:6px", "border:1px solid #4a658a", "background:#1b2534",
+            "color:#e8eef7", "font:12px/1.3 'Microsoft YaHei',system-ui,sans-serif", "outline:none",
+        ].join(";");
+        for (const [value, text] of anchorOptionSpec[key]) {
+            const option = document.createElement("option");
+            option.value = String(value);
+            option.textContent = text;
+            select.appendChild(option);
+        }
+        select.value = String(anchorCfg[key]);
+        try { select.title = anchorHints[key] || ""; } catch (_error) {}
+        select.addEventListener("change", () => {
+            anchorCfg[key] = Number(select.value);
+            saveAnchorConfig();
+        });
+        row.append(label, select);
+        advanced.appendChild(row);
+        anchorRows.push({ key, select });
+    };
+    let advancedOpen = false;
+    try { advancedOpen = node.properties?.ad_relay_advanced === true; } catch (_error) {}
+    let panelWidget = null;
+    const panelHeight = () => advancedOpen ? RELAY_PANEL_HEIGHT : RELAY_ADVANCED_COLLAPSED_HEIGHT;
+    const refreshPanelWidgetHeight = () => {
+        if (!panelWidget) return;
+        panelWidget.getHeight = () => panelHeight();
+        panelWidget.computeSize = width => [width, panelHeight()];
+        node.setDirtyCanvas?.(true, true);
+    };
     const optionsOf = (widget, fallback) => {
         const values = widget?.options?.values;
         return Array.isArray(values) && values.length ? values : fallback;
@@ -1431,11 +1515,50 @@ function mountRelayHint(node) {
     const hint = document.createElement("div");
     hint.className = "ad-h3-relay-hint";
     hint.style.cssText = [
-        "font:11px/1.5 'Microsoft YaHei',system-ui,sans-serif", "color:#9fb4cf",
-        "padding-top:5px", "border-top:1px solid rgba(255,255,255,.08)", "min-height:16px",
+        "font:10.5px/1.3 'Microsoft YaHei',system-ui,sans-serif", "color:#9fb4cf",
+        "height:30px", "box-sizing:border-box", "display:flex", "align-items:center",
+        "padding:0 10px", "border-top:1px solid rgba(255,255,255,.08)",
+        "border-left:2px solid rgba(90,170,255,.85)", "background:rgba(35,70,115,.28)",
+        "border-radius:4px", "overflow:hidden",
     ].join(";");
+    const advanced = document.createElement("div");
+    advanced.style.cssText = "display:none;flex-direction:column;gap:6px";
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className = "ad-h3-advanced-toggle";
+    toggle.style.cssText = [
+        "width:100%", "box-sizing:border-box", "height:30px", "padding:0 10px", "margin:0",
+        "border-radius:6px", "border:1px dashed rgba(120,160,210,.45)", "background:rgba(30,44,64,.55)",
+        "color:#b9cbe2", "font:12px/1.3 'Microsoft YaHei',system-ui,sans-serif", "text-align:left",
+        "cursor:pointer", "outline:none",
+    ].join(";");
+    const applyAdvanced = (persist = false) => {
+        advanced.style.display = advancedOpen ? "flex" : "none";
+        toggle.textContent = advancedOpen
+            ? "▾ 收起高级设置（重锚定 / 色彩匹配 / 锚定）"
+            : "▸ 高级设置（重锚定 / 色彩匹配 / 锚定）";
+        if (persist) {
+            try {
+                node.properties ||= {};
+                node.properties.ad_relay_advanced = advancedOpen;
+                node.graph?.change?.();
+            } catch (_error) {}
+        }
+        refreshPanelWidgetHeight();
+    };
+    toggle.addEventListener("click", () => {
+        advancedOpen = !advancedOpen;
+        applyAdvanced(true);
+        if (advancedOpen) {
+            try {
+                const size = node.computeSize?.();
+                if (size && node.size[1] < size[1]) node.setSize([node.size[0], Math.round(size[1])]);
+            } catch (_error) {}
+        }
+        node.setDirtyCanvas?.(true, true);
+    });
     const rows = [];
-    const addRow = (labelText, widget, fallback, onChange) => {
+    const addRow = (labelText, widget, fallback, onChange, target = panel) => {
         if (!widget) return null;
         const row = document.createElement("div");
         row.style.cssText = "display:grid;grid-template-columns:76px minmax(0,1fr);align-items:center;gap:8px;min-height:28px";
@@ -1444,7 +1567,7 @@ function mountRelayHint(node) {
         label.style.cssText = "font:12px/1.3 'Microsoft YaHei',system-ui,sans-serif;color:#c7d3e3;white-space:nowrap";
         const select = document.createElement("select");
         select.style.cssText = [
-            "width:100%", "min-width:0", "height:26px", "box-sizing:border-box", "padding:2px 8px",
+            "width:100%", "min-width:0", "height:30px", "box-sizing:border-box", "padding:2px 8px",
             "border-radius:6px", "border:1px solid #4a658a", "background:#1b2534",
             "color:#e8eef7", "font:12px/1.3 'Microsoft YaHei',system-ui,sans-serif", "outline:none",
         ].join(";");
@@ -1459,15 +1582,22 @@ function mountRelayHint(node) {
             node.setDirtyCanvas?.(true, true);
         });
         row.append(label, select);
-        panel.appendChild(row);
+        target.appendChild(row);
         const item = { widget, select };
         rows.push(item);
         return item;
     };
     addRow("潜桥续接", selector, relayOptions, applyMaterialPlan);
-    addRow("重锚定", reanchor, reanchorOptions);
-    addRow("色彩匹配", colorMatch, colorOptions);
+    panel.appendChild(toggle);
+    panel.appendChild(advanced);
+    addRow("重锚定", reanchor, reanchorOptions, undefined, advanced);
+    addRow("色彩匹配", colorMatch, colorOptions, undefined, advanced);
+    addAnchorRow("锚定强度", "strength");
+    addAnchorRow("外观锚", "appearance");
+    addAnchorRow("历史锚", "history");
+    addAnchorRow("声锚", "voice");
     panel.appendChild(hint);
+    applyAdvanced(false);
     const updateHint = () => {
         const value = relayValue(selector?.value);
         hint.textContent = messages[value] || messages[0];
@@ -1478,14 +1608,31 @@ function mountRelayHint(node) {
             const current = String(item.widget?.value ?? "");
             if (item.select.value !== current) item.select.value = current;
         }
+        anchorCfg = anchorConfigOf(node);
+        for (const item of anchorRows) {
+            const current = String(anchorCfg[item.key] ?? "");
+            if (item.select.value !== current) item.select.value = current;
+        }
+        try {
+            const savedOpen = node.properties?.ad_relay_advanced === true;
+            if (savedOpen !== advancedOpen) {
+                advancedOpen = savedOpen;
+                applyAdvanced(false);
+            }
+        } catch (_error) {}
         updateHint();
     };
     node._adH3SyncRelayPanel = syncFromNative;
     const widget = node.addDOMWidget("ad_h3_relay_panel", "div", panel, {
-        serialize: false, hideOnZoom: false, getHeight: () => RELAY_PANEL_HEIGHT,
+        serialize: false, hideOnZoom: false, getHeight: () => panelHeight(),
     });
     widget.serialize = false;
-    widget.computeSize = width => [width, RELAY_PANEL_HEIGHT];
+    panelWidget = widget;
+    widget.computeSize = width => [width, panelHeight()];
+    // v0.5.46：载入旧工作流时 DOM 控件宽度可能停留在节点创建时的宽度（约 210px），
+    // 导致潜桥面板比节点窄、高级设置文字换行、底部提示被裁。绑定后宽度始终跟随节点。
+    bindWidgetWidth(node, widget);
+    applyAdvanced(false);
     try {
         const list = node.widgets || [];
         const index = list.indexOf(widget);
@@ -1495,6 +1642,19 @@ function mountRelayHint(node) {
     } catch (_error) {}
     node._adH3RelayPanelMounted = true;
     hideLegacyWidgets(node);
+    try {
+        node.properties ||= {};
+        node.properties.ad_h3_anchor = normalizeAnchorConfig(anchorCfg);
+    } catch (_error) {}
+    setTimeout(() => {
+        try {
+            if (node._adH3Configured || node._adH3SavedSchema) return;
+            // 新建节点：按实际控件高度撑开（包含新增的 4 行锚定）。
+            const size = node.computeSize?.();
+            if (size) node.setSize([node.size[0], Math.max(240, Math.round(size[1]))]);
+            node.setDirtyCanvas?.(true, true);
+        } catch (_error) {}
+    }, 1200);
     for (const target of [reanchor, colorMatch]) {
         if (!target) continue;
         target.hidden = true;
@@ -1618,7 +1778,8 @@ function setupNode(node) {
             || savedLegacyRelayLayouts.has(info);
         const savedHeight = Number(info?.size?.[1]);
         if (isLegacyPanel && savedHeight > 0) {
-            node.setSize([node.size[0], savedHeight + RELAY_PANEL_HEIGHT - LEGACY_RELAY_HINT_HEIGHT]);
+            node.setSize([node.size[0], savedHeight + RELAY_ADVANCED_COLLAPSED_HEIGHT - LEGACY_RELAY_HINT_HEIGHT]);
+            node._adH3LegacyPanelResized = true;
         }
         updateSegmentIndexVisibility(node);
         const savedSelector=(node.widgets||[]).find(widget=>widget.name==="潜桥续接");
@@ -2057,6 +2218,11 @@ if(!chineseTitles[nodeData.name])return;
         const attach=element=>{
             if(!element||element._adWheelZoom)return;element._adWheelZoom=true;
             element.addEventListener("wheel",event=>{
+                // 鼠标在提示词框内：滚轮滚提示词内容，不转发给画布缩放。
+                if(event.target?.closest?.('.ad-h3-prompt-area')){
+                    event.stopPropagation();
+                    return;
+                }
                 if(event.target?.closest?.('.ad-h3-ab-overlay[data-zoom="image"]')) return;
                 const canvas=app.canvas?.canvas;if(!canvas)return;
                 event.preventDefault();event.stopImmediatePropagation();

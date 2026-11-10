@@ -21,7 +21,7 @@ _VOLATILE_KEYS = frozenset({
 # 时间线里会影响分段结果的字段；未列出的字段不参与缓存键（避免误把易变字段算进来）。
 _TIMELINE_FIELDS = (
     "split_points", "generation_clips", "segment_recipe", "segmentation", "duration",
-    "sources", "images", "video_tracks", "audio_tracks",
+    "sources", "images", "board_images", "video_tracks", "audio_tracks",
     "muted_tracks", "disabled_tracks", "max_frames",
 )
 

@@ -7,7 +7,7 @@ import "./ad_theme.js";
 import { mountGlassTimeline, matchesSource, previewSource, clearSourcePreview } from "./glass_ui.js";
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
-import { segmentBounds, segmentIntervals, cutTimelineAt, topVideoAt, framePlan, prependEmptyLane, playbackRange, imageOnlyClips, followsImageCount, clearImageSources, repairSourceInstances, retainedSourceBounds, trackDisabled, activeClips, selectionPlaybackRange } from "./timeline_state.js";
+import { segmentBounds, segmentIntervals, cutTimelineAt, topVideoAt, framePlan, prependEmptyLane, playbackRange, imageOnlyClips, followsImageCount, clearImageSources, repairSourceInstances, retainedSourceBounds, trackDisabled, activeClips, selectionPlaybackRange, parseTimedText, timedPromptFromBlocks, normalizeBoardSources } from "./timeline_state.js";
 import { mountStoragePanel } from "./storage_panel.js";
 import {generationClips, commitGeneration, changeGeneration, deleteGeneration} from "./generation_edit.js";
 import { bindWidgetWidth, timelineOrigin, markWidthBreakpoint, MIN_NODE_WIDTH } from "./dom_layout.js";
@@ -116,6 +116,8 @@ style.textContent = `
 .h3-tl .h3-load-row>button{background:#3B7DC4;border-color:#4A80BF;color:#fff}.h3-tl .h3-load-row>button:hover{background:#326BA8;color:#fff}
 .h3-tl .h3-tlbar button{background:#3B7DC4;border-color:#4A80BF;color:#fff}.h3-tl .h3-tlbar button:hover{background:#326BA8;color:#fff}.h3-tl .h3-tlbar button:disabled{opacity:.45}
 .h3-tl .h3-pool-slot{border:1px dashed var(--ad-border);border-radius:8px;min-height:132px;background:transparent}
+.h3-tl .h3-board-row{width:100%!important;max-width:100%!important;min-width:0!important;overflow:hidden!important}
+.h3-tl .h3-board-slots{display:flex!important;flex-direction:row!important;flex-wrap:nowrap!important;align-items:flex-start!important;gap:10px!important;width:100%!important;max-width:100%!important;min-width:0!important;overflow-x:auto!important;overflow-y:hidden!important;padding:2px 0 8px!important;min-height:0!important;height:auto!important;box-sizing:border-box}
 .h3-tl .h3-pool{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;align-content:flex-start;align-items:stretch;justify-content:flex-start;min-height:0;height:auto;max-height:none;flex:0 0 auto!important;border:1px dashed var(--ad-border);border-radius:8px;padding:10px;box-sizing:border-box;width:100%;background:#242424;position:relative;z-index:0;overflow:visible}
 .h3-tl .h3-pool.h3-drop{border-color:#22d3ee;background:rgba(34,211,238,.08)}
 .h3-tl .h3-glass-library.h3-drop{outline:2px dashed #22d3ee;outline-offset:-4px;background:rgba(34,211,238,.06)}
@@ -159,7 +161,7 @@ function defaultSegmentRecipe() {
 }
 function bareTimeline() {
     return { version: 3, segmentation: "clips", duration: null, sources: [],
-             video_tracks: [[], [], []], audio_tracks: [[], [], []], images: [], split_points: [],
+             video_tracks: [[], [], []], audio_tracks: [[], [], []], images: [], board_images: [], split_points: [],
              max_frames: DEFAULT_MAX_FRAMES };
 }
 function emptyTimeline() {
@@ -302,6 +304,7 @@ function loadStateValue(raw) {
     lastLoadDropped = sanitizeLoadedClips(state);
     state.muted_tracks ||= {};
     state.disabled_tracks ||= {};
+    state.board_images = Array.isArray(state.board_images) ? state.board_images : [];
     const sourceMap = new Map((state.sources || []).map(source => [source.id, source]));
     for (const key of ["video_tracks", "audio_tracks"])
         state.muted_tracks[key] = (state[key] || []).map((lane, index) =>
@@ -391,7 +394,7 @@ export function segmentRefCounts(state) {
     const sources = state?.sources || [];
     // 参考图按加载位置固定编号：禁止输出也占原槽位，仅该口输出空。
     // 不能减掉禁止图数量，否则后台按原位置取材时，末尾图片会被ref_counts截断。
-    const images = sources.filter(source => source && source.kind === "image").length;
+    const images = sources.filter(source => source && source.kind === "image" && !source.board_only).length;
     const videos = (state?.video_tracks || []).reduce((max, lane, index) => lane?.length ? Math.max(max, index + 1) : max, 0);
     // 参考音频口按轨道位置固定：音频1→参考音频1…；中间空轨保留空位，不把后面的音频往前顶。
     const audios = (state?.audio_tracks || []).reduce((max, lane, index) => lane?.length ? Math.max(max, index + 1) : max, 0);
@@ -410,10 +413,11 @@ export function updateSegmentMaterialOutputs(node, state) {
     // 只有素材/参考图/路径真正变化时才重建端口；普通编辑（含路径输入逐字触发）直接跳过，避免节点跳闪。
     const signature = JSON.stringify({
         path: String(state?.path_source || ""),
-        sources: (state?.sources || []).map(source => [source.id, source.kind, !!source.priority]),
+        sources: (state?.sources || []).map(source => [source.id, source.kind, !!source.priority, !!source.board_only]),
         images: (state?.images || []).map(image => [image.source, image.segment]),
         tracks: [state?.video_tracks, state?.audio_tracks].map(lanes => (lanes || []).map(lane => !!lane?.length)),
         outputs: (node.outputs || []).map(output => [output.name, output.type]),
+        ready: node._adH3GraphReady === true,
     });
     if (node._adH3MaterialSignature === signature) return;
     node._adH3MaterialSignature = signature;
@@ -442,7 +446,9 @@ export function updateSegmentMaterialOutputs(node, state) {
     // 等载入完成后再按真实连线清理，避免打开工作流时把用户连线删掉。
     const loading = !!(node._adH3Configured && node._adH3GraphReady !== true);
     const linked = linkedRefCounts(node.outputs, loading ? node._adH3SavedSchema : null);
-    const existingRefs = loading ? existingRefCounts(node.outputs) : null;
+    // 载入期只能保“保存档案里确实有线”的口；不能把所有旧空口都当已连接口，
+    // 否则清空参考图后 9 个参考图口会一直留着。没有保存档案（新建/程序化节点）直接按实际素材收缩。
+    const existingRefs = loading && node._adH3SavedSchema ? existingRefCounts(node.outputs) : null;
     const desired = {
         image: Math.min(PORT_LIMITS.image, Math.max(counts.image, linked.image || 0, existingRefs?.image || 0)),
         video: Math.min(PORT_LIMITS.video, Math.max(counts.video, linked.video || 0, existingRefs?.video || 0)),
@@ -489,7 +495,8 @@ export function updateSegmentMaterialOutputs(node, state) {
         for (const link of all) snapLink(link);
     }
     const slots = [...fixed, ...refSlots,
-        {name: "mask_frames", label: "遮罩专用", localized_name: "遮罩专用", type: "IMAGE", h3_key: "name:mask_frames"}];
+        {name: "mask_frames", label: "遮罩专用", localized_name: "遮罩专用", type: "IMAGE", h3_key: "name:mask_frames"},
+        {name: "board_image", label: "分镜参考图", localized_name: "分镜参考图", type: "IMAGE", h3_key: "name:board_image"}];
     // 端口没有变化时只刷新标签/序号，绝不 removeOutput/重排/重连线。
     // 否则画布点击、轮询等触发重建会误伤「正向提示词→转换后的文本输入」这类连线。
     const nextSignature = slots.map(slot => `${slot.name}|${slot.type}`).join(",");
@@ -684,11 +691,25 @@ export function mountTimelineEditor(node) {
         if (legacy.element) legacy.element.style.display = "none";
     }
 
+    let libraryTab = "reference";
     const T = { state: emptyTimeline(), selected: new Set(), segment: -1, playhead: 0, pxs: 36, smartCuts: [],
                 batchCount: 0, magnet: true, unit: "f", playing: false, nodes: [], buffers: new Map(), previewVideo: null };
     const undoStack = [], redoStack = [];
     node._adH3AssignTask=(session,task)=>{T.state.session_id=session;T.state.workflow_task_id=task;};
-    const pushUndo = (groupMove=false) => { const state=JSON.stringify(T.state);undoStack.push(groupMove?{state,groupMove:true}:state); if (undoStack.length > 20) undoStack.shift(); redoStack.length = 0; syncHistory(); };
+    const linkedPromptWidget = () => linkedPromptSegment(node)?.widgets?.find(widget => widget.name === "正向提示词") || null;
+    function currentLinkedPrompt() { return String(linkedPromptWidget()?.value ?? ""); }
+    function setLinkedPromptText(text) {
+        const segmentNode = linkedPromptSegment(node);
+        if (!segmentNode) throw new Error("请先把「分段清单」连到 AD-分段生成，才能写入逐段提示词。");
+        const widget = segmentNode.widgets?.find(item => item.name === "正向提示词");
+        if (!widget) throw new Error("找不到 AD-分段生成 的正向提示词控件。");
+        widget.value = text;
+        try { widget.callback?.call(widget, text); } catch {}
+        const area = segmentNode.widgets?.find(item => item.name === "ad_h3_prompt_editor")?.element?.querySelector?.(".ad-h3-prompt-area");
+        if (area) area.value = text;
+        segmentNode.setDirtyCanvas?.(true, true);
+    }
+    const pushUndo = (groupMove=false, promptSnapshot=null) => { const state=JSON.stringify(T.state);undoStack.push(promptSnapshot===null?(groupMove?{state,groupMove:true}:state):{state,groupMove:!!groupMove,prompt:String(promptSnapshot)}); if (undoStack.length > 20) undoStack.shift(); redoStack.length = 0; syncHistory(); };
 
     // Layout v3：用户拖拽优先；绝不改 parent 样式（改了会和节点框错位）
     let applyLayoutHeight = () => {};
@@ -709,9 +730,20 @@ export function mountTimelineEditor(node) {
     };
     // 撤销/重做后必须同步动态参考口与 ref_counts：outputs 传 true（afterEdit 内调用 updateMaterialOutputs → 刷新当前段参考口）。
     // 连线固定挂在端口上，撤销/重做只恢复轨道内容，不搬任何已连接的线。
-    const restoreHistory = (from,to) => {const saved=from.pop(),groupMove=typeof saved==="object"&&saved.groupMove,state=JSON.stringify(T.state);to.push(groupMove?{state,groupMove:true}:state);T.state=JSON.parse(groupMove?saved.state:saved);afterEdit(true,true,!!groupMove);};
-    const doUndo = () => { if (!undoStack.length) return; restoreHistory(undoStack,redoStack);hint("已撤销上一步操作。"); };
-    const doRedo = () => { if (!redoStack.length) return; restoreHistory(redoStack,undoStack);hint("已重做上一步操作。"); };
+    const restoreHistory = (from,to) => {
+        const saved=from.pop();
+        if (saved == null) return;
+        const entry=typeof saved==="object"&&saved?saved:null;
+        const groupMove=!!entry?.groupMove;
+        const hasPrompt=!!entry && Object.prototype.hasOwnProperty.call(entry,"prompt");
+        const state=JSON.stringify(T.state);
+        to.push(hasPrompt?{state,prompt:currentLinkedPrompt()}:groupMove?{state,groupMove:true}:state);
+        T.state=JSON.parse(entry?entry.state:saved);
+        if (hasPrompt) setLinkedPromptText(entry.prompt);
+        afterEdit(true,true,groupMove);
+    };
+    const doUndo = () => { if (!undoStack.length) return; boardUploadToken++; materialUploadToken++; boardTarget = null; restoreHistory(undoStack,redoStack);hint("已撤销上一步操作。"); };
+    const doRedo = () => { if (!redoStack.length) return; boardUploadToken++; materialUploadToken++; boardTarget = null; restoreHistory(redoStack,undoStack);hint("已重做上一步操作。"); };
     const syncHistory = () => { root.querySelector("[data-undo]").disabled = !undoStack.length; root.querySelector("[data-redo]").disabled = !redoStack.length; };
     // 开关类按钮补 aria-pressed，读屏能读出磁吸与秒/帧当前状态。
     const syncToggleA11y = () => {
@@ -767,9 +799,9 @@ export function mountTimelineEditor(node) {
 </div>
 <div class="h3-recipe-meta"><span data-actual-count>实际 0 段</span><span data-recipe-preview class="h3-recipe-preview"></span></div>
 <div class="h3-smart-row" data-smart-row>
-  <button type="button" data-smart-cut class="primary" title="在白色游标位置切分选中的音视频片段（Ctrl 多选，可撤销）">切分视频</button>
   <button type="button" data-run-affected class="primary" title="选中分段后仅运行所选段；未选择时重跑受影响段，完成后回原进度">运行此段</button>
   <button type="button" data-new-group class="primary" title="新开一组并从第1段待命；素材、设置与旧成果保留，运行中请先停止">新建一组</button>
+  <button type="button" data-import-timed class="primary" title="导入带时间行的文本：一块=一段，切当前选中音频轨并写入各段正向提示词（可撤销）">导入时间文本</button>
   <select data-smart-kind title="选择检测方式">
     <option value="beats-bar">踩节拍 I（小节）</option>
     <option value="beats-beat">踩节拍 II（每拍）</option>
@@ -790,6 +822,9 @@ export function mountTimelineEditor(node) {
   <div class="h3-canvas" data-canvas>
     <div class="h3-ruler" data-ruler></div>
   </div>
+</div>
+<div class="h3-board-row" data-board-row style="display:none;flex-direction:column;gap:6px;padding:4px 0 0;margin:0;background:transparent;border:0;pointer-events:auto">
+  <div data-board-slots class="h3-board-slots"></div>
 </div>
 <div class="h3-transport">
   <div class="h3-trim-cluster">
@@ -812,11 +847,74 @@ export function mountTimelineEditor(node) {
 <div class="h3-pool" data-pool></div>
 </div>`;
     mountGlassTimeline(root);
+    let clearImagesButton = null, libraryTitleEl = null, boardLoadButton = null;
+    {   // 参考图片区：参考图片 / 分镜参考 共用同一块区域；分镜操作只在分镜页显示。
+        const library = root.querySelector(".h3-glass-library");
+        const title = library?.querySelector(".h3-library-title");
+        libraryTitleEl = title || null;
+        clearImagesButton = title?.querySelector("[data-clear-images]") || null;
+        // 左上角不再显示“参考图片”标题；分镜载入移到“分镜参考”页签右侧。
+        title?.querySelector("h3")?.remove();
+        if (library) {
+            const tabs = document.createElement("div");
+            tabs.className = "h3-library-tabs";
+            tabs.style.cssText = "display:flex;gap:6px;margin:0 0 2px;flex-wrap:wrap;pointer-events:auto";
+            const makeTab = (key, label) => {
+                const button = document.createElement("button");
+                button.type = "button"; button.dataset.libraryTab = key;
+                button.textContent = label;
+                button.style.cssText = "min-height:30px;padding:0 12px;border-radius:6px;pointer-events:auto";
+                button.addEventListener("click", () => switchLibraryTab(key));
+                tabs.append(button);
+                return button;
+            };
+            const referenceTab = makeTab("reference", "参考图片");
+            const boardTab = makeTab("board", "分镜参考");
+            const boardCount = document.createElement("span");
+            boardCount.dataset.boardCount = ""; boardCount.textContent = " 0/0";
+            boardCount.style.cssText = "font-size:12px;opacity:.85";
+            boardTab.append(boardCount);
+            boardLoadButton = document.createElement("button");
+            boardLoadButton.type = "button"; boardLoadButton.className = "h3-image-clear"; boardLoadButton.dataset.boardBatch = "";
+            boardLoadButton.textContent = "＋ 分镜载入";
+            boardLoadButton.title = "选择多张分镜图，按文件名数字顺序从第 1 段起依次对应；点击分镜页的单段槽位可替换";
+            boardLoadButton.style.cssText = "min-height:30px;padding:0 12px;border-radius:6px;margin-left:2px;pointer-events:auto";
+            tabs.append(boardLoadButton);
+            if (clearImagesButton) {
+                // 清空按钮统一放到页签行最右侧；点它按当前页签清参考图或分镜参考。
+                tabs.append(clearImagesButton);
+                clearImagesButton.style.marginLeft = "auto";
+                clearImagesButton.style.display = "";
+                clearImagesButton.textContent = "清空";
+                clearImagesButton.title = "清空参考图片内的全部素材（不影响分镜参考图和视频/音频轨）";
+            }
+            boardLoadButton.style.display = "none";
+            // 原左上角标题行清空后已无内容，整体移除。
+            title?.remove();
+            libraryTitleEl = null;
+            const poolEl = library.querySelector("[data-pool]");
+            if (poolEl) library.insertBefore(tabs, poolEl); else library.append(tabs);
+            const boardRow = root.querySelector("[data-board-row]");
+            if (boardRow) library.append(boardRow);
+            referenceTab.classList.add("on");
+            styleLibraryTab(referenceTab, true);
+            styleLibraryTab(boardTab, false);
+            boardLoadButton.style.display = "none";
+        }
+    }
     const storagePanel = mountStoragePanel(root, node, api, delay => scheduleLayout(delay), clearAllSources);
     const fileInput = document.createElement("input");
     fileInput.type = "file"; fileInput.multiple = true; fileInput.hidden = true;
     fileInput.accept = "image/*,video/*,audio/*";
     root.append(fileInput);
+    const timedTextInput = document.createElement("input");
+    timedTextInput.type = "file"; timedTextInput.hidden = true;
+    timedTextInput.accept = ".srt,.txt,text/plain";
+    root.append(timedTextInput);
+    const boardImageInput = document.createElement("input");
+    boardImageInput.type = "file"; boardImageInput.hidden = true;
+    boardImageInput.multiple = true; boardImageInput.accept = "image/*";
+    root.append(boardImageInput);
 
     const $ = selector => root.querySelector(selector);
     const view = $("[data-view]"), canvas = $("[data-canvas]"), ruler = $("[data-ruler]"),
@@ -1233,6 +1331,7 @@ export function mountTimelineEditor(node) {
         syncButtons();
         renderFramePlan();
         if (lastIntervals === null) lastIntervals = snapshotIntervals();  // 首次绘制记录段线基线
+        renderBoardRow();
         syncViewHeight();  // 每次重绘后重算高度（缩放/无素材都不留底空白）
         syncTrackMuteButtons();
         syncTrackVisibilityButtons();
@@ -1460,7 +1559,8 @@ export function mountTimelineEditor(node) {
 
     function renderPool() {
         pool.replaceChildren();
-        const visibleSources=T.state.sources.filter(source=>matchesSource(root,source));
+        // 参考图片页只显示参考图；分镜图在「分镜参考」页单独显示，不重复。
+        const visibleSources=T.state.sources.filter(source=>!source.board_only && matchesSource(root,source));
         pool.classList.toggle("is-empty", !visibleSources.length);
         const batchSegs = T.state.path_source ? Math.max(0, Number(T.batchCount) || 0) : 0;
         const count = Math.max(1, T.state.path_source ? batchSegs : intervals().length);
@@ -1480,7 +1580,7 @@ export function mountTimelineEditor(node) {
                 const image=document.createElement("img");
                 const preview=source.preview&&typeof source.preview==="object"&&source.preview.file?{...source,...source.preview}:source;
                 const originalURL=mediaURL(source);let triedOriginal=preview===source;
-                image.alt="参考图";image.decoding="async";image.tabIndex=0;image.setAttribute("role","button");image.setAttribute("aria-label","预览 "+source.name);
+                image.alt="参考图";image.decoding="async";image.tabIndex=0;image.draggable=false;image.setAttribute("role","button");image.setAttribute("aria-label","预览 "+source.name);
                 image.onerror=()=>{if(!triedOriginal){triedOriginal=true;image.src=originalURL;return;}image.hidden=true;const unavailable=document.createElement("button");unavailable.type="button";unavailable.className="h3-thumb-unavailable";unavailable.textContent="图片暂不可预览";unavailable.onclick=show;image.after(unavailable);};
                 image.src=mediaURL(preview);image.onclick=show;image.onkeydown=event=>{if(event.key==="Enter"||event.key===" "){event.preventDefault();show();}};card.append(image);
                 const name=document.createElement("span");name.className="h3-shot-name";name.textContent=source.name;name.title=source.name;card.append(name);
@@ -1499,12 +1599,23 @@ export function mountTimelineEditor(node) {
                     }
                     pushUndo();if(setting)setting.segment=Number(select.value);else T.state.images.push({id:uid("img"),source:source.id,segment:Number(select.value)});afterEdit();
                 };card.append(select);
+                card.draggable = false;
+                if (T.state.images.some(image => image.source === source.id)) {
+                    makeReferenceDraggable(card, source);
+                    const measured = parseFloat(getComputedStyle(card).width);
+                    if (measured > 0) node._adH3ShotWidth = measured;
+                }
             } else {
                 const button=document.createElement("button");button.type="button";button.className="h3-source-preview";button.setAttribute("aria-label","预览 "+source.name);
                 const thumb=document.createElement("span");thumb.className="h3-source-kind";thumb.textContent=source.kind==="video"?"视频素材":"音频素材";
                 const name=document.createElement("span");name.className="h3-source-name";name.textContent=source.name;name.title=source.name;button.append(thumb,name);button.onclick=show;card.append(button);
             }
-            const remove=document.createElement("button");remove.type="button";remove.className="h3-source-remove";remove.textContent="×";remove.title="移除素材";remove.setAttribute("aria-label","移除 "+source.name);remove.onclick=()=>removeSource(source.id);card.append(remove);pool.append(card);
+            const remove=document.createElement("button");remove.type="button";remove.className="h3-source-remove";remove.textContent="×";remove.title="移除素材";remove.setAttribute("aria-label","移除 "+source.name);remove.onclick=()=>removeSource(source.id);card.append(remove);
+            if (source.kind === "image") card.addEventListener("click", event => {
+                if (event.target.closest("button,select")) return;
+                show();
+            });
+            pool.append(card);
         }
         const addImage=document.createElement("button");addImage.type="button";addImage.className="h3-image-add";addImage.dataset.load="image";addImage.textContent="＋ 加载图片";addImage.setAttribute("aria-label","添加参考图片");addImage.title="点击上传图片，也可将图片拖入此区域";pool.append(addImage);
         applyPoolExtra(Number(node._adH3PoolExtra) || 0);
@@ -1561,7 +1672,9 @@ export function mountTimelineEditor(node) {
     }
     function readRecipeInputs() {
         const raw = Number($("[data-every]")?.value);
-        const frames = align17(T.unit === "s" ? raw * FPS : raw);
+        // v0.5.47：潜桥开启（C>0）时每段输出必须是 17n；124 这类 17k+5 段长会让后台重排输出、
+        // 而源/音频/参考窗口仍按原段边界取，段与段之间就会重复/跳过若干帧。这里直接吸附到 17n。
+        const frames = alignSegmentLength(T.unit === "s" ? raw * FPS : raw);
         const count = Number($("[data-count]")?.value);
         const byCount = Number.isInteger(count) && count >= 1 && count <= 1000;
         return { raw, frames, count, byCount };
@@ -1637,6 +1750,13 @@ export function mountTimelineEditor(node) {
         T.state.sources = T.state.sources.filter(s => s.kind === "image" || s.reference_only || clipSources.has(s.id));
         if (T.state.sources.length < before)
             hint("片段已全部删除的素材连同其参考输出口一并移除；重新加载可再次使用。");
+    };
+    // 分镜图专用素材：只保留仍被某一段分镜引用的；被替换/清空后从清单移除（磁盘文件保留）。
+    const pruneBoardSources = () => {
+        const boardIds = new Set((Array.isArray(T.state.board_images) ? T.state.board_images : []).filter(Boolean));
+        const imageIds = new Set((T.state.images || []).map(image => image.source));
+        T.state.sources = T.state.sources.filter(source =>
+            !source.board_only || boardIds.has(source.id) || imageIds.has(source.id));
     };
 
     function linkedSegment() {
@@ -1846,6 +1966,7 @@ export function mountTimelineEditor(node) {
         if (!hasAvClips() && !Array.isArray(T.state.generation_clips) && T.state.duration>0) generationClips(T.state);
         bumpSnapCache();
         pruneSources();
+        pruneBoardSources();
         // 空槽有实际轨道身份；组移后再裁剪/删除也不能把后轨偷偷挪上来。
         const hasTrackGap=[T.state.video_tracks,T.state.audio_tracks].some(lanes=>lanes.some((lane,i)=>!lane.length&&lanes.slice(i+1).some(next=>next.length)));
         if (!preserveTracks && !restoredBindings && !hasTrackGap) compactTracks();
@@ -1865,105 +1986,253 @@ export function mountTimelineEditor(node) {
         node.setDirtyCanvas(true, true);
     }
 
-    // 潜桥开启：保持当前段数/提示词不变，把可见视频轨道重排成总帧 floor(源总帧/17)*17，
-    // 按段数尽量均匀分配（如 3 段 248 帧 -> 85/85/68）。只处理单视频轨、无独立音频轨的常见情况。
+    // 潜桥开启：保持段数/提示词不变，把可见视频轨道重排成 17n 目标帧（总帧按 17 取整）。
+    // · 单源连续轨：整轨分配、可跨片段边界切分（如 666 帧 6 段 -> 119/119/119/102/102/102）。
+    // · 合并/多源轨（片段来自多个素材文件）：逐片段按 17n 对齐，不跨源拼接，片段尾部不足 17 帧的部分裁掉。
+    // v0.5.47：自动模式（relayPlanAuto）+ 应用分段请求参数（relayPlanRequest：分段数/每段长度）。
+    let relayPlanAuto = null;
+    let relayPlanRequest = null;
+    let relayAutoAlignTimer = 0;
+    let relayAlignWarned = "";
+    const relayContextValue = () => {
+        try {
+            const seg = linkedPromptSegment(node);
+            const raw = seg?.widgets?.find(item => item.name === "潜桥续接")?.value;
+            const value = parseFloat(String(raw ?? ""));
+            return Number.isFinite(value) && value > 0 ? value : 0;
+        } catch (_error) { return 0; }
+    };
+    const relaySegmentsNeedAlign = () => {
+        try {
+            const flags = (T.state.disabled_tracks || {}).video_tracks || [];
+            const clips = (T.state.video_tracks || []).flatMap((lane, index) => flags[index] ? [] : (lane || []));
+            if (!clips.length) return false;
+            return clips.some(clip => Math.round((clipEnd(clip) - Number(clip.tl_start || 0)) * FPS) % 17 !== 0);
+        } catch (_error) { return false; }
+    };
+    // 逐片段 17n 布局（合并/多源轨用）：片段不跨源拼接；返回新片段、每段目标帧、总帧。
+    const relayGridLayout = (clips, options = {}) => {
+        const sorted = [...clips].sort((a, b) => Number(a.tl_start) - Number(b.tl_start));
+        if (!sorted.length) throw new Error("没有可重排的视频片段");
+        const eps = 0.5 / FPS;
+        for (let index = 0; index < sorted.length; index++) {
+            const clip = sorted[index];
+            if (![clip.tl_start, clip.src_in, clip.src_out].every(value => Number.isFinite(Number(value))))
+                throw new Error("片段缺少时间/源范围数值");
+            if (index === 0) {
+                if (Math.abs(Number(clip.tl_start)) > eps) throw new Error("视频需从时间线 0 开始");
+                continue;
+            }
+            if (Math.abs(Number(clip.tl_start) - clipEnd(sorted[index - 1])) > eps)
+                throw new Error("时间线不连续（有断开或重叠）");
+        }
+        const framesOf = clip => Math.max(0, Math.round((Number(clip.src_out) - Number(clip.src_in)) * FPS));
+        const maxUnits = sorted.map(clip => Math.floor(framesOf(clip) / 17));
+        if (maxUnits.some(units => units < 1)) throw new Error("存在不足 17 帧的片段");
+        const totalUnits = maxUnits.reduce((sum, units) => sum + units, 0);
+        const stepUnits = Math.max(0, Math.floor((Number(options.step) || 0) / 17));
+        const requested = Math.max(0, Math.round(Number(options.count) || 0));
+        const splitUnits = units => {
+            if (stepUnits >= 1) {
+                const seq = [];
+                let left = units;
+                while (left >= stepUnits) { seq.push(stepUnits * 17); left -= stepUnits; }
+                if (left > 0) {
+                    const tail = left * 17;
+                    if (seq.length && tail < stepUnits * 17 / 2) seq[seq.length - 1] += tail;
+                    else seq.push(tail);
+                }
+                return seq.length ? seq : [units * 17];
+            }
+            return [units * 17];
+        };
+        let counts;
+        if (requested >= 1 && stepUnits < 1) {
+            const wanted = Math.min(totalUnits, Math.max(sorted.length, requested));
+            counts = sorted.map(() => 1);
+            let remain = wanted - sorted.length;
+            while (remain > 0) {
+                let best = -1, bestScore = -Infinity;
+                for (let index = 0; index < sorted.length; index++) {
+                    if (maxUnits[index] - counts[index] <= 0) continue;
+                    const score = (maxUnits[index] - counts[index]) / (counts[index] + 1);
+                    if (score > bestScore) { bestScore = score; best = index; }
+                }
+                if (best < 0) break;
+                counts[best] += 1; remain -= 1;
+            }
+        } else {
+            counts = maxUnits.map(() => 1);
+        }
+        const nextClips = [];
+        const targets = [];
+        let cursorFrames = 0;
+        sorted.forEach((clip, index) => {
+            const units = maxUnits[index];
+            const parts = Math.max(1, Math.min(units, counts[index] || 1));
+            const base = Math.floor(units / parts), extra = units % parts;
+            const segmentTargets = stepUnits >= 1 && parts === 1
+                ? splitUnits(units)
+                : Array.from({ length: parts }, (_, part) => (base + (part < extra ? 1 : 0)) * 17);
+            let sourceCursor = Number(clip.src_in);
+            for (const frames of segmentTargets) {
+                targets.push(frames);
+                nextClips.push({...clip, id: uid("v"),
+                    tl_start: snapFrame(cursorFrames / FPS),
+                    src_in: snapFrame(sourceCursor), src_out: snapFrame(sourceCursor + frames / FPS),
+                    retained_src_in: undefined, retained_src_out: undefined});
+                sourceCursor += frames / FPS; cursorFrames += frames;
+            }
+        });
+        return {clips: nextClips, targets, totalFrames: cursorFrames};
+    };
     const applyRelayPlan = relayContext => {
+        // 自动模式：自动触发时失败只记录原因，由 _adH3EnsureRelayPlan 统一提示；手动切换仍即时提示。
+        const autoState = (typeof relayPlanAuto === "object" && relayPlanAuto) ? relayPlanAuto : null;
+        const auto = !!autoState?.on;
+        const request = (typeof relayPlanRequest === "object" && relayPlanRequest) ? relayPlanRequest : null;
+        const fail = message => { if (autoState) autoState.problem = message; if (!auto) hint(message, true); return false; };
         const context = Math.max(0, Number(relayContext) || 0);
         if (!context) return false;
         const lanes = T.state.video_tracks || [];
-        const active = lanes.map((lane, index) => ({ lane, index })).filter(item => item.lane?.length);
+        const disabled = (T.state.disabled_tracks || {}).video_tracks || [];
+        const active = lanes.map((lane, index) => ({ lane, index }))
+            .filter(item => item.lane?.length && !disabled[item.index]);
         if (active.length !== 1) {
-            hint("潜桥自动重排目前只支持一条可见视频轨道；请先合并/隐藏其它视频轨。", true);
-            return false;
+            return fail("潜桥自动重排目前只支持一条可见视频轨道；请先合并/隐藏其它视频轨。");
         }
-        if ((T.state.audio_tracks || []).some(lane => lane?.length)) {
-            hint("潜桥自动重排暂不处理独立音频轨；请先把音频片段去掉或合并到视频轨。", true);
-            return false;
+        const audioDisabled = (T.state.disabled_tracks || {}).audio_tracks || [];
+        if ((T.state.audio_tracks || []).some((lane, index) => lane?.length && !audioDisabled[index])) {
+            return fail("潜桥自动重排暂不处理独立音频轨；请先把音频片段去掉或合并到视频轨。");
         }
         const clips = [...active[0].lane].sort((a, b) => Number(a.tl_start) - Number(b.tl_start));
         if (!clips.length) return false;
-        const sourceIds = new Set(clips.map(clip => clip.source));
-        if (sourceIds.size !== 1) {
-            hint("潜桥自动重排需要同一源视频的连续片段；当前视频轨来自多个源文件。", true);
-            return false;
-        }
-        // 连续性校验：只对“同一源、时间线连续、源范围连续”的片段自动重排；
-        // 任何空隙/重叠/跳源都保留用户编辑并明确提示，不能把已删内容重新取回。
         const eps = 0.5 / FPS;
         for (let index = 0; index < clips.length; index++) {
             const clip = clips[index];
-            if (!Number.isFinite(Number(clip.tl_start)) || !Number.isFinite(Number(clip.src_in))
-                    || !Number.isFinite(Number(clip.src_out))) {
-                hint("潜桥自动重排发现片段缺少时间/源范围数值，已保留你的编辑。", true);
-                return false;
+            if (![clip.tl_start, clip.src_in, clip.src_out].every(value => Number.isFinite(Number(value))))
+                return fail("潜桥自动重排发现片段缺少时间/源范围数值，已保留你的编辑。");
+            if (index === 0) {
+                if (Math.abs(Number(clip.tl_start)) > eps)
+                    return fail("潜桥自动重排要求视频从时间线 0 开始；当前前面有空隙，已保留你的编辑。");
+                continue;
             }
-            if (index === 0) continue;
-            const previous = clips[index - 1];
-            if (Math.abs(Number(clip.tl_start) - clipEnd(previous)) > eps) {
-                hint("潜桥自动重排要求时间线连续、中间没有空隙或重叠；当前有断开，已保留你的编辑（可先合并或删掉空隙再试）。", true);
-                return false;
-            }
-            if (Math.abs(Number(clip.src_in) - Number(previous.src_out)) > eps) {
-                hint("潜桥自动重排要求源视频范围连续；当前片段之间跳源/有删减，已保留你的编辑。", true);
-                return false;
-            }
-        }
-        const totalStart = Math.min(...clips.map(clip => Number(clip.tl_start) || 0));
-        if (Math.abs(totalStart) > eps) {
-            hint("潜桥自动重排要求视频从时间线 0 开始；当前前面有空隙，已保留你的编辑。", true);
-            return false;
+            if (Math.abs(Number(clip.tl_start) - clipEnd(clips[index - 1])) > eps)
+                return fail("潜桥自动重排要求时间线连续、中间没有空隙或重叠；当前有断开，已保留你的编辑（可先合并或删掉空隙再试）。");
         }
         const totalEnd = Math.max(...clips.map(clip => clipEnd(clip)));
-        const totalFrames = Math.max(0, Math.round((totalEnd - totalStart) * FPS));
-        const count = clips.length;
+        const totalFrames = Math.max(0, Math.round(totalEnd * FPS));
         const units = Math.floor(totalFrames / 17);
-        if (units < count) {
-            hint(`源视频只有 ${totalFrames} 帧，潜桥至少需要 ${count * 17} 帧才能保持 ${count} 段。`, true);
-            return false;
-        }
-        const base = Math.floor(units / count), extra = units % count;
-        const targets = Array.from({ length: count }, (_, index) => (base + (index < extra ? 1 : 0)) * 17);
-        // 按最终生成帧数 G=target+C 预检单段上限，避免排队后才报错。
+        if (units < 1) return fail(`源视频只有 ${totalFrames} 帧，潜桥至少需要 17 帧。`);
         const maxWidget = (node.widgets || []).find(widget => widget.name === "max_frames");
         const maxRaw = Number(maxWidget?.value ?? maxWidget?.options?.default);
         const maxFrames = Number.isFinite(maxRaw) && maxRaw > 0 ? maxRaw : 0;
-        if (maxFrames) {
-            for (let index = 0; index < targets.length; index++) {
-                if (targets[index] + context > maxFrames) {
-                    hint(`潜桥重排后第 ${index + 1} 段需要生成 ${targets[index] + context} 帧（${targets[index]}+C=${context}），超过单段上限 ${maxFrames} 帧；已保留原编辑，请增加段数/缩短时长或提高单段上限。`, true);
-                    return false;
+        const requestCount = Math.max(0, Math.round(Number(request?.count) || 0));
+        const requestStep = Math.max(0, Math.round(Number(request?.step) || 0));
+        const singleSource = new Set(clips.map(clip => clip.source)).size === 1;
+        let sourceContinuous = singleSource;
+        if (singleSource) {
+            for (let index = 1; index < clips.length; index++) {
+                if (Math.abs(Number(clips[index].src_in) - Number(clips[index - 1].src_out)) > eps) {
+                    sourceContinuous = false;
+                    break;
                 }
             }
         }
-        const signature = [clips[0].source, totalFrames, count, context, targets.join("/")].join("|");
-        if (T.state.segment_recipe?.relay_plan?.signature === signature) return false;
-        const template = clips[0];
-        const sourceStart = Number(template.src_in) || 0;
-        let cursorFrames = 0;
-        const nextClips = targets.map((frames, index) => {
-            const start = cursorFrames / FPS;
-            const end = (cursorFrames + frames) / FPS;
-            cursorFrames += frames;
-            return {
-                ...template,
-                id: uid("v"),
-                tl_start: snapFrame(start),
-                src_in: snapFrame(sourceStart + start),
-                src_out: snapFrame(sourceStart + end),
-                retained_src_in: undefined,
-                retained_src_out: undefined,
-            };
-        });
+        let targets;
+        let nextClips;
+        let cursorFrames;
+        let signatureSource;
+        let count;
+        if (singleSource && !sourceContinuous) {
+            return fail("潜桥自动重排要求源视频范围连续；当前片段之间跳源/有删减，已保留你的编辑。");
+        }
+        if (singleSource && sourceContinuous) {
+            // 单源连续：整轨分配（可跨片段边界切分）。
+            const recipeCount = Math.max(0, Math.round(Number(T.state.segment_recipe?.count) || 0));
+            let stepUnits = 0;
+            if (requestStep >= 17 && requestCount < 1) stepUnits = Math.max(1, Math.round(requestStep / 17));
+            if (stepUnits >= 1) {
+                const seq = [];
+                let left = units;
+                while (left >= stepUnits) { seq.push(stepUnits * 17); left -= stepUnits; }
+                if (left > 0) {
+                    const tail = left * 17;
+                    if (seq.length && tail < stepUnits * 17 / 2) seq[seq.length - 1] += tail;
+                    else seq.push(tail);
+                }
+                targets = seq;
+            } else {
+                count = requestCount >= 1 ? requestCount : (recipeCount >= 1 ? recipeCount : clips.length);
+                count = Math.max(1, count);
+                if (units < count) return fail(`源视频只有 ${totalFrames} 帧，潜桥至少需要 ${count * 17} 帧才能保持 ${count} 段。`);
+                const base = Math.floor(units / count), extra = units % count;
+                targets = Array.from({ length: count }, (_, index) => (base + (index < extra ? 1 : 0)) * 17);
+            }
+            if (maxFrames) {
+                for (let index = 0; index < targets.length; index++) {
+                    if (targets[index] + context > maxFrames) {
+                        return fail(`潜桥重排后第 ${index + 1} 段需要生成 ${targets[index] + context} 帧（${targets[index]}+C=${context}），超过单段上限 ${maxFrames} 帧；已保留原编辑，请增加段数/缩短时长或提高单段上限。`);
+                    }
+                }
+            }
+            const template = clips[0];
+            const sourceStart = Number(template.src_in) || 0;
+            cursorFrames = 0;
+            nextClips = targets.map(frames => {
+                const start = cursorFrames / FPS;
+                const end = (cursorFrames + frames) / FPS;
+                cursorFrames += frames;
+                return {...template, id: uid("v"),
+                    tl_start: snapFrame(start), src_in: snapFrame(sourceStart + start), src_out: snapFrame(sourceStart + end),
+                    retained_src_in: undefined, retained_src_out: undefined};
+            });
+            signatureSource = clips[0].source;
+            count = targets.length;
+        } else {
+            // 合并/多源：逐片段对齐 17n，片段不跨源拼接（逐片段尾部不足 17 帧的裁掉）。
+            let layout;
+            try {
+                layout = relayGridLayout(clips, {count: requestCount >= 1 ? requestCount : clips.length, step: requestStep});
+            } catch (error) {
+                return fail(String(error?.message || error));
+            }
+            targets = layout.targets;
+            nextClips = layout.clips;
+            cursorFrames = layout.totalFrames;
+            count = targets.length;
+            signatureSource = clips.map(clip => clip.source).join(",");
+            if (maxFrames) {
+                for (let index = 0; index < targets.length; index++) {
+                    if (targets[index] + context > maxFrames) {
+                        return fail(`潜桥重排后第 ${index + 1} 段需要生成 ${targets[index] + context} 帧（${targets[index]}+C=${context}），超过单段上限 ${maxFrames} 帧；已保留原编辑，请增加段数/缩短时长或提高单段上限。`);
+                    }
+                }
+            }
+        }
+        const signature = [signatureSource, count, context, targets.join("/")].join("|");
+        // 幂等：当前各段帧数已经等于目标时不再重排（重排后总长变为 17n 倍数，不能再用原始总帧做签名）。
+        const layoutNow = clips.map(clip => Math.round((clipEnd(clip) - Number(clip.tl_start)) * FPS));
+        const plannedTotal = targets.reduce((total, frames) => total + frames, 0);
+        if (layoutNow.length === targets.length && layoutNow.every((frames, index) => frames === targets[index])) {
+            T.state.segment_recipe = { ...(T.state.segment_recipe || {}),
+                frames: targets[0], count, unit: "f", custom: true,
+                relay_plan: { signature, targets, total: plannedTotal, context,
+                              source: signatureSource, source_start: 0 } };
+            return false;
+        }
+        const otherEnd = Math.max(0, ...lanes.flatMap((lane, index) =>
+            index === active[0].index ? [] : (lane || []).map(clip => Number(clipEnd(clip)) || 0)));
         pushUndo();
-        T.state.video_tracks = lanes.map((lane, index) => index === active[0].index ? nextClips : []);
-        T.state.duration = snapFrame(cursorFrames / FPS);
+        T.state.video_tracks = lanes.map((lane, index) => index === active[0].index ? nextClips : lane);
+        T.state.duration = snapFrame(Math.max(cursorFrames / FPS, otherEnd));
         T.state.segmentation = "clips";
         T.state.split_points = [];
         T.state.segment_recipe = {
             ...(T.state.segment_recipe || {}),
             frames: targets[0], count, unit: "f", custom: true,
             relay_plan: { signature, targets, total: cursorFrames, context,
-                          source: clips[0].source, source_start: sourceStart },
+                          source: signatureSource, source_start: 0 },
         };
         T.unit = "f";
         T.selected.clear();
@@ -1974,10 +2243,49 @@ export function mountTimelineEditor(node) {
         if (every) every.value = targets[0];
         if (countInput) countInput.value = count;
         afterEdit();
-        hint(`潜桥已重排：${count} 段 ${targets.join(" / ")} 帧，共 ${cursorFrames} 帧（C=${context}，尾部不足 17 帧的部分不生成）。`);
+        const detail = `：${count} 段 ${targets.join(" / ")} 帧，共 ${cursorFrames} 帧（C=${context}，尾部不足 17 帧的部分不生成）。`;
+        if (auto) hint(`潜桥已自动重排（${autoState.label || "潜桥开启"}）${detail}`);
+        else hint(`潜桥已重排${detail}`);
         return true;
     };
     node._adH3ApplyRelayPlan = applyRelayPlan;
+    // 应用分段（潜桥开启）：按输入的「分段数」或「每段长度」整轨重排为 17n。
+    node._adH3ApplyRelayLayout = (request = {}) => {
+        const auto = { on: true, label: request.label || "潜桥开启", problem: "" };
+        relayPlanAuto = auto;
+        relayPlanRequest = { count: Number(request.count) || 0, step: Number(request.step) || 0 };
+        let changed = false;
+        try { changed = applyRelayPlan(relayContextValue()); } finally { relayPlanAuto = null; relayPlanRequest = null; }
+        return { ok: changed || !auto.problem, changed, problem: auto.problem || "" };
+    };
+    // 自动对齐入口：加载工作流 / 应用分段 / 点开始前调用（幂等；无法重排时保留用户编辑并提示原因）。
+    node._adH3EnsureRelayPlan = () => {
+        if (String(T.state.path_source || "").trim()) return false;
+        const context = relayContextValue();
+        if (!context) return false;
+        const auto = { on: true, label: "潜桥开启", problem: "" };
+        relayPlanAuto = auto;
+        let changed = false;
+        try { changed = applyRelayPlan(context); } finally { relayPlanAuto = null; }
+        if (changed) { relayAlignWarned = ""; return true; }
+        if (auto.problem && relaySegmentsNeedAlign() && auto.problem !== relayAlignWarned) {
+            relayAlignWarned = auto.problem;
+            hint(`潜桥已开启，但当前时间线无法自动对齐 17 帧网格：${auto.problem}；生成仍按原分段执行，段间可能出现重复/跳过。`, true);
+        }
+        return false;
+    };
+    const scheduleRelayAutoAlign = (tries = 8, delay = 0) => {
+        clearTimeout(relayAutoAlignTimer);
+        let left = Math.max(0, tries);
+        const run = () => {
+            if (!node.graph) return;
+            if (left-- <= 0) return;
+            if (!relayContextValue()) { relayAutoAlignTimer = setTimeout(run, 250); return; }
+            try { node._adH3EnsureRelayPlan(); } catch (_error) {}
+        };
+        relayAutoAlignTimer = setTimeout(run, delay);
+    };
+    node._adH3ScheduleRelayAlign = scheduleRelayAutoAlign;
 
     // ---------- 波形 ----------
     let audioCtx = null, previewDisposed = false;
@@ -2186,19 +2494,29 @@ export function mountTimelineEditor(node) {
         audioPending.get(id)?.controller.abort(); audioCache.delete(id);
         T.state.sources = T.state.sources.filter(source => source.id !== id);
         T.state.images = T.state.images.filter(image => image.source !== id);
+        if (Array.isArray(T.state.board_images)) T.state.board_images = T.state.board_images.map(value => value === id ? null : value);
         for (const key of ["video_tracks", "audio_tracks"])
             T.state[key] = T.state[key].map(lane => lane.filter(clip => clip.source !== id));
         afterEdit();
     }
-    // 「清空」参考图片：只清图片素材与段别映射，视频/音频素材和轨道保持不动。
+    // 「清空」参考图片页：只清参考图卡与参考范围；分镜参考图、视频/音频轨保持不动。
     function clearReferenceImages() {
-        const images = (T.state.sources || []).filter(source => source.kind === "image");
+        const images = Array.isArray(T.state.images) ? T.state.images : [];
         if (!images.length) { hint("参考图片已经是空的。"); return; }
+        const referenced = new Set(images.map(image => image.source));
+        const boardIds = new Set((Array.isArray(T.state.board_images) ? T.state.board_images : []).filter(Boolean));
+        materialUploadToken++;  // 取消仍在进行中的参考图/素材批量导入，避免清空后被迟到结果写回
         pushUndo();
-        for (const source of images) thumbCache.delete(source.id);
-        const removed = clearImageSources(T.state);
+        // 同一素材可能同时作参考图和分镜图：参考记录必须清掉，被分镜引用的源保留，
+        // 但保留后要改成 board_only，否则它还会被当成参考图（参考口/自动段数）。
+        for (const id of referenced) if (!boardIds.has(id)) thumbCache.delete(id);
+        T.state.images = [];
+        T.state.sources = normalizeBoardSources(
+            (T.state.sources || []).filter(source => !referenced.has(source.id) || boardIds.has(source.id)),
+            T.state.board_images, T.state.images);
+        if (node._adH3LocalProgress?.busy) setMaterialProgress(node, {busy: false, phase: "paused", fraction: null, text: "已取消导入"});
         afterEdit();
-        hint(`已清空参考图片（${removed} 张），视频/音频轨未改动。`);
+        hint(`已清空参考图片（${images.length} 张）；分镜参考图、视频/音频轨未改动。`);
     }
     // 「清空全部素材」：移除素材准备节点里的全部图片/视频/音频（含时间线片段），不删除磁盘文件。
     function clearAllSources() {
@@ -2206,9 +2524,13 @@ export function mountTimelineEditor(node) {
         const clipCount = [...(T.state.video_tracks || []), ...(T.state.audio_tracks || [])].flat().length;
         if (!sources.length && !clipCount) { hint("素材准备里没有素材。"); return; }
         if (!window.confirm(`清空素材准备里的全部素材（${sources.length} 个，含图片/视频/音频）？\n只从节点移除，不删除磁盘文件。`)) return;
+        boardUploadToken++;
+        materialUploadToken++;
+        boardTarget = null;
         pushUndo();
         try { clearSourcePreview(root); } catch {}
         try { stopPlayback(); } catch {}
+        if (node._adH3LocalProgress?.busy) setMaterialProgress(node, {busy: false, phase: "paused", fraction: null, text: "已取消导入"});
         for (const source of sources) {
             thumbCache.delete(source.id);
             audioPending.get(source.id)?.controller.abort();
@@ -2218,6 +2540,7 @@ export function mountTimelineEditor(node) {
         }
         T.state.sources = [];
         T.state.images = [];
+        T.state.board_images = [];
         T.state.video_tracks = [[], [], []];
         T.state.audio_tracks = [[], [], []];
         T.state.split_points = [];
@@ -2274,20 +2597,25 @@ export function mountTimelineEditor(node) {
     async function uploadFiles(fileList, referenceOnly=false) {
         const files = Array.from(fileList || []);
         if (!files.length) return;
+        // 容量检查是异步的；代次必须在检查之前建立，否则检查期间清空后上传仍会写回。
+        const token = ++materialUploadToken;
         // 批量预检只做一次（不再每个文件各扫一次占用），上传结束再刷新一次占用。
         try {
             const total = files.reduce((sum, file) => sum + (Number(file.size) || 0), 0);
             if (!await storagePanel.canImport(total)) { hint("导入将超过素材容量上限，请先清理缓存或整理素材。", true); return; }
         } catch (error) { hint(error.message, true); return; }
+        if (token !== materialUploadToken) return;  // 等待容量检查时被清空/重载
         let finished = 0, failed = false;
         setMaterialProgress(node, {busy: true, phase: "running", fraction: null, text: `导入中 0/${files.length}`});
         try {
             for (const file of files) {
+                if (token !== materialUploadToken) return;
                 const form = new FormData();
                 form.append("file", file, file.name);
                 try {
                     const response = await api.fetchApi("/aiden_h3/upload", { method: "POST", body: form });
                     const data = await response.json();
+                    if (token !== materialUploadToken) return;
                     if (data.error) { failed = true; hint(data.error, true); if (data.code === "storage_limit") break; continue; }
                     if (referenceOnly) data.source.reference_only = true;
                     addSource(data.source);
@@ -2296,9 +2624,11 @@ export function mountTimelineEditor(node) {
                 } catch (error) { failed = true; hint(`导入失败：${error.message}`, true); }
             }
         } finally {
-            setMaterialProgress(node, {busy: false, phase: failed ? "error" : "completed", fraction: finished/files.length,
-                text: `${failed ? "部分导入失败" : "导入完成"} ${finished}/${files.length}`});
-            void storagePanel.refresh().catch(() => {});
+            if (token === materialUploadToken) {
+                setMaterialProgress(node, {busy: false, phase: failed ? "error" : "completed", fraction: finished/files.length,
+                    text: `${failed ? "部分导入失败" : "导入完成"} ${finished}/${files.length}`});
+                void storagePanel.refresh().catch(() => {});
+            }
         }
     }
     async function loadLibrary(mode) {
@@ -3435,10 +3765,494 @@ export function mountTimelineEditor(node) {
         finally { T.merging = false; }
     }
 
+    // ---------- 参考图拖动调序（只调整参考图，音频/视频/分镜素材不动） ----------
+    function commitReferenceOrder() {
+        const cards = [...pool.querySelectorAll(".h3-shot")].filter(card => {
+            const source = (T.state.sources || []).find(item => item.id === card.dataset.sourceId);
+            return source?.kind === "image" && (T.state.images || []).some(image => image.source === source.id);
+        });
+        const order = cards.map(card => card.dataset.sourceId).filter(Boolean);
+        if (order.length < 2) return;
+        const sourceMap = new Map((T.state.sources || []).map(source => [source.id, source]));
+        const referenceIds = new Set(order);
+        let cursor = 0;
+        const next = (T.state.sources || []).map(source => referenceIds.has(source.id)
+            ? sourceMap.get(order[cursor++]) || source : source);
+        if (next.map(source => source.id).join("|") === (T.state.sources || []).map(source => source.id).join("|")) return;
+        pushUndo();
+        T.state.sources = next;
+        afterEdit();
+        hint("已调整参考图片顺序；参考图端口按新顺序输出。");
+    }
+    function makeReferenceDraggable(card) {
+        card.style.cursor = "grab";
+        card.style.touchAction = "pan-y";
+        card.title = (card.title ? card.title + "\n" : "") + "左右拖动可调整参考图顺序";
+        card.addEventListener("click", event => {
+            if (card.dataset.dragged) { event.stopPropagation(); event.preventDefault(); delete card.dataset.dragged; }
+        }, true);
+        let startX = 0, startY = 0, dragging = false, active = false, moveFrame = 0, lastPoint = null;
+        const place = (under, clientX) => {
+            if (!under || under === card || !pool.contains(under) || !under.dataset.sourceId) return;
+            const rect = under.getBoundingClientRect();
+            const before = clientX <= rect.left + rect.width / 2;
+            if (before) {
+                if (under.previousSibling !== card) under.parentElement.insertBefore(card, under);
+            } else if (under.nextSibling !== card) {
+                under.parentElement.insertBefore(card, under.nextSibling);
+            }
+        };
+        const applyMove = () => {
+            moveFrame = 0;
+            if (!dragging || !lastPoint) return;
+            const {clientX, clientY} = lastPoint;
+            place(document.elementFromPoint(clientX, clientY)?.closest?.(".h3-shot"), clientX);
+            const rect = pool.getBoundingClientRect();
+            if (clientX < rect.left + 42) pool.scrollLeft -= 20;
+            else if (clientX > rect.right - 42) pool.scrollLeft += 20;
+        };
+        const move = event => {
+            if (!active) return;
+            if (!dragging && Math.hypot(event.clientX - startX, event.clientY - startY) < 3) return;
+            if (!dragging) {
+                dragging = true; card.dataset.dragged = "1";
+                card.style.opacity = ".72"; card.style.zIndex = "5";
+                card.style.transform = "scale(1.03)"; card.style.boxShadow = "0 6px 18px #0008";
+                try { card.setPointerCapture?.(event.pointerId); } catch {}
+            }
+            event.preventDefault();
+            lastPoint = {clientX: event.clientX, clientY: event.clientY};
+            if (!moveFrame) moveFrame = requestAnimationFrame(applyMove);
+        };
+        const stop = () => {
+            if (!active) return;
+            active = false;
+            window.removeEventListener("pointermove", move);
+            window.removeEventListener("pointerup", stop);
+            window.removeEventListener("pointercancel", stop);
+            if (moveFrame) { cancelAnimationFrame(moveFrame); moveFrame = 0; }
+            card.style.opacity = ""; card.style.zIndex = ""; card.style.transform = "";
+            card.style.boxShadow = ""; card.style.cursor = "grab";
+            if (dragging) {
+                dragging = false;
+                commitReferenceOrder();
+                setTimeout(() => { delete card.dataset.dragged; }, 0);
+            }
+        };
+        card.addEventListener("pointerdown", event => {
+            if (event.button !== 0 || event.target.closest("button,select")) return;
+            active = true; dragging = false; startX = event.clientX; startY = event.clientY;
+            window.addEventListener("pointermove", move, {passive: false});
+            window.addEventListener("pointerup", stop);
+            window.addEventListener("pointercancel", stop);
+        });
+    }
+
+    function styleLibraryTab(button, active) {
+        if (!button) return;
+        button.classList.toggle("on", active);
+        button.style.background = active ? "var(--ad-accent)" : "var(--ad-surface-deep)";
+        button.style.borderColor = active ? "var(--ad-accent-border)" : "var(--ad-border)";
+        button.style.color = active ? "#fff" : "var(--ad-text-dim)";
+        button.style.fontWeight = active ? "700" : "600";
+    }
+    function switchLibraryTab(tab) {
+        libraryTab = tab === "board" ? "board" : "reference";
+        root.querySelectorAll("[data-library-tab]").forEach(button => styleLibraryTab(button, button.dataset.libraryTab === libraryTab));
+        const poolEl = $("[data-pool]"), boardRow = $("[data-board-row]");
+        if (poolEl) {
+            if (libraryTab === "reference") poolEl.style.removeProperty("display");
+            else poolEl.style.setProperty("display", "none", "important");
+        }
+        if (boardRow) boardRow.style.display = libraryTab === "board" ? "flex" : "none";
+        if (libraryTitleEl) libraryTitleEl.style.display = libraryTab === "board" ? "none" : "";
+        if (boardLoadButton) boardLoadButton.style.display = libraryTab === "board" ? "" : "none";
+        if (clearImagesButton) {
+            clearImagesButton.textContent = "清空";
+            clearImagesButton.title = libraryTab === "board"
+                ? "清空所有段的分镜参考图（不影响参考图片）"
+                : "清空参考图片内的全部素材（不影响分镜参考图和视频/音频轨）";
+            clearImagesButton.style.display = "";
+        }
+        if (libraryTab === "board") renderBoardRow(); else renderPool();
+        scheduleLayout(40);
+    }
+    function clearBoardImages() {
+        const boards = Array.isArray(T.state.board_images) ? T.state.board_images : [];
+        const busy = !!node._adH3LocalProgress?.busy;
+        if (!boards.some(Boolean)) {
+            if (busy) {
+                boardUploadToken++;
+                boardTarget = null;
+                T.state.board_images = [];
+                afterEdit();
+                renderBoardRow();
+                setMaterialProgress(node, {busy: false, phase: "paused", fraction: null, text: "已取消分镜导入"});
+                hint("已取消正在进行的分镜导入。");
+            } else hint("没有分镜参考图。");
+            return;
+        }
+        if (!window.confirm("清空所有段的分镜参考图？只从节点移除，不删除磁盘文件；参考图片不受影响。")) return;
+        boardUploadToken++;
+        boardTarget = null;
+        pushUndo();
+        T.state.board_images = [];
+        afterEdit();
+        renderBoardRow();
+        if (busy) setMaterialProgress(node, {busy: false, phase: "paused", fraction: null, text: "已取消分镜导入"});
+        hint("已清空分镜参考图；参考图片保留。");
+    }
+
+    // ---------- 分镜参考图（每段一张） ----------
+    let boardTarget = null;
+    let boardUploadToken = 0;  // 清空/重新导入时递增，丢弃迟到的分镜上传结果
+    let materialUploadToken = 0;  // 参考图/视频/音频批量导入的代次：清空/重载时递增
+    let boardRowSignature = "";
+    const boardSourceMap = () => new Map((T.state.sources || []).map(source => [source.id, source]));
+    function commitBoardMove(fromIndex, toIndex) {
+        const total = intervals().length;
+        if (fromIndex === toIndex || fromIndex < 0 || toIndex < 0 || toIndex >= total) return;
+        const boards = Array.isArray(T.state.board_images) ? [...T.state.board_images] : [];
+        while (boards.length < total) boards.push(null);
+        const moving = boards[fromIndex] || null;
+        boards[fromIndex] = boards[toIndex] || null;
+        boards[toIndex] = moving;
+        pushUndo();
+        T.state.board_images = boards;
+        afterEdit();
+        hint(`已交换第 ${fromIndex + 1} 段和第 ${toIndex + 1} 段的分镜图。`);
+    }
+    function makeBoardCardDraggable(slot, index) {
+        slot.style.cursor = "grab";
+        slot.title = (slot.title ? slot.title + "\n" : "") + "左右拖动可交换段位置";
+        let startX = 0, startY = 0, active = false, dragging = false, targetIndex = index, moveFrame = 0, lastPoint = null;
+        const slotsEl = () => $("[data-board-slots]");
+        const applyMove = () => {
+            moveFrame = 0;
+            if (!dragging || !lastPoint) return;
+            const {clientX, clientY} = lastPoint;
+            const under = document.elementFromPoint(clientX, clientY)?.closest?.(".h3-board-shot");
+            if (under && under !== slot && under.dataset.boardIndex != null) targetIndex = Number(under.dataset.boardIndex);
+            const container = slotsEl();
+            if (container) {
+                const rect = container.getBoundingClientRect();
+                if (clientX < rect.left + 42) container.scrollLeft -= 20;
+                else if (clientX > rect.right - 42) container.scrollLeft += 20;
+            }
+        };
+        const move = event => {
+            if (!active) return;
+            if (!dragging && Math.hypot(event.clientX - startX, event.clientY - startY) < 3) return;
+            if (!dragging) {
+                dragging = true; slot.dataset.dragged = "1";
+                slot.style.opacity = ".72"; slot.style.zIndex = "5";
+                slot.style.transform = "scale(1.03)"; slot.style.boxShadow = "0 6px 18px #0008";
+                try { slot.setPointerCapture?.(event.pointerId); } catch {}
+            }
+            event.preventDefault();
+            lastPoint = {clientX: event.clientX, clientY: event.clientY};
+            if (!moveFrame) moveFrame = requestAnimationFrame(applyMove);
+        };
+        const stop = () => {
+            if (!active) return;
+            active = false;
+            window.removeEventListener("pointermove", move);
+            window.removeEventListener("pointerup", stop);
+            window.removeEventListener("pointercancel", stop);
+            if (moveFrame) { cancelAnimationFrame(moveFrame); moveFrame = 0; }
+            slot.style.opacity = ""; slot.style.zIndex = ""; slot.style.transform = ""; slot.style.boxShadow = "";
+            slot.style.cursor = "grab";
+            if (dragging) {
+                dragging = false;
+                const from = index, to = targetIndex;
+                targetIndex = index;
+                commitBoardMove(from, to);
+                setTimeout(() => { delete slot.dataset.dragged; }, 0);
+            }
+        };
+        slot.addEventListener("pointerdown", event => {
+            if (event.button !== 0 || event.target.closest("button,select")) return;
+            active = true; dragging = false; targetIndex = index;
+            startX = event.clientX; startY = event.clientY;
+            window.addEventListener("pointermove", move, {passive: false});
+            window.addEventListener("pointerup", stop);
+            window.addEventListener("pointercancel", stop);
+        });
+    }
+    function renderBoardRow() {
+        const row = $("[data-board-row]"), slots = $("[data-board-slots]");
+        if (!row || !slots) return;
+        const total = intervals().length;
+        const boards = Array.isArray(T.state.board_images) ? T.state.board_images : [];
+        const sourceMap = boardSourceMap();
+        const visible = libraryTab === "board";
+        const signature = JSON.stringify([total, boards.slice(0, total), visible,
+            [...sourceMap.values()].map(source => [source.id, source.name])]);
+        if (signature === boardRowSignature) { row.style.display = visible ? "flex" : "none"; return; }
+        boardRowSignature = signature;
+        row.style.display = visible ? "flex" : "none";
+        slots.replaceChildren();
+        if (!total) {
+            const empty = document.createElement("div");
+            empty.textContent = "请先用「导入时间文本」或应用分段得到至少 1 段。";
+            empty.style.cssText = "padding:12px 4px;color:var(--ad-text-dim);font-size:13px";
+            slots.append(empty);
+            const count = $("[data-board-count]"); if (count) count.textContent = " 0/0";
+            return;
+        }
+        let filled = 0;
+        slots.style.gap = "10px";
+        for (let index = 0; index < total; index++) {
+            const source = sourceMap.get(boards[index]);
+            if (source) filled++;
+            const tag = `#${String(index + 1).padStart(2, "0")}`;
+            const slot = document.createElement("div");
+            slot.className = "h3-shot h3-board-shot";
+            slot.dataset.boardIndex = String(index);
+            const shotWidth = Math.round(Number(node._adH3ShotWidth) || 172);
+            slot.style.setProperty("flex", `0 0 ${shotWidth}px`, "important");
+            slot.style.setProperty("width", `${shotWidth}px`, "important");
+            slot.style.setProperty("min-width", `${shotWidth}px`, "important");
+            slot.style.setProperty("max-width", `${shotWidth}px`, "important");
+            slot.style.cursor = "pointer";
+            slot.title = source ? `${source.name}\n点击替换第 ${index + 1} 段分镜图` : `点击选择第 ${index + 1} 段分镜图`;
+            if (!source) slot.style.borderStyle = "dashed";
+            if (source) {
+                const img = document.createElement("img");
+                img.src = mediaURL(source); img.alt = source.name || ""; img.loading = "lazy"; img.draggable = false;
+                img.onerror = () => { img.hidden = true; };
+                slot.append(img);
+            } else {
+                const empty = document.createElement("div");
+                empty.textContent = "点击选择";
+                empty.style.cssText = "height:84px;display:flex;align-items:center;justify-content:center;color:var(--ad-text-dim);font-size:12px;background:#232e3e;border-radius:5px";
+                slot.append(empty);
+            }
+            const name = document.createElement("span");
+            name.className = "h3-shot-name";
+            name.textContent = `${tag} · ${source ? source.name : "未选择"}`;
+            name.title = source ? `${tag} ${source.name}` : `${tag} 点击选择分镜图`;
+            slot.append(name);
+            if (source) {
+                const select = document.createElement("select");
+                select.setAttribute("aria-label", `第 ${index + 1} 段分镜的段号`);
+                select.add(new Option("替换图片…", "__replace__"));
+                for (let number = 1; number <= total; number++) select.add(new Option(`第 ${number} 段`, String(number)));
+                select.value = String(index + 1);
+                select.addEventListener("click", event => event.stopPropagation());
+                select.addEventListener("change", event => {
+                    event.stopPropagation();
+                    if (select.value === "__replace__") {
+                        select.value = String(index + 1);
+                        openBoardPicker(index);
+                        return;
+                    }
+                    const target = Number(select.value) - 1;
+                    if (target === index) return;
+                    const next = Array.isArray(T.state.board_images) ? [...T.state.board_images] : [];
+                    while (next.length < total) next.push(null);
+                    const moving = next[index] || null;
+                    next[index] = next[target] || null;
+                    next[target] = moving;
+                    pushUndo(); T.state.board_images = next; afterEdit();
+                    hint(`已把分镜图调整到第 ${target + 1} 段。`);
+                });
+                slot.append(select);
+            }
+            const remove = document.createElement("button");
+            remove.type = "button"; remove.className = "h3-source-remove"; remove.textContent = "×"; remove.title = "移除本段分镜图";
+            remove.addEventListener("click", event => {
+                event.stopPropagation();
+                const next = Array.isArray(T.state.board_images) ? [...T.state.board_images] : [];
+                while (next.length < total) next.push(null);
+                if (next[index] == null) return;
+                next[index] = null; pushUndo(); T.state.board_images = next; afterEdit();
+                hint(`已移除第 ${index + 1} 段分镜参考图。`);
+            });
+            slot.append(remove);
+            makeBoardCardDraggable(slot, index);
+            slot.addEventListener("click", event => {
+                if (slot.dataset.dragged) { delete slot.dataset.dragged; return; }
+                if (event.target.closest("select,button")) return;
+                openBoardPicker(index);
+            });
+            slots.append(slot);
+        }
+        const count = $("[data-board-count]");
+        if (count) count.textContent = ` ${filled}/${total}`;
+    }
+    function openBoardPicker(target) {
+        boardTarget = target;
+        boardImageInput.multiple = target === null;
+        boardImageInput.value = "";
+        boardImageInput.click();
+    }
+    async function uploadBoardImages(fileList, target = null) {
+        const files = Array.from(fileList || []);
+        if (!files.length) return;
+        const total = intervals().length;
+        if (!total) { hint("请先用「导入时间文本」或应用分段得到至少 1 段，再添加分镜图。", true); return; }
+        const collator = new Intl.Collator(undefined, {numeric: true, sensitivity: "base"});
+        const ordered = files.slice().sort((a, b) => collator.compare(a.name, b.name));
+        const start = target == null ? 0 : Number(target);
+        if (!Number.isInteger(start) || start < 0 || start >= total) { hint("分镜图目标段无效。", true); return; }
+        const capacity = target == null ? Math.max(0, total - start) : 1;
+        const selected = ordered.slice(0, capacity), skipped = ordered.length - selected.length;
+        // 容量检查是异步的：代次必须在检查之前建立，检查期间清空/重载也能取消本次导入。
+        const token = ++boardUploadToken;
+        try {
+            const totalBytes = selected.reduce((sum, file) => sum + (Number(file.size) || 0), 0);
+            if (!await storagePanel.canImport(totalBytes)) { hint("导入将超过素材容量上限，请先清理缓存。", true); return; }
+        } catch (error) { hint(error.message, true); return; }
+        if (token !== boardUploadToken) return;  // 等待容量检查时被清空/重载
+        pushUndo();
+        setMaterialProgress(node, {busy: true, phase: "running", fraction: null, text: `导入分镜图 0/${selected.length}`});
+        let failed = false;
+        // 按文件名排序后的原始位置记录结果：失败的位置留空，不能让后面的图错位补上。
+        const imported = new Array(selected.length).fill(null);
+        try {
+            for (let offset = 0; offset < selected.length; offset++) {
+                if (token !== boardUploadToken) return;
+                const file = selected[offset];
+                const form = new FormData(); form.append("file", file, file.name);
+                try {
+                    const response = await api.fetchApi("/aiden_h3/upload", {method: "POST", body: form});
+                    const data = await response.json();
+                    if (token !== boardUploadToken) return;
+                    if (data.error) {
+                        failed = true; hint(`${file.name}：${data.error}`, true);
+                        if (data.code === "storage_limit") break;
+                        continue;
+                    }
+                    let sourceId = data.source.id;
+                    const existing = T.state.sources.find(item => item.id === sourceId);
+                    if (existing && !existing.board_only) {
+                        // 同一物理文件已作参考图：分镜用独立 board_only 实例，否则清空参考图时
+                        // 它会被当作参考图保留（参考口/自动段数仍算它），两类用途无法隔离。
+                        sourceId = uid("s");
+                        T.state.sources.push({...data.source, id: sourceId, board_only: true});
+                    } else if (!existing) {
+                        T.state.sources.push({...data.source, board_only: true});
+                    }
+                    imported[offset] = sourceId;
+                    const count = imported.filter(Boolean).length;
+                    setMaterialProgress(node, {busy: true, phase: "running", fraction: count / selected.length,
+                        text: `已导入分镜图 ${count}/${selected.length}`});
+                } catch (error) {
+                    failed = true;
+                    hint(`分镜图导入失败（${file.name}）：${error.message}`, true);
+                }
+            }
+            if (token !== boardUploadToken) return;
+            const ids = imported.filter(Boolean);
+            if (ids.length) {
+                const boards = Array.isArray(T.state.board_images) ? [...T.state.board_images] : [];
+                while (boards.length < total) boards.push(null);
+                // 保留失败位置：只在成功的位置写入，后面的图不会往前顶。
+                imported.forEach((id, offset) => { if (id) boards[start + offset] = id; });
+                T.state.board_images = boards;
+                afterEdit();
+                const gaps = imported.some(id => !id);
+                hint(`已设置 ${ids.length} 张分镜参考图${gaps ? "（失败位置保留空槽）" : ""}${skipped > 0 ? `；多出的 ${skipped} 张未使用` : ""}。`);
+            }
+        } finally {
+            if (token === boardUploadToken) {
+                const count = imported.filter(Boolean).length;
+                setMaterialProgress(node, {busy: false, phase: failed ? "error" : "completed", fraction: count / selected.length,
+                    text: failed ? "分镜图部分导入失败" : "分镜图导入完成"});
+                void storagePanel.refresh().catch(() => {});
+            }
+        }
+    }
+    boardImageInput.onchange = async () => {
+        const files = [...(boardImageInput.files || [])];
+        boardImageInput.value = "";
+        const target = boardTarget; boardTarget = null;
+        if (files.length) await uploadBoardImages(files, target);
+    };
+
+    // ---------- 导入时间文本 ----------
+    function timedClockFrames(frames) {
+        const seconds = Math.max(0, Number(frames) || 0) / FPS;
+        const minutes = Math.floor(seconds / 60), rest = seconds - minutes * 60;
+        return `${minutes}:${rest.toFixed(3).padStart(6, "0")}`;
+    }
+    function importTimedText(blocks) {
+        if (!Array.isArray(blocks) || !blocks.length) throw new Error("时间文本没有可导入的段落。");
+        if (T.playing) stopPlayback();
+        if (T.state.video_tracks.some((lane, index) => lane?.length && !trackDisabled(T.state, "video_tracks", index))) throw new Error("时间文本导入目前只支持单音频轨：请先隐藏/删除视频轨片段。");
+        const audioLanes = T.state.audio_tracks.map((lane, index) => ({lane: lane || [], index})).filter(item => item.lane.length && !trackDisabled(T.state, "audio_tracks", item.index));
+        if (audioLanes.length !== 1) throw new Error("时间文本导入目前只支持一条音频轨：请先隐藏/删除其它音频轨。");
+        const li = audioLanes[0].index, lane = audioLanes[0].lane;
+        if (!lane.some(item => T.selected.has(item.id))) throw new Error("请先选中要切分的音频片段（当前轨道唯一片段）。");
+        const head = lane[0];
+        const contiguous = lane.every((item, index) => index === 0 ||
+            (item.source === head.source &&
+             Math.abs(Number(item.tl_start) - clipEnd(lane[index - 1])) < 1e-6 &&
+             Math.abs(Number(item.src_in) - Number(lane[index - 1].src_out)) < 1e-6));
+        const covers = Math.abs(Number(lane.at(-1).src_out) - Number(head.src_in) - (clipEnd(lane.at(-1)) - Number(head.tl_start))) < 1e-6;
+        if (lane.length > 1 && (!contiguous || !covers))
+            throw new Error("当前音频轨不是一条连续同源片段；请先合并或重新导入整条音频。");
+        const clip = lane.length > 1 ? {...head, src_out: lane.at(-1).src_out} : head;
+        if (Math.round(clip.tl_start * FPS) > 0) throw new Error("当前音频片段起点不是 0；时间文本导入要求从时间线 0 开始。");
+        const trackEnd = Math.round(clipEnd(clip) * FPS);
+        const maxFrames = Math.max(5, Math.round(Number($("[data-max-frames]")?.value) || T.state.max_frames || 362));
+        const frames = blocks.map(block => ({start: Math.round(block.startFrame), end: Math.round(block.endFrame)}));
+        frames[0].start = 0;
+        frames.forEach((block, index) => {
+            const length = block.end - block.start;
+            if (length < 5) throw new Error(`第 ${index + 1} 块只有 ${length} 帧，少于 H3 最少的 5 帧。`);
+            if (length > maxFrames) throw new Error(`第 ${index + 1} 块 ${length} 帧，超过单段上限 ${maxFrames} 帧。`);
+        });
+        if (frames.at(-1).end > trackEnd + 1) throw new Error(`文本结束（${frames.at(-1).end} 帧）超过音频长度（${trackEnd} 帧）。`);
+        if (frames.at(-1).end < trackEnd) frames.at(-1).end = trackEnd;
+        const lastLength = frames.at(-1).end - frames.at(-1).start;
+        if (lastLength > maxFrames) throw new Error(`末段并入音频尾部后为 ${lastLength} 帧，超过单段上限 ${maxFrames} 帧。`);
+        for (let index = 1; index < frames.length; index++) {
+            if (frames[index].start !== frames[index - 1].end) throw new Error("时间文本块之间存在空隙/重叠，无法连续切分。");
+        }
+        if (!linkedPromptSegment(node)) throw new Error("请先把「分段清单」连到 AD-分段生成，才能写入逐段提示词。");
+        const prompt = timedPromptFromBlocks(blocks);
+        const preview = frames.slice(0, 8).map((block, index) =>
+            `#${index + 1}  ${timedClockFrames(block.start)}–${timedClockFrames(block.end)}  (${block.end - block.start} 帧)`).join("\n");
+        if (!window.confirm(`识别到 ${frames.length} 段，音频总长 ${timedClockFrames(trackEnd)}。\n\n${preview}${frames.length > 8 ? "\n…" : ""}\n\n将切分当前选中音频轨、替换现有分段，并写入每段正向提示词。继续？`)) return;
+        pushUndo(false, currentLinkedPrompt());
+        let splitClip = clip;
+        if (lane.length > 1) {
+            // 重新导入时把上一次切开的同源连续片段还原成一条逻辑片段，再按新时间文本重切。
+            T.state.audio_tracks[li] = [clip];
+            T.selected = new Set([clip.id]);
+            splitClip = clip;
+        }
+        splitSelectedClips([splitClip], frames.slice(1).map(block => snapFrame(block.start / FPS)));
+        T.state.segmentation = "clips";
+        T.state.split_points = [];
+        T.segment = -1;
+        const pieces = T.state.audio_tracks[li] || [];
+        T.selected = new Set(pieces.map(piece => piece.id));
+        const average = Math.max(1, Math.round(frames.reduce((sum, block) => sum + block.end - block.start, 0) / frames.length));
+        T.unit = T.unit === "s" ? "s" : "f";
+        const everyInput = $("[data-every]");
+        if (everyInput) everyInput.value = T.unit === "s" ? Number((average / FPS).toFixed(6)) : average;
+        const countInput = $("[data-count]");
+        if (countInput) countInput.value = String(frames.length);
+        T.state.segment_recipe = { frames: average, count: frames.length, unit: T.unit, custom: false };
+        setLinkedPromptText(prompt);
+        afterEdit();
+        hint(`已导入 ${frames.length} 段：切分当前音频轨并写入正向提示词；可撤销。`);
+    }
+
     // ---------- 工具栏 ----------
     root.addEventListener("click", async event => {
         const button = event.target.closest("button");
         if (!button || button.disabled) return;
+        if (button.hasAttribute("data-board-batch")) { openBoardPicker(null); return; }
+        if (button.hasAttribute("data-import-timed")) {
+            if (T.playing) stopPlayback();
+            timedTextInput.value = "";
+            timedTextInput.click();
+            return;
+        }
         if(button.dataset.cursorStep){
             if(T.playing)stopPlayback();
             clearSourcePreview(root);
@@ -3446,7 +4260,10 @@ export function mountTimelineEditor(node) {
             renderOverlays();renderClock();syncButtons();return;
         }
         if (button.dataset.libraryPick) { void pickLibraryFiles(button.dataset.libraryPick); return; }
-        if (button.hasAttribute("data-clear-images")) { clearReferenceImages(); return; }
+        if (button.hasAttribute("data-clear-images")) {
+            if (libraryTab === "board") clearBoardImages(); else clearReferenceImages();
+            return;
+        }
         if (button.dataset.libraryPanel) { void openLibraryPanel(button.dataset.libraryPanel); return; }
         if (button.dataset.openFolder) {
             try { const response=await api.fetchApi("/aiden_h3/open_folder",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({mode:button.dataset.openFolder})});const result=await response.json();if(!response.ok)throw new Error(result.error);hint("已打开目录。"); } catch(error){hint(error.message,true);} return;
@@ -3486,6 +4303,14 @@ export function mountTimelineEditor(node) {
                 T.state.segment_recipe = { frames: segFrames, count: segCount, unit: T.unit, custom: false };
             };
             const selectedClips = selectedEditableClips();
+            // v0.5.47：潜桥开启时「应用分段」= 把整条可见视频轨按 17n 网格重排（合并/多源片段也支持）。
+            if (hasClips && relayContextValue() > 0 && activeClips(T.state, "video_tracks").length) {
+                const result = node._adH3ApplyRelayLayout?.({ count: byCount ? count : 0, step: byCount ? 0 : frames, label: "应用分段" });
+                if (!result) { hint("潜桥自动对齐暂不可用：请保存工作流后按 Ctrl+F5 刷新页面。", true); return; }
+                if (!result.ok) hint(`潜桥自动对齐未生效：${result.problem || "请先确认只有一条可见视频轨、时间线从 0 开始且片段连续"}`, true);
+                else if (!result.changed) hint("潜桥段长已经是 17 帧网格，无需重排。");
+                return;
+            }
             if (hasClips && !selectedClips.length) { requireSelectedClips(); return; }
             // 有选中音视频：只拆选中片段
             if (selectedClips.length) {
@@ -3516,6 +4341,8 @@ export function mountTimelineEditor(node) {
                 writeBackRecipe(byCount ? avg : frames, byCount ? count : Math.max(1, iv.length));
                 afterEdit();
                 hint(`已拆开选中片段；清单共 ${Math.max(0, intervals().length)} 段。`);
+                // v0.5.47：潜桥开启时立即把刚拆出来的段长对齐到 17n。
+                try { node._adH3EnsureRelayPlan?.(); } catch (_error) {}
                 return;
             }
             // 纯图片：段数改由「分段数」决定；保留已有各段长度，只在末尾追加或从末尾删除差值段（v0.4.23 用户新规则）。
@@ -3643,6 +4470,17 @@ export function mountTimelineEditor(node) {
         if (files.length) void uploadFiles(files,fileInput.dataset.reference==="1");
         fileInput.value = "";
     };
+    timedTextInput.onchange = async () => {
+        const file = timedTextInput.files?.[0];
+        timedTextInput.value = "";
+        if (!file) return;
+        try {
+            const text = await file.text();
+            importTimedText(parseTimedText(text));
+        } catch (error) {
+            hint(error?.message || "时间文本导入失败", true);
+        }
+    };
     root.addEventListener("pointerdown", event => {
         if (event.target?.closest?.("input, textarea, select")) return;  // 不抢输入框焦点，保证原生上下箭头可用
         activeEditorRoot = root;
@@ -3734,6 +4572,10 @@ export function mountTimelineEditor(node) {
     }, { capture: true, passive: false });
 
     const restoreEditor = value => {
+            // 载入/合并工作流时取消仍在进行的上传，避免旧节点/旧工作流的迟到结果写进新状态。
+            boardUploadToken++;
+            materialUploadToken++;
+            boardTarget = null;
             let rawSources = [];
             try {
                 try { rawSources = JSON.parse(value || "{}").sources || []; } catch { rawSources = []; }
@@ -3743,9 +4585,12 @@ export function mountTimelineEditor(node) {
                 if (lastLoadDropped) hint(`已丢弃 ${lastLoadDropped} 个时间/源范围异常的片段记录，其余内容已正常载入。`, true);
             }
             catch (error) { hint(error.message, true); T.state = emptyTimeline(); }
-            // 旧版本删除图片只清了参考记录：加载时清掉没有池条目的孤儿图片源
-            T.state.sources = T.state.sources.filter(source =>
-                source.kind !== "image" || T.state.images.some(image => image.source === source.id));
+            // 旧版本删除图片只清了参考记录：加载时清掉没有池条目的孤儿图片源；
+            // 但分镜参考图（board_images）引用的图片源必须保留，否则刷新后分镜会消失。
+            const retainedBoardIds = new Set((Array.isArray(T.state.board_images) ? T.state.board_images : []).filter(Boolean));
+            T.state.sources = normalizeBoardSources(T.state.sources.filter(source =>
+                source.kind !== "image" || T.state.images.some(image => image.source === source.id) || retainedBoardIds.has(source.id)),
+                T.state.board_images, T.state.images);
             pruneSources();  // 视频/音频：片段已全部删除的素材在加载时同样清理
             node._adH3MaterialsReady = true;
             if (Array.isArray(rawSources) && rawSources.some(isBlockedToneSource)) {
@@ -3864,24 +4709,6 @@ export function mountTimelineEditor(node) {
         }catch(error){hint(`检测失败：${error.message}`,true);setMaterialProgress(node,{busy:false,phase:"error",fraction:0,text:"检测失败"});}
         finally{T.detecting=false;$("[data-smart-detect]").disabled=false;if(node._adH3LocalProgress)node._adH3LocalProgress.busy=false;}
     }
-    function splitVideoAtPlayhead() {
-        if (T.playing) return;
-        if (!hasAvClips()) { hint("时间线上没有音视频片段，无法切分", true); return; }
-        const t = Math.round(T.playhead * FPS) / FPS;
-        const total = Math.round(duration() * FPS) / FPS;
-        if (t <= 0.5 / FPS || t >= total - 0.5 / FPS) {
-            hint("请把白色游标移到时间线内部，再点「切分视频」。", true); return;
-        }
-        const selected = requireSelectedClips();
-        if (!selected.length) return;
-        const targets = selected.filter(clip => t > clip.tl_start + 0.5 * FRAME && t < clipEnd(clip) - 0.5 * FRAME);
-        if (!targets.length) { hint("请把白色游标移到所选音视频片段内部。", true); return; }
-        pushUndo();
-        splitSelectedClips(targets, [t]);
-        afterEdit();
-        paintSmartInfo();
-        hint(`已在 ${fmtClock(t)} 切分 ${targets.length} 个所选音视频片段；其它片段保持，可按撤销恢复。`);
-    }
     function smartApply() {
         if (smartApply._busy) return;
         const clips = requireSelectedClips(); if (!clips.length) return;
@@ -3934,11 +4761,6 @@ export function mountTimelineEditor(node) {
     }
 
 
-    const smartCutButton = $("[data-smart-cut]");
-    if (smartCutButton && !smartCutButton.dataset.adH3Bound) {
-        smartCutButton.dataset.adH3Bound = "1";
-        smartCutButton.addEventListener("click", () => splitVideoAtPlayhead());
-    }
     // 切分/裁剪/合并/删除后，清理 smartScopes/smartOwners 中已失效片段的候选条目；
     // 片段仍在但范围变了同样视为失效（旧候选线位置不再有效），由 afterEdit 统一调用。
     function pruneSmartCandidates() {
@@ -4181,7 +5003,7 @@ export function mountTimelineEditor(node) {
         const result = onConfigure?.apply(this, arguments);
         // 旧隐藏控件可能还保存着上次加载的 JSON；当前 DOM 编辑器的值追加在后，优先取它。
         const saved = savedTimelineValue(info);
-        setTimeout(() => { if (node.graph) { if (saved) restoreEditor(typeof saved === "string" ? saved : JSON.stringify(saved)); else { node._adH3MaterialsReady = true; updateMaterialOutputs(node, T.state); } applyLayoutHeight(); } }, 0);
+        setTimeout(() => { if (node.graph) { if (saved) restoreEditor(typeof saved === "string" ? saved : JSON.stringify(saved)); else { node._adH3MaterialsReady = true; updateMaterialOutputs(node, T.state); } applyLayoutHeight(); scheduleRelayAutoAlign(); } }, 0);
         return result;
     };
     const onRemoved = node.onRemoved;
@@ -4230,12 +5052,16 @@ export function mountTimelineEditor(node) {
         root.querySelectorAll("[data-unit]").forEach(item => item.classList.toggle("on", item.dataset.unit === T.unit));
         syncToggleA11y();
         $("[data-count]").value = recipe.count || DEFAULT_SEG_COUNT;
+        // v0.5.47：新建/首次挂载时也尝试自动对齐（潜桥已从已保存工作流载入时 onConfigure 不一定会再次触发）。
+        scheduleRelayAutoAlign(6, 200);
     }
     render();
     
     const prevConn = node.onConnectionsChange;
     node.onConnectionsChange = function () {
         const result = prevConn?.apply(this, arguments);
+        // v0.5.47：把素材清单接到分段节点（或改连线）后，等链接生效再自动对齐潜桥段长。
+        scheduleRelayAutoAlign(4, 150);
         node._adH3SyncPromptSegments?.();
         try { updateMaterialOutputs(node, T.state); } catch {}
         return result;
@@ -4244,3 +5070,4 @@ try { updateMaterialOutputs(node, T.state); } catch {}
     // 只量一次高度，避免贴合死循环
     setTimeout(() => { if (node.graph) applyLayoutHeight(); }, 0);
 }
+
