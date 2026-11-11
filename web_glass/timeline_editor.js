@@ -79,7 +79,7 @@ style.textContent = `
 .h3-tl .h3-clip .label{position:absolute;left:6px;top:3px;right:6px;font-size:12px;color:var(--ad-text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;pointer-events:none;text-shadow:0 1px 2px #000;z-index:1}
 .h3-tl .h3-clip canvas{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
 .h3-tl .h3-clip.v canvas{opacity:.85}.h3-tl .h3-clip.a canvas{opacity:.55}
-.h3-tl .h3-clip .edge{position:absolute;top:0;bottom:0;width:7px;cursor:ew-resize}
+.h3-tl .h3-clip .edge{position:absolute;top:0;bottom:0;width:14px;cursor:ew-resize;z-index:3;touch-action:none}
 .h3-tl .h3-clip .edge.l{left:0}.h3-tl .h3-clip .edge.r{right:0}
 .h3-tl .h3-clip.v,.h3-tl .h3-clip.a{border:2px solid #2a5f78;box-shadow:none}
 .h3-tl .h3-clip.selected{border-color:#49baff;box-shadow:0 0 0 1px #49baff inset,0 0 6px #49baff66}
@@ -1161,6 +1161,20 @@ export function mountTimelineEditor(node) {
             ? `段线变化：${dropped} 张图片的原段已不存在，已改为「全局参考」`
             : "段线变化：已按时间重叠自动迁移图片的「第 N 段参考」");
     }
+    // 拖边热区：除 14px 的 .edge 外，指针靠近片段任一端的 14px 内都算拖边（更容易抓住两端）。
+    const edgeAt = (event, element) => {
+        if (event.target?.classList?.contains("edge")) return event.target.classList.contains("l") ? "l" : "r";
+        if (!element) return null;
+        const rect = element.getBoundingClientRect();
+        if (!rect.width) return null;
+        const scale = viewScale() || 1;
+        const x = (event.clientX - rect.left) / scale;
+        const width = rect.width / scale;
+        const hot = Math.max(12, 14 / scale);
+        if (x <= hot) return "l";
+        if (x >= width - hot) return "r";
+        return null;
+    };
     // 磁吸锚点缓存：同一帧内多次 snapTo 复用；片段位置变了用 ++snapEpoch 失效
     let snapEpoch = 0, snapCacheEpoch = -1, snapCacheAnchors = null, snapCacheTotal = 0;
     const bumpSnapCache = () => { snapEpoch++; };
@@ -1273,8 +1287,7 @@ export function mountTimelineEditor(node) {
                     event.stopPropagation();
                     const resume = T.playing;
                     if (resume) stopPlayback();
-                    const edge = event.target.classList.contains("edge")
-                        ? (event.target.classList.contains("l") ? "l" : "r") : null;
+                    const edge = edgeAt(event, clip);
                     const selectedId = generationClips(T.state)[i].id;
                     if (event.ctrlKey || event.metaKey) {
                         if (T.selected.has(selectedId)) T.selected.delete(selectedId); else T.selected.add(selectedId);
@@ -3463,7 +3476,18 @@ export function mountTimelineEditor(node) {
         if (!clip) { endInteraction(); return; }
         const laneBody = element.parentElement;
         const lanes = [...canvas.querySelectorAll(".h3-body")];
-        const edge = event.target.classList.contains("edge") ? (event.target.classList.contains("l") ? "l" : "r") : null;
+        const edge = (() => {
+            if (event.target?.classList?.contains("edge")) return event.target.classList.contains("l") ? "l" : "r";
+            if (typeof element.getBoundingClientRect !== "function") return null;
+            const rect = element.getBoundingClientRect();
+            if (!rect || !rect.width) return null;
+            const scale = viewScale() || 1;
+            const x = (event.clientX - rect.left) / scale;
+            const hot = Math.max(12, 14 / scale);
+            if (x <= hot) return "l";
+            if (x >= rect.width / scale - hot) return "r";
+            return null;
+        })();
         if (event.ctrlKey || event.metaKey) {
             T.selected.has(id) ? T.selected.delete(id) : T.selected.add(id);
         } else if (edge || !T.selected.has(id)) {
