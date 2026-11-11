@@ -37,19 +37,21 @@ function widget(node, name) {
 
 // 锚定配置保存在节点 properties（不新增原生 widget，旧工作流 widget_values 不受影响）。
 // 默认：锚强度 1（全强）、外观锚每 3 段、历史锚/声锚关闭。
-export const ANCHOR_DEFAULTS = { strength: 1, appearance: 3, history: 0, voice: 0 };
-const ANCHOR_APPEARANCE_STEPS = [0, 2, 3, 5, 7, 10];
+// v0.5.50：删除无效/未验证的 锚定强度、历史锚、声锚；新增 桥接模式 / 质感还原。
+export const ANCHOR_DEFAULTS = { appearance: 3, segment_correction: 0, texture_restore: 0, bridge_mode: 0 };
+const ANCHOR_APPEARANCE_STEPS = [0, 1, 2, 3, 5, 7, 10];
 
 export function normalizeAnchorConfig(raw) {
     const cfg = { ...ANCHOR_DEFAULTS };
     if (!raw || typeof raw !== "object") return cfg;
-    const strength = Number(raw.strength);
-    cfg.strength = Number.isFinite(strength) ? (strength >= 0.75 ? 1 : (strength > 0 ? 0.5 : 0)) : ANCHOR_DEFAULTS.strength;
     const appearance = Number(raw.appearance);
     cfg.appearance = ANCHOR_APPEARANCE_STEPS.includes(appearance) ? appearance : ANCHOR_DEFAULTS.appearance;
-    const history = Number(raw.history);
-    cfg.history = Number.isFinite(history) ? Math.max(0, Math.min(3, Math.round(history))) : ANCHOR_DEFAULTS.history;
-    cfg.voice = raw.voice === true || raw.voice === 1 || raw.voice === "1" ? 1 : 0;
+    for (const key of ["segment_correction", "texture_restore"]) {
+        const value = Number(raw[key]);
+        cfg[key] = Number.isFinite(value) ? (value >= 0.75 ? 1 : (value > 0 ? 0.5 : 0)) : ANCHOR_DEFAULTS[key];
+    }
+    const bridge = Number(raw.bridge_mode);
+    cfg.bridge_mode = Number.isFinite(bridge) && bridge > 0 ? 1 : 0;
     return cfg;
 }
 
@@ -372,22 +374,33 @@ export function injectHiddenRelay(serialized, graph) {
         const bridgeId = String(id++);
         const saveId = String(id++);
         const trimId = String(id++);
+        // v0.5.50：像素质量复位桥接需要视频 VAE（用于把上一段成片尾帧重编码成上下文）；
+        // 取 RemakeConditioning 的 vae 输入连线，取不到则桥接自动回退直接 latent。
+        let remakeVaeLink = null;
+        for (const candidate of Object.values(prompt || {})) {
+            const cls = String(candidate?.class_type || "");
+            if (!cls.includes("RemakeConditioning")) continue;
+            const link = candidate?.inputs?.vae;
+            if (Array.isArray(link) && link.length === 2) { remakeVaeLink = link; break; }
+        }
+        const bridgeInputs = {
+            latent: latentLink,
+            relay_context: [segId, contextIdx],
+            context_frames: contextFrames,
+            mask_mode: "hard",
+            pin_audio: true,
+            anchor_config: anchorJson,
+        };
+        if (remakeVaeLink) bridgeInputs.vae = remakeVaeLink;
         prompt[bridgeId] = {
             class_type: "ADH3InternalBridge",
-            inputs: {
-                latent: latentLink,
-                relay_context: [segId, contextIdx],
-                context_frames: contextFrames,
-                mask_mode: "hard",
-                pin_audio: true,
-                anchor_config: anchorJson,
-            },
+            inputs: bridgeInputs,
             _meta: { title: "AD-内部潜桥桥接" },
         };
         sampler.inputs.latent_image = [bridgeId, 0];
-        // 外观锚/历史锚：把锚段开头帧作为 minimax_refs 追加进 H3 conditioning。
+        // 外观锚：把第 1 段开头帧作为 minimax_refs 追加进 H3 conditioning。
         // 只改条件链，不改 latent / 帧数 / 裁头 ⇒ 接缝不跳。
-        if (anchorConfig.appearance > 0 || anchorConfig.history > 0) {
+        if (anchorConfig.appearance > 0) {
             const guiderLink = promptLink(sampler, "guider");
             const guider = guiderLink ? prompt[String(guiderLink[0])] : null;
             const conditioningLink = guider ? promptLink(guider, "conditioning") : null;
@@ -420,6 +433,8 @@ export function injectHiddenRelay(serialized, graph) {
             images: imagesLink,
             relay_context: [segId, contextIdx],
             fps: 24.0,
+            // v0.5.48：裁头节点顺带执行“整段软校正”（按第 1 段成片校正皮肤/服装色）。
+            anchor_config: anchorJson,
         };
         if (generatedAudio) trimInputs.audio = audioLink;
         prompt[trimId] = {

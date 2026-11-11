@@ -159,6 +159,8 @@ def normalize_video(video,context,state,directory,strict_sync=False):
     if snap_info:
         details["resolution_snap"]=snap_info
     details["reanchor"]=bool(context.get("reanchor"))
+    if isinstance(context.get("ad_effective"), dict):
+        details["ad_effective"] = context["ad_effective"]
     if color_info:
         details["color_match"]=color_info
     details["references"]=context.get("references",{})

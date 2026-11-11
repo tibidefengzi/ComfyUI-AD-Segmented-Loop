@@ -14,8 +14,15 @@ COLOR_MATCH_CHOICES = (
     "0 · 关闭",
     "0.5 · 半强",
     "1 · 全强",
+    "0.5 · 全链统一（第1段）",
+    "1 · 全链统一（第1段）",
 )
 COLOR_MATCH_VALUES = {"0 · 关闭": 0.0, "0.5 · 半强": 0.5, "1 · 全强": 1.0}
+# 全链统一目标：所有段都往“第 1 段参考首帧”的同一色彩目标拉，避免逐段目标不同造成段间台阶。
+COLOR_MATCH_CHAIN_VALUES = {
+    "0.5 · 全链统一（第1段）": 0.5,
+    "1 · 全链统一（第1段）": 1.0,
+}
 MAX_OFFSET = 0.18
 MIN_REF_MEAN = 0.015
 
@@ -35,6 +42,18 @@ def parse_blend(raw):
     if value <= 0:
         return 0.0
     return 1.0 if value >= 0.75 else 0.5
+
+
+def parse_config(raw):
+    """解析下拉/数字：返回 {"blend": 0/0.5/1, "chain": bool}。chain=True 表示目标取全链第 1 段。"""
+    if isinstance(raw, (int, float)):
+        return {"blend": parse_blend(raw), "chain": False}
+    text = str(raw or "").strip()
+    if text in COLOR_MATCH_CHAIN_VALUES:
+        return {"blend": COLOR_MATCH_CHAIN_VALUES[text], "chain": True}
+    if text in COLOR_MATCH_VALUES:
+        return {"blend": COLOR_MATCH_VALUES[text], "chain": False}
+    return {"blend": parse_blend(text), "chain": False}
 
 
 def reference_frame_stats(frame, source, frame_index):

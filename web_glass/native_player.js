@@ -16,6 +16,12 @@ frameStyles.textContent=`
 .ad-h3-video.aiden-h3 .ad-h3-frame-step button{min-height:26px;height:26px;padding:0 10px;font-size:12px;border-radius:6px;border:1px solid #4a658a;background:#1b283ce6;color:#e8f0fb;cursor:pointer}
 .ad-h3-video.aiden-h3 .ad-h3-frame-step button:hover{background:#2d405b}
 .ad-h3-video.aiden-h3.ad-h3-audio-mode .ad-h3-frame-step,.ad-h3-preview-layout.is-comparing .ad-h3-frame-step,.ad-h3-video.aiden-h3 .ad-h3-frame-step[hidden]{display:none!important}
+/* 分段生成历史：右侧竖向滚动条 —— 保留最近 10 轮，全部可在预览框内滚动查看 */
+.ad-h3-video.aiden-h3 .ad-h3-strips{max-height:min(420px,42vh);overflow-y:auto;overflow-x:hidden;padding-right:8px;scrollbar-width:thin;scrollbar-color:#4a658a #141c28}
+.ad-h3-video.aiden-h3 .ad-h3-strips::-webkit-scrollbar{width:10px}
+.ad-h3-video.aiden-h3 .ad-h3-strips::-webkit-scrollbar-track{background:#141c28;border-radius:6px}
+.ad-h3-video.aiden-h3 .ad-h3-strips::-webkit-scrollbar-thumb{background:#4a658a;border-radius:6px;border:2px solid #141c28}
+.ad-h3-video.aiden-h3 .ad-h3-strips::-webkit-scrollbar-thumb:hover{background:#5f7ea6}
 `;
 document.head.append(frameStyles);
 }

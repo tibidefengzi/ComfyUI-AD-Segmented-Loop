@@ -1421,21 +1421,26 @@ function mountRelayHint(node) {
     };
     const relayOptions = ["0 · 关闭", "5 · 上下文5帧", "22 · 上下文22帧（推荐）", "39 · 上下文39帧"];
     const reanchorOptions = ["0 · 不重锚定", "2 · 每2段", "3 · 每3段", "5 · 每5段", "7 · 每7段", "10 · 每10段"];
-    const colorOptions = ["0 · 关闭", "0.5 · 半强", "1 · 全强"];
+    const colorOptions = [
+        "0 · 关闭", "0.5 · 半强", "1 · 全强",
+        "0.5 · 全链统一（第1段）", "1 · 全链统一（第1段）",
+    ];
     // ---- 潜桥锚定（锚强度 / 外观锚 / 历史锚 / 声锚）：存在 node.properties，不新增原生 widget ----
     let anchorCfg = anchorConfigOf(node);
+    // v0.5.50：删除实测无效果/未验证的 锚定强度、历史锚、声锚；保留实测有效的 外观锚/整段校正，
+    // 新增 质感还原（后处理）与 桥接模式（像素质量复位）。
     const anchorOptionSpec = {
-        strength: [[0, "0 · 关闭"], [0.5, "0.5 · 半强"], [1, "1 · 全强"]],
-        appearance: [[0, "0 · 关闭"], [2, "2 · 每2段"], [3, "3 · 每3段"], [5, "5 · 每5段"], [7, "7 · 每7段"], [10, "10 · 每10段"]],
-        history: [[0, "0 · 关闭"], [1, "1 · 近1段"], [2, "2 · 近2段"], [3, "3 · 近3段"]],
-        voice: [[0, "0 · 关闭"], [1, "1 · 开启"]],
+        appearance: [[0, "0 · 关闭"], [1, "1 · 每段"], [2, "2 · 每2段"], [3, "3 · 每3段"], [5, "5 · 每5段"], [7, "7 · 每7段"], [10, "10 · 每10段"]],
+        segment_correction: [[0, "0 · 关闭"], [0.5, "0.5 · 半强"], [1, "1 · 全强"]],
+        texture_restore: [[0, "0 · 关闭"], [0.5, "0.5 · 半强"], [1, "1 · 全强"]],
+        bridge_mode: [[0, "0 · 直接 latent（默认）"], [1, "1 · 像素质量复位（实验）"]],
     };
     const anchorRows = [];
     const anchorHints = {
-        strength: "软锚定：每段把拷入前缀的颜色/亮度统计拉回第 1 段；只影响被裁掉的上下文，不增加跳动。",
-        appearance: "每 N 段把第 1 段开头 5 帧作为参考块追加进 H3 条件，缓解人物质感累积劣化；不改 latent/帧数。",
-        history: "每段把前 N 段开头 5 帧也作为参考块追加（历史锚简化版）；段数越多条件越重，默认关闭。",
-        voice: "用第 1 段音频 latent 作为音色锚替换本段音频前缀；默认关闭，先试听口型/音色。",
+        appearance: "每 N 段把第 1 段开头 5 帧作为参考块追加进 H3 条件；1·每段=每段都拉回第1段。",
+        segment_correction: "生成后按第 1 段成片的皮肤/服装色均值做整段固定偏移（不逐帧）；治逐段皮肤/服装色漂。",
+        texture_restore: "生成后按第 1 段成片的细节水平做自适应轻度锐化（不重新生成、不逐帧）；治后段发糊/发油。",
+        bridge_mode: "桥接上下文来源：直接 latent（现状）或像素质量复位（上一段成片尾帧→锐化→VAE重编码，切断越跑越糊的复利链；失败自动回退）。",
     };
     const saveAnchorConfig = () => {
         try {
@@ -1592,10 +1597,10 @@ function mountRelayHint(node) {
     panel.appendChild(advanced);
     addRow("重锚定", reanchor, reanchorOptions, undefined, advanced);
     addRow("色彩匹配", colorMatch, colorOptions, undefined, advanced);
-    addAnchorRow("锚定强度", "strength");
     addAnchorRow("外观锚", "appearance");
-    addAnchorRow("历史锚", "history");
-    addAnchorRow("声锚", "voice");
+    addAnchorRow("整段校正", "segment_correction");
+    addAnchorRow("质感还原", "texture_restore");
+    addAnchorRow("桥接模式", "bridge_mode");
     panel.appendChild(hint);
     applyAdvanced(false);
     const updateHint = () => {
@@ -1956,13 +1961,13 @@ function remapSegmentWidgetValues(info) {
     info.__adWidgetOrderRemapped = true;
     const oldValues = Array.isArray(info.widgets_values) ? info.widgets_values : [];
     const named = info.widgets_values_named && typeof info.widgets_values_named === "object" ? info.widgets_values_named : {};
-    if (oldValues.length < AD_SEG_WIDGET_NEW_ORDER.length && !Object.hasOwn(named, "潜桥重锚定")) {
+    // 当前 13 值布局（含旧版多出来的第 14 个参考图尺寸值）按新顺序取前 13 个；更早的 11 值老布局按 OLD_ORDER。
+    const layout = oldValues.length >= AD_SEG_WIDGET_NEW_ORDER.length ? AD_SEG_WIDGET_NEW_ORDER : AD_SEG_WIDGET_OLD_ORDER;
+    if (layout === AD_SEG_WIDGET_OLD_ORDER && !Object.hasOwn(named, "潜桥重锚定")) {
         savedLegacyRelayLayouts.add(info);
     }
     const map = {};
-    for (let i = 0; i < AD_SEG_WIDGET_OLD_ORDER.length; i++) {
-        if (i < oldValues.length) map[AD_SEG_WIDGET_OLD_ORDER[i]] = oldValues[i];
-    }
+    for (let i = 0; i < Math.min(layout.length, oldValues.length); i++) map[layout[i]] = oldValues[i];
     for (const [key, value] of Object.entries(named)) map[key] = value;
     const values = AD_SEG_WIDGET_NEW_ORDER.map(name => {
         if (Object.prototype.hasOwnProperty.call(map, name)) return map[name];

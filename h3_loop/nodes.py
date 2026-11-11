@@ -7,7 +7,7 @@ import math
 
 from . import assets
 from . import compat
-from .color_match import COLOR_MATCH_CHOICES as _COLOR_MATCH_CHOICES, parse_blend as _color_match_blend, reference_frame_stats
+from .color_match import COLOR_MATCH_CHOICES as _COLOR_MATCH_CHOICES, parse_blend as _color_match_blend, parse_config as _color_match_config, reference_frame_stats
 from .normalization import normalize_source
 from .spec import relay_reanchor_interval as _relay_reanchor_interval, relay_reanchors, relay_parent_stage, relay_segment_context
 from .audio import h3_window, read_audio_entry, read_pieces
@@ -807,6 +807,20 @@ def relay_plan(target, context, mode=None):
             "trim_frames": context, "pre_roll_frames": context}
 
 
+def _effective_relay_context(relay_context, index, reanchor):
+    """第 1 段固定 5 帧；第 2 段起（含重锚定）统一按用户选择的 C 预卷/裁头。
+
+    v0.5.54：重锚定只改变“桥接方式”（桥 stage_index=0 直通，不读上一段/第 1 段 latent），
+    不再把预卷压到 5 帧。生成窗口同样前移 C 帧、输出时裁掉 C 帧——前 C 帧是模型自己
+    从源画面热身生成的画面，丢弃后成片从稳定帧开始（消除冷启动回闪），同时因为不继承
+    上一段生成 latent，不会出现“越跑越糊/质感复利”。第 1 段没有前序内容可预卷，仍固定 5。
+    """
+    context = int(relay_context or 0)
+    if context <= 0:
+        return context
+    return relay_segment_context(context, int(index))
+
+
 def _reference_spans(lane, sources, start, end):
     from .spec import frame_index
     for clip in sorted(lane, key=lambda item: item["tl_start"]):
@@ -950,11 +964,44 @@ def _video_clip_audio(state, number, clip, source_map):
     return {"waveform": result, "sample_rate": rate}
 
 
+def _chain_color_stats(entries):
+    """全链统一色彩目标：第 1 段参考视频首帧的逐通道均值（每个会话只解码一帧，带缓存）。"""
+    from .normalization import normalize_source
+
+    try:
+        source = (entries[0].get("video_source") if entries else None) or {}
+        key = (source.get("origin"), source.get("file"), float(source.get("src_in") or 0.0))
+    except Exception:
+        return None
+    if not all((key[0], key[1])):
+        return None
+    cached = _CHAIN_COLOR_CACHE.get(key)
+    if cached is not None:
+        return dict(cached)
+    try:
+        start = float(source.get("src_in") or 0.0)
+        normalized = normalize_source({**source, "kind": "video"})
+        frame = _video_frames(normalized, start_time=start, end_time=start + 1 / FPS,
+                              long_edge=REF_VIDEO_LONG_EDGE)
+        if frame is None or len(frame) == 0:
+            return None
+        stats = reference_frame_stats(frame[0], normalized, round(start * FPS))
+        if len(_CHAIN_COLOR_CACHE) > 16:
+            _CHAIN_COLOR_CACHE.clear()
+        _CHAIN_COLOR_CACHE[key] = stats
+        return dict(stats)
+    except Exception as exc:
+        print("[AD-颜色] 全链统一色彩目标读取失败：%r" % (exc,))
+        return None
+
+
 def _timeline_material_values(queue, used=None, index=None, window=None, *,
-                              media_details=None, mask_size=None, mask_source=None, color_match=False):
+                              media_details=None, mask_size=None, mask_source=None, color_match=False,
+                              color_target_stats=None):
     """紧凑顺序：图 -> 视频 -> 视频音频 -> 音频，末尾 None 垫满；与前端动态口一致。
 
     used 为下游实际连接的输出口序号集合；未连接的口不加载素材（避免无谓解码）。
+    参考图输出固定使用素材规范化尺寸（长边 2160，由 H3 ref2va 的 match/max 自行缩放）。
     """
     from .spec import frame_index
     state = output_timeline(queue.get("timeline") or {})
@@ -1055,7 +1102,11 @@ def _timeline_material_values(queue, used=None, index=None, window=None, *,
                 primary_lane, source_map, reference_start, reference_end, reference_count,
                 body_start=body_start, cache=normalized, canvas=mask_size)
         if color_match:
-            if not color_stats and primary_lane:
+            if color_target_stats is not None:
+                color_stats = dict(color_target_stats)
+                if primary_index is not None:
+                    color_stats.setdefault("track", primary_index + 1)
+            elif not color_stats and primary_lane:
                 _, source, _, _, first = next(_reference_spans(primary_lane, source_map, body_start, body_end))
                 try:
                     source = _normalized_reference(source, normalized)
@@ -1340,7 +1391,7 @@ class AidenH3Segment:
                              "ref_counts": ("STRING", {"default": "{}", "tooltip": "动态参考口数量（前端自动写入）"}),
                              "潜桥模式": (list(RELAY_MODES), {"default": "关闭", "tooltip": "关闭=原有逐段生成；普通多参考=自选17倍数段长做潜桥；动作迁移预卷=源视频动作迁移/人物替换，前置预卷后裁头，保持65帧等任意目标帧数"}),
                              "潜桥上下文帧数": (list(RELAY_CONTEXTS), {"default": "22", "tooltip": "旧参数：兼容旧工作流，前端会自动迁移"}),
-                             "潜桥重锚定": (list(RELAY_REANCHOR_CHOICES), {"default": "0 · 不重锚定", "tooltip": "每 N 段清一次潜桥上下文（第 N、2N…段不读取上一段 latent，从当前段源画面/提示词重新锚定）；可缓解长链越跑越糊/越跑越暗。0=关闭"}),
+                             "潜桥重锚定": (list(RELAY_REANCHOR_CHOICES), {"default": "0 · 不重锚定", "tooltip": "每 N 段按独立段重新生成（第 N、2N…段：桥不读上一段/第 1 段 latent，跳过外观/历史锚）；预卷/裁头与潜桥续接一致：生成=输出+C、裁头C（前 C 帧为模型热身，裁掉不进成片）。既不继承上一段 latent（不产生质感复利），又保留正常预卷（成片从稳定帧开始，接缝不闪跳）；第 1 段因无前序内容固定 5 帧。0=关闭"}),
                              "参考首帧色彩匹配": (list(_COLOR_MATCH_CHOICES), {"default": "0 · 关闭", "tooltip": "按本段参考视频首帧的亮度/白平衡校正生成画面（整段固定偏移，不逐帧自动增益，不做 VAE 往返）；0=关闭"})},
                 "hidden": {"prompt": "PROMPT", "unique_id": "UNIQUE_ID", "extra_pnginfo": "EXTRA_PNGINFO"}}
 
@@ -1487,15 +1538,23 @@ class AidenH3Segment:
         relay_reanchor_every = 0
         relay_reanchor = False
         relay_run_id = ""
-        color_match_blend = _color_match_blend(kwargs.get("参考首帧色彩匹配"))
+        # v0.5.51：重锚定=独立生成 + 正常预卷。预卷/裁头照常按潜桥续接 C 计算
+        # （第 1 段固定 5、第 2 段起=C）；重锚定只改变“桥接方式”（桥 stage_index=0
+        # 直通，不读上一段/第 1 段 latent），因此不会再出现“第 1 段画面串入”；
+        # 前 C 帧是模型自己热身生成的画面，输出时裁掉 ⇒ 成片首帧稳定、且质感不复利。
+        color_match_cfg = _color_match_config(kwargs.get("参考首帧色彩匹配"))
+        color_match_blend = float(color_match_cfg.get("blend") or 0.0)
+        color_match_chain = bool(color_match_cfg.get("chain"))
         relay_save_run_id = ""
         relay_stage_index = int(index)
         if relay_active:
+            relay_reanchor_every = _relay_reanchor_interval(kwargs.get("潜桥重锚定"))
+            relay_reanchor = relay_reanchors(relay_reanchor_every, int(index))
             source_target = int(window["target_frames"])
             relay_target = _relay_targets_for_entries(entries)[index]
             if relay_target < 17:
                 raise ValueError("潜桥开启时每段至少需要 17 帧目标长度")
-            effective_context = relay_segment_context(relay_context, int(index))
+            effective_context = _effective_relay_context(relay_context, int(index), relay_reanchor)
             if relay_target <= effective_context:
                 raise ValueError(f"潜桥上下文 C={effective_context} 必须小于本段输出帧数 {relay_target}")
             plan = relay_plan(relay_target, effective_context)
@@ -1503,6 +1562,11 @@ class AidenH3Segment:
                 print("[AD-潜桥] 第 1 段无前序上下文：只加 %d 帧（生成 %d → 输出 %d，裁头 %d），不按 C=%d 预卷"
                       % (effective_context, plan["generation_frames"], relay_target,
                          plan["trim_frames"], relay_context))
+            elif relay_reanchor:
+                print("[AD-潜桥] 第 %d 段重锚定：独立生成（桥不读上一段/第 1 段 latent；"
+                      "生成 %d → 输出 %d，裁头 %d，其中预卷 %d 帧为模型热身、裁掉不进成片）"
+                      % (int(index) + 1, plan["generation_frames"], relay_target,
+                         plan["trim_frames"], plan["pre_roll_frames"]))
             # 潜桥输出 L 与上下文 C 都确定后，必须按最终生成帧数 G=L+C 重新核对单段上限，
             # 不能只沿用 h3_window 里按 L 算的旧上限（否则 G 会静默超限）。
             limit_frames = int(settings.get("max_frames") or DEFAULT_SEGMENT_MAX_FRAMES)
@@ -1516,15 +1580,13 @@ class AidenH3Segment:
             relay_trim_frames = plan["trim_frames"]
             relay_pre_roll = plan["pre_roll_frames"]
             relay_run_id, relay_save_run_id, relay_stage_index = _relay_identity(session_id, session, index)
-            # 分段重锚定：第 N、2N…段跳过上一段 latent，从当前段源画面/提示词重新起锚。
-            relay_reanchor_every = _relay_reanchor_interval(kwargs.get("潜桥重锚定"))
-            relay_reanchor = relay_reanchors(relay_reanchor_every, int(index))
-            if relay_reanchor:
-                print("[AD-潜桥] 第 %d 段重锚定：跳读上一段 latent，从当前段重新起锚" % (int(index) + 1))
             # 上一段的稳定 stage 是桥接的唯一父 latent 来源；缺失说明存盘/提升还没完成，
             # 必须显式报错，不能带着空父 latent 静默生成（预览子会话用父段号校验）。
+            # v0.5.49：重锚定是真正独立段，不读取任何父 latent（也不再校验第 1 段 stage），
+            # 因此这里只在续接段校验父段。
             relay_label = str((session.get("preview_parent") or {}).get("group_label") or "")
-            _require_parent_relay_stage(relay_run_id, relay_stage_index, relay_label, reanchor=relay_reanchor)
+            if not relay_reanchor:
+                _require_parent_relay_stage(relay_run_id, relay_stage_index, relay_label)
         used = None
         if isinstance(prompt, dict) and unique_id is not None:
             slots = set()
@@ -1640,7 +1702,10 @@ class AidenH3Segment:
         refs = list(_timeline_material_values(
             queue, schema_used, index, window, media_details=media_details,
             mask_size=(height, width) if need(extra_slot) and not batch_source else None,
-            mask_source=segment_source, color_match=bool(color_match_blend and not batch_source)))
+            mask_source=segment_source, color_match=bool(color_match_blend and not batch_source),
+            color_target_stats=(_chain_color_stats(entries)
+                                if (color_match_blend and color_match_chain and not batch_source and int(index) > 0)
+                                else None)))
         context["color_match_reference"] = media_details.get("color_match_reference")
         out_refs = []
         offset = 0
@@ -2355,8 +2420,11 @@ NODE_DISPLAY_NAME_MAPPINGS = {
 #   · 外观锚 = 第 1 段开头 5 帧作为 minimax_refs 参考块常驻 conditioning；
 #   · 历史锚 = 前 N 段开头 5 帧作为 minimax_refs 参考块（TIHA 的简化实现）；
 #   · 声锚   = voice_anchor_stage=0，用第 1 段的音频 latent 作为音色锚。
-ANCHOR_DEFAULTS = {"strength": 1.0, "appearance": 3, "history": 0, "voice": 0}
-ANCHOR_APPEARANCE_STEPS = (0, 2, 3, 5, 7, 10)
+# v0.5.50：删除无效/未验证选项（锚定强度、历史锚、声锚）；保留实测有效的 外观锚/整段校正，
+# 新增 桥接模式（像素质量复位）与 质感还原。
+ANCHOR_DEFAULTS = {"appearance": 3, "segment_correction": 0.0, "texture_restore": 0.0, "bridge_mode": 0}
+ANCHOR_APPEARANCE_STEPS = (0, 1, 2, 3, 5, 7, 10)
+_CHAIN_COLOR_CACHE = {}
 _ANCHOR_STAGE_CACHE = {}
 
 
@@ -2372,22 +2440,21 @@ def parse_anchor_config(raw):
     if not isinstance(parsed, dict):
         return data
     try:
-        strength = float(parsed.get("strength", data["strength"]))
-    except (TypeError, ValueError):
-        strength = float(data["strength"])
-    data["strength"] = 1.0 if strength >= 0.75 else (0.5 if strength > 0 else 0.0)
-    try:
         appearance = int(parsed.get("appearance", data["appearance"]))
     except (TypeError, ValueError):
         appearance = int(data["appearance"])
     data["appearance"] = appearance if appearance in ANCHOR_APPEARANCE_STEPS else 0
+    for key in ("segment_correction", "texture_restore"):
+        try:
+            value = float(parsed.get(key, data[key]))
+        except (TypeError, ValueError):
+            value = float(data[key])
+        data[key] = 1.0 if value >= 0.75 else (0.5 if value > 0 else 0.0)
     try:
-        history = int(parsed.get("history", data["history"]))
+        bridge = int(parsed.get("bridge_mode", data["bridge_mode"]))
     except (TypeError, ValueError):
-        history = int(data["history"])
-    data["history"] = max(0, min(3, history))
-    voice = parsed.get("voice", data["voice"])
-    data["voice"] = 1 if voice in (True, 1, "1", "true", "True", "on", "开启") else 0
+        bridge = int(data["bridge_mode"])
+    data["bridge_mode"] = 1 if bridge else 0
     return data
 
 
@@ -2501,20 +2568,25 @@ def _relay_audio_fix(bridge_out, target, ctx, stage, reanchor=False, voice_on=Fa
     head = None
     note = "静音"
     if stage > 0:
-        head_stage = 0 if (reanchor or voice_on) else stage - 1
-        try:
-            parent = _anchor_stage_latent(run_id, int(head_stage))
-            tail, take = _relay_core.audio_tail_from_latent(
-                parent, pre,
-                _relay_core.pixel_frames(int(_relay_core.video_from_latent(parent).shape[2])))[:2]
-            take = int(take)
-            if take > 0:
-                shift = min(shift, take, total - 1)
-                head = tail[..., take - shift:]
-                note = "第 %d 段音频尾" % (int(head_stage) + 1)
-        except Exception as exc:
-            print("[AD-潜桥] 音频前导读取失败，改用静音占位（%r）" % (exc,))
+        # 重锚定是独立段：音频前导用静音占位，不接第 1 段内容（声锚已删除）。
+        head_stage = -1 if reanchor else stage - 1
+        if head_stage < 0:
             head = None
+            note = "静音（重锚定独立段）"
+        else:
+            try:
+                parent = _anchor_stage_latent(run_id, int(head_stage))
+                tail, take = _relay_core.audio_tail_from_latent(
+                    parent, pre,
+                    _relay_core.pixel_frames(int(_relay_core.video_from_latent(parent).shape[2])))[:2]
+                take = int(take)
+                if take > 0:
+                    shift = min(shift, take, total - 1)
+                    head = tail[..., take - shift:]
+                    note = "第 %d 段音频尾" % (int(head_stage) + 1)
+            except Exception as exc:
+                print("[AD-潜桥] 音频前导读取失败，改用静音占位（%r）" % (exc,))
+                head = None
     if shift <= 0:
         return bridge_out
     if head is None:
@@ -2548,6 +2620,104 @@ def _relay_audio_fix(bridge_out, target, ctx, stage, reanchor=False, voice_on=Fa
     return out
 
 
+def _prev_segment_file(ctx):
+    """当前段上一段已提交的成片文件（用于像素质量复位桥接）。"""
+    from .storage import STORE
+    session_id = str(ctx.get("session_id") or "")
+    index = int(ctx.get("relay_stage_index") or 0)
+    if not session_id or index <= 0:
+        return None
+    try:
+        state = STORE.read(session_id)
+        rows = state.get("segments") or []
+    except Exception:
+        return None
+    if index > len(rows):
+        return None
+    row = rows[index - 1]
+    selected = row.get("selected")
+    versions = row.get("versions") or []
+    version = next((v for v in versions if selected and v.get("id") == selected), None)
+    if version is None and versions:
+        version = versions[-1]
+    if not version or not version.get("file"):
+        return None
+    path = STORE.directory(session_id) / str(version["file"])
+    return path if path.is_file() else None
+
+
+def _decode_tail_frames(path, count):
+    """解码视频最后 count 帧为 IMAGE 张量 [N,H,W,3] 0..1。"""
+    try:
+        import av
+        import numpy as np
+        import torch
+    except Exception:
+        return None
+    try:
+        picked = []
+        with av.open(str(path)) as container:
+            for frame in container.decode(video=0):
+                picked.append(frame.to_ndarray(format="rgb24"))
+        if len(picked) < int(count):
+            return None
+        chunk = picked[-int(count):]
+        return torch.from_numpy(np.stack([np.asarray(f, dtype=np.float32) / 255.0 for f in chunk]))
+    except Exception:
+        return None
+
+
+def _mild_sharpen(images, amount=0.25):
+    """轻度 USM 锐化（像素桥接用，帧数很少）。"""
+    try:
+        import torch
+        import torch.nn.functional as F
+    except Exception:
+        return images
+    if images is None or images.shape[0] < 1 or float(amount) <= 0:
+        return images
+    h, w = int(images.shape[1]), int(images.shape[2])
+    kernel = torch.tensor([[1, 4, 6, 4, 1], [4, 16, 24, 16, 4], [6, 24, 36, 24, 6],
+                           [4, 16, 24, 16, 4], [1, 4, 6, 4, 1]], dtype=torch.float32,
+                          device=images.device) / 256.0
+    kernel = kernel.view(1, 1, 5, 5)
+    x = images.permute(0, 3, 1, 2).reshape(-1, 1, h, w)
+    padded = F.pad(x, (2, 2, 2, 2), mode="replicate")
+    blur = F.conv2d(padded, kernel).reshape(images.shape[0], 3, h, w).permute(0, 2, 3, 1)
+    return (images + float(amount) * (images - blur)).clamp(0.0, 1.0)
+
+
+def _pixel_bridge_context(run_id, ctx, vae, frames):
+    """像素质量复位：上一段成片尾 frames 帧 → 轻度锐化 → VAE 重编码，替换上下文视频流；
+    音频流沿用上一段 stage latent（音频钉住逻辑不变）。"""
+    from comfy.nested_tensor import NestedTensor
+    from ._relay_vendor import relay_core as _relay_core
+
+    frames = int(frames)
+    if frames < 5:
+        raise ValueError("像素桥接至少需要 5 帧上下文")
+    path = _prev_segment_file(ctx)
+    if path is None:
+        raise FileNotFoundError("找不到上一段成片文件")
+    images = _decode_tail_frames(path, frames)
+    if images is None:
+        raise ValueError("上一段成片不足 %d 帧" % frames)
+    images = _mild_sharpen(images, 0.25)
+    z = vae.encode(images)
+    expected = int(_relay_core.steps_for_frames(frames))
+    if int(z.shape[2]) != expected:
+        raise ValueError("VAE 编码步数 %d 与上下文 %d 帧期望 %d 不符" % (int(z.shape[2]), frames, expected))
+    stage = int(ctx.get("relay_stage_index") or 0)
+    parent = _anchor_stage_latent(run_id, stage - 1)
+    samples = parent.get("samples")
+    if samples is None or not getattr(samples, "is_nested", False):
+        raise ValueError("上一段 stage 不是 AV latent")
+    members = samples.unbind()
+    if len(members) < 2:
+        raise ValueError("上一段 stage 缺少音频流")
+    return {"samples": NestedTensor((z, members[1]))}
+
+
 class ADH3InternalBridge:
     """内部桥：从 AD 分段节点的 context 输出读取 run_id/stage，不接受用户接线。"""
     @classmethod
@@ -2559,7 +2729,8 @@ class ADH3InternalBridge:
         }, "optional": {
             "mask_mode": (["hard", "taper", "ramp", "blend", "window"], {"default": "hard"}),
             "pin_audio": ("BOOLEAN", {"default": True}),
-            "anchor_config": ("STRING", {"default": "{\"strength\":0,\"voice\":0}"}),
+            "anchor_config": ("STRING", {"default": "{}"}),
+            "vae": ("VAE",),
         }}
     RETURN_TYPES = ("LATENT",)
     FUNCTION = "run"
@@ -2567,61 +2738,52 @@ class ADH3InternalBridge:
     OUTPUT_NODE = False
 
     def run(self, latent, relay_context, context_frames=22, mask_mode="hard", pin_audio=True,
-            anchor_config="{}"):
+            anchor_config="{}", vae=None):
         ctx = relay_context if isinstance(relay_context, dict) else {}
         run_id = str(ctx.get("relay_run_id") or "ad_relay")
         stage = int(ctx.get("relay_stage_index") or 0)
         cfg = parse_anchor_config(anchor_config)
-        strength = float(cfg.get("strength") or 0.0)
-        voice_on = bool(cfg.get("voice"))
-        anchor_latent = None
-        anchor_blend = strength
-        if stage > 0 and strength > 0:
-            try:
-                anchor_latent = _anchor_stage_latent(run_id, 0)
-            except Exception as exc:
-                print("[AD-潜桥] 锚强度未生效：读第 1 段 stage 失败（%r）" % (exc,))
-                anchor_latent = None
+        bridge_mode = int(cfg.get("bridge_mode") or 0)
         upstream = _relay_vendor_runtime.H3RelayCopyBridge()
-        # 只有目标 latent 的音频确实被钉住时才改走 AD 侧音频对齐；否则保持旧路径，
-        # 上游仍按 pin_audio 原参数处理（旧工作流字面零变化；v0.5.46）。
         audio_pinned = _relay_audio_pin_state(latent)[1] is not None
         upstream_pin = False if audio_pinned else bool(pin_audio)
-        # 音频被钉住时统一交给 _relay_audio_fix：上游只拷视频窗（pin_audio=False），
-        # 否则上游会把上一段音频覆盖到音频头部，之后无法再做“整体前移”的裁头对齐。
         reanchor = bool(ctx.get("relay_reanchor"))
+        ctx["ad_bridge_used"] = "independent" if reanchor else "latent"
         if reanchor:
-            # 分段重锚定：不再读“上一段”的尾 latent，但仍用第 1 段的稳定 stage 作为
-            # 全局外观锚（人物身份/服装/环境）。失败时明确停止，避免本段丢失角色身份。
-            _require_parent_relay_stage(run_id, stage, reanchor=True)
-            anchor_path = _relay_stage_file(run_id, 0)
+            # v0.5.49 分段重锚定 = 真正独立段：不读上一段 latent，也不拿第 1 段 latent 当上下文。
+            trim = int(ctx.get("relay_trim_frames") or 5)
+            result = upstream.bridge(latent, context_frames=int(trim), mask_mode=str(mask_mode or "hard"),
+                                     pin_audio=upstream_pin, run_id=run_id, stage_index=0)
+            if not audio_pinned:
+                return (result[0],)
+            return (_relay_audio_fix(result[0], latent, ctx, stage, reanchor=True),)
+        if bridge_mode == 1 and stage > 0 and vae is not None and (run_id or "").strip():
+            # v0.5.50 像素质量复位：桥接上下文不再是“上一段生成 latent”的直接拷贝，而是
+            # 上一段成片尾帧 → 轻度锐化 → VAE 重编码，切断“越跑越糊”的复利链；失败自动回退。
             try:
-                from ._relay_vendor import relay_core as _relay_core
-                anchor = _relay_core.load_av_latent(str(anchor_path))
-                result = upstream.bridge(latent, context_latent=anchor,
+                context_latent = _pixel_bridge_context(run_id, ctx, vae, int(context_frames))
+                result = upstream.bridge(latent, context_latent=context_latent,
                                          context_frames=int(context_frames),
                                          mask_mode=str(mask_mode or "hard"),
                                          pin_audio=upstream_pin,
                                          run_id=run_id, stage_index=stage)
+                ctx["ad_bridge_used"] = "pixel"
+                print("[AD-潜桥] 第 %d 段桥接：像素质量复位（上一段成片尾 %d 帧 → 锐化 → VAE 重编码）"
+                      % (stage + 1, int(context_frames)))
+                if not audio_pinned:
+                    return (result[0],)
+                return (_relay_audio_fix(result[0], latent, ctx, stage),)
             except Exception as exc:
-                raise ValueError(f"潜桥重锚定失败，本轮第 1 段外观锚无法读取或无法与本段续接：{exc}") from exc
-            if not audio_pinned:
-                return (result[0],)
-            return (_relay_audio_fix(result[0], latent, ctx, stage, reanchor=True, voice_on=voice_on),)
-        bridge_kwargs = {}
-        if anchor_latent is not None:
-            bridge_kwargs["anchor_latent"] = anchor_latent
-            bridge_kwargs["anchor_blend"] = anchor_blend
+                print("[AD-潜桥] 像素质量复位桥接不可用，回退直接 latent（%r）" % (exc,))
         result = upstream.bridge(latent, context_frames=int(context_frames), mask_mode=str(mask_mode or "hard"),
-                                 pin_audio=upstream_pin, run_id=run_id, stage_index=stage,
-                                 **bridge_kwargs)
+                                 pin_audio=upstream_pin, run_id=run_id, stage_index=stage)
         if not audio_pinned:
             return (result[0],)
-        return (_relay_audio_fix(result[0], latent, ctx, stage, reanchor=False, voice_on=voice_on),)
+        return (_relay_audio_fix(result[0], latent, ctx, stage),)
 
 
 class ADH3InternalAppearanceAnchor:
-    """内部外观/历史锚：把锚段开头几帧追加进 H3 conditioning（不改 latent，不跳）。"""
+    """内部外观锚：把第 1 段开头几帧追加进 H3 conditioning（不改 latent、不跳段）。"""
     @classmethod
     def INPUT_TYPES(cls):
         return {"required": {
@@ -2641,35 +2803,28 @@ class ADH3InternalAppearanceAnchor:
         stage = int(ctx.get("relay_stage_index") or 0)
         cfg = parse_anchor_config(anchor_config)
         appearance = int(cfg.get("appearance") or 0)
-        history = int(cfg.get("history") or 0)
-        if stage <= 0 or (appearance <= 0 and history <= 0):
+        ctx["ad_appearance_refs"] = 0
+        if stage <= 0 or appearance <= 0:
             return (conditioning,)
-        refs = []
-        notes = []
-        if appearance > 0 and (stage + 1) % appearance == 0:
-            try:
-                refs.append(_anchor_ref_block(run_id, 0))
-                notes.append("外观锚=第1段")
-            except Exception as exc:
-                print("[AD-潜桥] 外观锚未生效（%r）" % (exc,))
-        for offset in range(1, history + 1):
-            anchor_index = stage - offset
-            if anchor_index < 0:
-                continue
-            try:
-                refs.append(_anchor_ref_block(run_id, anchor_index))
-                notes.append("历史锚=第%d段" % (anchor_index + 1))
-            except Exception as exc:
-                print("[AD-潜桥] 历史锚第 %d 段未生效（%r）" % (anchor_index + 1, exc))
-        if not refs:
+        if ctx.get("relay_reanchor"):
+            # 重锚定段是独立生成，任何“第 1 段”参考块都会直接串味（v0.5.49）。
+            print("[AD-潜桥] 第 %d 段为重锚定独立段：跳过外观锚（避免第 1 段画面串入）" % (stage + 1,))
+            return (conditioning,)
+        if (stage + 1) % appearance != 0:
+            return (conditioning,)
+        try:
+            ref = _anchor_ref_block(run_id, 0)
+        except Exception as exc:
+            print("[AD-潜桥] 外观锚未生效（%r）" % (exc,))
             return (conditioning,)
         try:
             import node_helpers
-            out = node_helpers.conditioning_set_values(conditioning, {"minimax_refs": refs}, append=True)
+            out = node_helpers.conditioning_set_values(conditioning, {"minimax_refs": [ref]}, append=True)
         except Exception as exc:
             print("[AD-潜桥] 锚定参考块注入失败，保持原条件（%r）" % (exc,))
             return (conditioning,)
-        print("[AD-潜桥] 第 %d 段锚定：追加 %d 个参考块（%s）" % (stage + 1, len(refs), "、".join(notes)))
+        ctx["ad_appearance_refs"] = 1
+        print("[AD-潜桥] 第 %d 段锚定：追加 1 个外观锚参考块（第1段）" % (stage + 1,))
         return (out,)
 
 
@@ -2706,6 +2861,561 @@ class ADH3InternalSave:
         return (latent,)
 
 
+def _region_color_means(images, max_frames=6):
+    """取生成帧的全局/皮肤/绿衣区域均值（只统计，不逐帧处理）。返回 dict 或 None。"""
+    try:
+        import numpy as np
+        import torch
+    except Exception:
+        return None
+    try:
+        if images is None or not hasattr(images, "shape") or len(images.shape) != 4 or int(images.shape[0]) < 1:
+            return None
+        step = max(1, int(images.shape[0]) // max_frames)
+        sample = images[::step][:max_frames].detach().float().cpu()
+        rgb = sample.permute(0, 3, 1, 2).reshape(sample.shape[0], 3, -1).permute(0, 2, 1).reshape(-1, 3).numpy()
+        if rgb.shape[0] > 300000:
+            rgb = rgb[:: max(1, rgb.shape[0] // 300000)]
+        r, g, b = rgb[:, 0], rgb[:, 1], rgb[:, 2]
+        y = 0.299 * r + 0.587 * g + 0.114 * b
+        cb = 0.564 * (b - y)
+        cr = 0.713 * (r - y)
+        mx = rgb.max(axis=1)
+        mn = rgb.min(axis=1)
+        sat = np.where(mx > 1e-5, (mx - mn) / np.maximum(mx, 1e-5), 0.0)
+        skin = (cr >= -0.05) & (cr <= 0.20) & (cb >= -0.20) & (cb <= 0.10) & (y >= 0.15) & (y <= 0.95)
+        cloth = (g >= r) & (g >= b) & (sat >= 0.20) & (mx >= 0.04) & (mx <= 0.90)
+        out = {"all": rgb.mean(axis=0)}
+        for name, mask in (("skin", skin), ("cloth", cloth)):
+            count = int(mask.sum())
+            enough = count >= 200 and count >= rgb.shape[0] * 0.005
+            out[name] = (rgb[mask].mean(axis=0), count) if enough else (None, count)
+        return out
+    except Exception:
+        return None
+
+
+def _first_segment_frames(ctx, max_frames=6):
+    """读第 1 段成片的少量帧（供整段校正/质感还原取统计）。"""
+    try:
+        from .storage import STORE
+        import av
+        import numpy as np
+        import torch
+    except Exception:
+        return None
+    session_id = str(ctx.get("session_id") or "")
+    if not session_id:
+        return None
+    try:
+        state = STORE.read(session_id)
+        rows = state.get("segments") or []
+        if not rows:
+            return None
+        row = rows[0]
+        selected = row.get("selected")
+        versions = row.get("versions") or []
+        version = next((v for v in versions if selected and v.get("id") == selected), None)
+        if version is None and versions:
+            version = versions[-1]
+        if not version or not version.get("file"):
+            return None
+        path = STORE.directory(session_id) / str(version["file"])
+        if not path.is_file():
+            return None
+        picked = []
+        with av.open(str(path)) as container:
+            for frame in container.decode(video=0):
+                picked.append(frame.to_ndarray(format="rgb24"))
+                if len(picked) >= max_frames * 8:
+                    break
+        if not picked:
+            return None
+        step = max(1, len(picked) // max_frames)
+        chosen = picked[::step][:max_frames]
+        return torch.from_numpy(np.stack([np.asarray(f, dtype=np.float32) / 255.0 for f in chosen]))
+    except Exception as exc:
+        print("[AD-颜色] 读取第 1 段成片失败：%r" % (exc,))
+        return None
+
+
+def _first_segment_color_means(ctx, max_frames=6):
+    """第 1 段成片的皮肤/服装色彩均值，作为整段软校正的目标。"""
+    tensor = _first_segment_frames(ctx, max_frames=max_frames)
+    if tensor is None:
+        return None
+    return _region_color_means(tensor, max_frames=max_frames)
+
+
+def _image_detail(images, max_frames=6):
+    """整段细节水平：采样帧灰度的拉普拉斯方差均值（越大越锐/细节越多）。"""
+    try:
+        import numpy as np
+    except Exception:
+        return None
+    try:
+        if images is None or len(images.shape) != 4 or int(images.shape[0]) < 1:
+            return None
+        step = max(1, int(images.shape[0]) // max_frames)
+        sample = images[::step][:max_frames].detach().float().cpu().numpy()
+        values = []
+        for frame in sample:
+            gray = frame[..., 0] * 0.299 + frame[..., 1] * 0.587 + frame[..., 2] * 0.114
+            lap = (gray[1:-1, :-2] + gray[1:-1, 2:] + gray[:-2, 1:-1] + gray[2:, 1:-1]
+                   - 4.0 * gray[1:-1, 1:-1])
+            values.append(float(lap.var()))
+        return float(np.mean(values)) if values else None
+    except Exception:
+        return None
+
+
+def _first_segment_detail(ctx, max_frames=6):
+    tensor = _first_segment_frames(ctx, max_frames=max_frames)
+    if tensor is None:
+        return None
+    return _image_detail(tensor, max_frames=max_frames)
+
+
+def _unsharp_images(images, amount):
+    """整段 USM 锐化（分块，不逐帧自动增益）。"""
+    try:
+        import torch
+        import torch.nn.functional as F
+    except Exception:
+        return images
+    try:
+        amount = float(amount)
+    except (TypeError, ValueError):
+        amount = 0.0
+    if images is None or amount <= 0 or int(images.shape[0]) < 1:
+        return images
+    h, w = int(images.shape[1]), int(images.shape[2])
+    kernel = torch.tensor([[1, 4, 6, 4, 1], [4, 16, 24, 16, 4], [6, 24, 36, 24, 6],
+                           [4, 16, 24, 16, 4], [1, 4, 6, 4, 1]], dtype=torch.float32,
+                          device=images.device) / 256.0
+    kernel = kernel.view(1, 1, 5, 5)
+    out = images.clone()
+    chunk = max(1, (64 * 1024 * 1024) // max(1, int(out[0].numel()) * int(out.element_size())))
+    for start in range(0, int(out.shape[0]), chunk):
+        part = out[start:start + chunk]
+        x = part.permute(0, 3, 1, 2).reshape(-1, 1, h, w)
+        padded = F.pad(x, (2, 2, 2, 2), mode="replicate")
+        blur = F.conv2d(padded, kernel).reshape(part.shape[0], 3, h, w).permute(0, 2, 3, 1)
+        part.copy_((part + amount * (part - blur)).clamp_(0.0, 1.0))
+    return out
+
+
+def _apply_texture_restore(images, ctx, anchor_config="{}"):
+    """质感还原：按第 1 段成片的细节水平，对本段做自适应轻度锐化（不重新生成）。"""
+    try:
+        cfg = parse_anchor_config(anchor_config)
+        blend = float(cfg.get("texture_restore") or 0.0)
+    except Exception:
+        blend = 0.0
+    stage = int((ctx or {}).get("relay_stage_index") or 0)
+    if blend <= 0 or stage <= 0 or images is None or not hasattr(images, "shape") or int(images.shape[0]) < 1:
+        return images
+    target = _first_segment_detail(ctx)
+    current = _image_detail(images)
+    if target is None or current is None or current <= 1e-6:
+        print("[AD-质感] 缺少第 1 段/本段细节统计，跳过质感还原")
+        return images
+    ratio = float(target) / float(current)
+    if ratio <= 1.15:
+        print("[AD-质感] 细节已达标（第1段 %.0f / 本段 %.0f），跳过" % (target, current))
+        return images
+    amount = min(0.8, (ratio - 1.0) * blend * 0.8)
+    if amount < 0.03:
+        return images
+    corrected = _unsharp_images(images, amount)
+    print("[AD-质感] 质感还原：第1段细节 %.0f / 本段 %.0f → 锐化 %.2f" % (target, current, amount))
+    return corrected
+
+
+_SEAM_PREV_CACHE = {}
+_SEAM_PREV_CACHE_LIMIT = 16
+_SEAM_LUMA_GAIN_MIN = 0.8
+_SEAM_LUMA_GAIN_MAX = 1.25
+_SEAM_CHROMA_REL = 0.05
+_SEAM_TARGET_FRAMES = 5
+_SEAM_DEFLICKER_WINDOW = 48
+
+
+def _seam_cache_get(key):
+    """真 LRU：命中后把键移到末尾（dict 插入序）。"""
+    if key not in _SEAM_PREV_CACHE:
+        return None
+    value = _SEAM_PREV_CACHE.pop(key)
+    _SEAM_PREV_CACHE[key] = value
+    return value
+
+
+def _seam_cache_put(key, value):
+    _SEAM_PREV_CACHE[key] = value
+    while len(_SEAM_PREV_CACHE) > _SEAM_PREV_CACHE_LIMIT:
+        _SEAM_PREV_CACHE.pop(next(iter(_SEAM_PREV_CACHE)))
+
+
+def _last_frame_channel_means(path, count=_SEAM_TARGET_FRAMES):
+    """读视频最后 count 帧，返回每通道中位数（0..1，3 个 float）；按文件身份 LRU 缓存。"""
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    key = (str(path), int(stat.st_mtime_ns), int(stat.st_size), int(count))
+    cached = _seam_cache_get(key)
+    if cached is not None:
+        return cached
+    try:
+        import av
+        import numpy as np
+        frames = []
+        with av.open(str(path)) as container:
+            stream = container.streams.video[0]
+            duration = None
+            try:
+                if stream.duration is not None and stream.time_base is not None:
+                    duration = float(stream.duration * stream.time_base)
+            except Exception:
+                duration = None
+            if duration is None:
+                try:
+                    if container.duration:
+                        duration = float(container.duration) / 1000000.0
+                except Exception:
+                    duration = None
+            if duration and duration > 0.5:
+                try:
+                    offset = max(0.0, duration - 1.5)
+                    container.seek(int(offset / float(stream.time_base)), stream=stream,
+                                   backward=True, any_frame=False)
+                except Exception:
+                    pass
+            for frame in container.decode(stream):
+                frames.append(frame)
+                if len(frames) > int(count) + 2:
+                    frames.pop(0)
+        if not frames:
+            return None
+        last = frames[-int(count):]
+        arr = np.stack([np.asarray(f.to_ndarray(format="rgb24"), dtype="float32") / 255.0
+                        for f in last])
+        per_frame = arr.reshape(arr.shape[0], -1, 3).mean(axis=1)
+        means = tuple(float(v) for v in np.median(per_frame, axis=0))
+    except Exception:
+        return None
+    _seam_cache_put(key, means)
+    return means
+
+
+def _version_file_path(session_id, row):
+    if not isinstance(row, dict):
+        return None
+    try:
+        from .storage import STORE
+    except Exception:
+        return None
+    selected = row.get("selected")
+    versions = row.get("versions") or []
+    version = next((v for v in versions if selected and v.get("id") == selected), None)
+    if version is None and versions:
+        version = versions[-1]
+    if not version or not version.get("file"):
+        return None
+    try:
+        path = STORE.directory(session_id) / str(version["file"])
+    except Exception:
+        return None
+    return path if path.is_file() else None
+
+
+def _row_from_session_rows(session_id, stage):
+    try:
+        from .storage import STORE
+        state = STORE.read(session_id)
+    except Exception:
+        return None
+    rows = state.get("segments") or []
+    return rows[int(stage)] if 0 <= int(stage) < len(rows) else None
+
+
+def _row_from_round_snapshot(session_id, round_key, stage):
+    text = str(round_key or "").strip()
+    if not text.isdigit() or int(text) <= 0:
+        return None
+    try:
+        import json
+        from .storage import STORE
+        state = STORE.read(session_id)
+        rel = (state.get("group_snapshots") or {}).get(text)
+        if not rel:
+            return None
+        path = STORE.directory(session_id) / str(rel)
+        if not path.is_file():
+            return None
+        with path.open(encoding="utf-8") as handle:
+            snapshot = json.load(handle)
+        rows = snapshot.get("segments") or []
+        return rows[int(stage)] if 0 <= int(stage) < len(rows) else None
+    except Exception:
+        return None
+
+
+def _segment_file_last_frame(session_id, stage, round_key="", prefer_snapshot=False):
+    try:
+        stage = int(stage)
+    except (TypeError, ValueError):
+        return None
+    if not session_id or stage < 0:
+        return None
+    getters = [
+        lambda: _row_from_round_snapshot(session_id, round_key, stage),
+        lambda: _row_from_session_rows(session_id, stage),
+    ]
+    ordered = getters if prefer_snapshot else [getters[1], getters[0]]
+    for getter in ordered:
+        row = getter()
+        path = _version_file_path(session_id, row) if row is not None else None
+        if path is None:
+            continue
+        means = _last_frame_channel_means(path)
+        if means is not None:
+            return means
+    return None
+
+
+def _round_key_of(ctx):
+    """只有正整数 round_no 才当作历史轮键；0/空值/round_id 非数字一律视为无轮次。"""
+    try:
+        number = int((ctx or {}).get("round_no") or 0)
+    except (TypeError, ValueError):
+        number = 0
+    return str(number) if number > 0 else ""
+
+
+def _previous_segment_last_frame(ctx, stage):
+    try:
+        import torch
+    except Exception:
+        return None
+    round_key = _round_key_of(ctx)
+    sid = str((ctx or {}).get("session_id") or "")
+    parent = str((ctx or {}).get("preview_parent_session") or "")
+    is_child = sid.startswith("trial_")
+    if is_child and not round_key:
+        print("[AD-接缝] 抽卡子会话缺少有效轮次号：跳过父会话当前轮回退（避免曝光目标取错）")
+        means = _segment_file_last_frame(sid, int(stage) - 1, "", prefer_snapshot=False)
+    else:
+        means = None
+        tries = []
+        if sid:
+            tries.append((sid, False))
+        if parent and parent != sid:
+            tries.append((parent, True))
+        for session_id, prefer_snapshot in tries:
+            means = _segment_file_last_frame(session_id, int(stage) - 1, round_key,
+                                             prefer_snapshot=prefer_snapshot)
+            if means is not None:
+                break
+    if means is None:
+        return None
+    return torch.tensor(means, dtype=torch.float32)
+
+
+def _smooth_curve(values, radius=2):
+    import torch
+    import torch.nn.functional as F
+    n = int(values.shape[0])
+    if n < 3 or radius <= 0:
+        return values
+    channels = int(values.shape[1]) if len(values.shape) > 1 else 1
+    tensor = values if len(values.shape) > 1 else values.view(n, 1)
+    kernel = torch.ones((channels, 1, 2 * radius + 1), dtype=torch.float32, device=tensor.device)
+    kernel = kernel / float(2 * radius + 1)
+    padded = F.pad(tensor.transpose(0, 1).unsqueeze(0), (radius, radius), mode="replicate")
+    out = F.conv1d(padded, kernel, groups=channels).squeeze(0).transpose(0, 1)
+    return out if len(values.shape) > 1 else out.view(n)
+
+
+def _apply_seam_transition(images, ctx, anchor_config="{}"):
+    """接缝过渡：前 N 帧每通道增益对齐上一段末 5 帧中位数；重锚定段随后做自适应整段去闪。
+
+    参数（anchor_config 可覆盖）：seam_frames / seam_strength / seam_deflicker。
+    限幅：整体亮度增益 0.8–1.25，通道相对偏差 ≤5%（色度比亮度更保守）。
+    """
+    try:
+        stage = int((ctx or {}).get("relay_stage_index") or 0)
+    except Exception:
+        stage = 0
+    relay_on = (int((ctx or {}).get("relay_context_frames") or 0) > 0
+                or int((ctx or {}).get("relay_trim_frames") or 0) > 0)
+    if stage < 1 or not relay_on or images is None or not hasattr(images, "shape") or int(images.shape[0]) < 2:
+        return images
+    prev = _previous_segment_last_frame(ctx, stage)
+    if prev is None:
+        return images
+    reanchor = bool((ctx or {}).get("relay_reanchor"))
+    raw = {}
+    try:
+        import json
+        parsed = json.loads(anchor_config or "{}")
+        raw = parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        raw = {}
+    try:
+        frames = int(raw.get("seam_frames") or (24 if reanchor else 12))
+    except (TypeError, ValueError):
+        frames = 24 if reanchor else 12
+    frames = max(0, min(48, frames))
+    try:
+        strength = float(raw.get("seam_strength", 1.0))
+    except (TypeError, ValueError):
+        strength = 1.0
+    strength = max(0.0, min(1.0, strength))
+    try:
+        deflicker = float(raw.get("seam_deflicker", 0.25 if reanchor else 0.0))
+    except (TypeError, ValueError):
+        deflicker = 0.25 if reanchor else 0.0
+    deflicker = max(0.0, min(1.0, deflicker))
+    if frames <= 0 and deflicker <= 0:
+        return images
+    try:
+        import torch
+        total = int(images.shape[0])
+        out = images.clone()
+        n = 0
+        info = {"frames": 0, "method": "per_channel_gain", "strength": round(strength, 3),
+                "gain_first": [1.0, 1.0, 1.0], "gain_range": [1.0, 1.0],
+                "prev_means": [round(float(v), 4) for v in prev.view(3).tolist()],
+                "deflicker": round(deflicker, 3), "deflicker_frames": 0, "reanchor": reanchor}
+        if frames > 0 and strength > 0:
+            n = min(frames, total)
+            head = images[:n].detach().float()
+            means = head.mean(dim=(1, 2))
+            smooth = _smooth_curve(means, radius=2)
+            weights = torch.tensor(
+                [0.5 * (1.0 + math.cos(math.pi * i / max(1, n - 1))) for i in range(n)],
+                dtype=torch.float32, device=images.device)
+            prev_vec = prev.to(device=images.device, dtype=torch.float32).view(1, 3)
+            target = smooth + weights.view(n, 1) * (prev_vec - smooth[0].view(1, 3))
+            raw_gain = (target / means.clamp(min=1e-3))
+            luma_cur = (0.299 * means[:, 0] + 0.587 * means[:, 1] + 0.114 * means[:, 2]).clamp(min=1e-3)
+            luma_tgt = (0.299 * target[:, 0] + 0.587 * target[:, 1] + 0.114 * target[:, 2])
+            raw_luma_gain = luma_tgt / luma_cur
+            global_gain = raw_luma_gain.clamp(_SEAM_LUMA_GAIN_MIN, _SEAM_LUMA_GAIN_MAX)
+            relative = (raw_gain / raw_luma_gain.clamp(min=1e-3).view(n, 1)).clamp(
+                1.0 - _SEAM_CHROMA_REL, 1.0 + _SEAM_CHROMA_REL)
+            gain = global_gain.view(n, 1) * relative
+            gain = 1.0 + (gain - 1.0) * strength
+            if float((gain - 1.0).abs().max()) < 0.005:
+                return images
+            if n >= 3:
+                tail = min(3, n - 1)
+                factors = torch.tensor([1.0 - k / float(tail) for k in range(tail + 1)],
+                                       dtype=torch.float32, device=images.device).view(-1, 1)
+                gain[n - tail - 1:] = 1.0 + (gain[n - tail - 1:] - 1.0) * factors
+            out[:n] = (out[:n] * gain.view(n, 1, 1, 3)).clamp(0.0, 1.0)
+            info.update(frames=n,
+                        gain_first=[round(float(v), 4) for v in gain[0].tolist()],
+                        gain_range=[round(float(gain.min()), 4), round(float(gain.max()), 4)])
+        if deflicker > 0 and total > n:
+            start = n
+            end = min(total, start + _SEAM_DEFLICKER_WINDOW)
+            if end > start + 2:
+                body = out[start:end].detach().float()
+                luma = (0.299 * body[..., 0] + 0.587 * body[..., 1] + 0.114 * body[..., 2]).mean(dim=(1, 2))
+                smooth_luma = _smooth_curve(luma.view(-1, 1), radius=2).view(-1)
+                residual = luma - smooth_luma
+                weight = ((residual.abs() - 0.03) / 0.03).clamp(0.0, 1.0)
+                gain_luma = (smooth_luma / luma.clamp(min=1e-3)).clamp(0.85, 1.15)
+                blend = 1.0 + (gain_luma - 1.0) * deflicker * weight
+                out[start:end] = (out[start:end] * blend.view(-1, 1, 1, 1)).clamp(0.0, 1.0)
+                info["deflicker_frames"] = int(end - start)
+        ctx["ad_seam"] = info
+        print("[AD-接缝] 第 %d 段%s：前 %d 帧每通道增益过渡 gain0=%s 范围=[%s,%s]%s"
+              % (stage + 1, "（重锚定）" if reanchor else "", info["frames"], info["gain_first"],
+                 info["gain_range"][0], info["gain_range"][1],
+                 "，自适应去闪 %.2f（%d 帧）" % (deflicker, info["deflicker_frames"]) if info["deflicker_frames"] else ""))
+        return out
+    except Exception as exc:
+        print("[AD-接缝] 接缝曝光过渡失败（保留原画面）：%r" % (exc,))
+        return images
+
+
+def _segment_effective_audit(ctx, anchor_config):
+    """本段实际生效的选项（写入版本 metadata + 日志，便于核对每个选项到底有没有作用）。"""
+    try:
+        cfg = parse_anchor_config(anchor_config)
+    except Exception:
+        cfg = {}
+    stage = int((ctx or {}).get("relay_stage_index") or 0)
+    return {
+        "stage": stage + 1,
+        "relay_trim_frames": int((ctx or {}).get("relay_trim_frames") or 0),
+        "reanchor": bool((ctx or {}).get("relay_reanchor")),
+        "appearance": int(cfg.get("appearance") or 0),
+        "appearance_refs": (ctx or {}).get("ad_appearance_refs"),
+        "segment_correction": float(cfg.get("segment_correction") or 0.0),
+        "texture_restore": float(cfg.get("texture_restore") or 0.0),
+        "bridge_mode": int(cfg.get("bridge_mode") or 0),
+        "bridge_used": (ctx or {}).get("ad_bridge_used"),
+        "seam_frames": int(((ctx or {}).get("ad_seam") or {}).get("frames") or 0),
+        "seam_method": ((ctx or {}).get("ad_seam") or {}).get("method"),
+        "seam_strength": ((ctx or {}).get("ad_seam") or {}).get("strength"),
+        "seam_gain_first": ((ctx or {}).get("ad_seam") or {}).get("gain_first"),
+        "seam_gain_range": ((ctx or {}).get("ad_seam") or {}).get("gain_range"),
+        "seam_prev_means": ((ctx or {}).get("ad_seam") or {}).get("prev_means"),
+        "seam_deflicker": ((ctx or {}).get("ad_seam") or {}).get("deflicker"),
+        "seam_deflicker_frames": ((ctx or {}).get("ad_seam") or {}).get("deflicker_frames"),
+        "seam_reanchor": ((ctx or {}).get("ad_seam") or {}).get("reanchor"),
+    }
+
+
+def _apply_segment_correction(images, ctx, anchor_config="{}"):
+    """整段软校正：按第 1 段成片的皮肤/服装色均值，对当前段整段做统一固定偏移（不逐帧）。"""
+    try:
+        import numpy as np
+        import torch
+    except Exception:
+        return images
+    try:
+        cfg = parse_anchor_config(anchor_config)
+        blend = float(cfg.get("segment_correction") or 0.0)
+    except Exception:
+        blend = 0.0
+    stage = int((ctx or {}).get("relay_stage_index") or 0)
+    if blend <= 0 or stage <= 0 or images is None or not hasattr(images, "shape") or int(images.shape[0]) < 1:
+        return images
+    target = _first_segment_color_means(ctx)
+    current = _region_color_means(images)
+    if target is None or current is None:
+        return images
+    offsets, weights = [], []
+    for name in ("skin", "cloth"):
+        target_mean, _ = target.get(name, (None, 0))
+        current_mean, current_count = current.get(name, (None, 0))
+        if target_mean is None or current_mean is None:
+            continue
+        offsets.append(np.asarray(target_mean, dtype=np.float64) - np.asarray(current_mean, dtype=np.float64))
+        weights.append(max(1, int(current_count)))
+    if not offsets:
+        offsets.append(np.asarray(target["all"], dtype=np.float64) - np.asarray(current["all"], dtype=np.float64))
+        weights.append(1)
+    offset = np.average(np.stack(offsets), axis=0, weights=np.asarray(weights, dtype=np.float64))
+    offset = np.clip(offset * blend, -0.18, 0.18).astype(np.float32)
+    if float(np.abs(offset).max()) < 0.002:
+        print("[AD-颜色] 整段软校正：偏移过小，跳过")
+        return images
+    correction = torch.as_tensor(offset, device=images.device, dtype=images.dtype).view(1, 1, 1, 3)
+    corrected = images.clone()
+    chunk = max(1, (64 * 1024 * 1024) // max(1, int(corrected[0].numel()) * int(corrected.element_size())))
+    for start in range(0, int(corrected.shape[0]), chunk):
+        part = corrected[start:start + chunk]
+        part.add_(correction).clamp_(0.0, 1.0)
+    print("[AD-颜色] 整段软校正（第1段成片目标，blend=%.1f）：offset=%s" % (blend, [round(float(v), 4) for v in offset]))
+    return corrected
+
+
 class ADH3InternalTrim:
     """内部裁头：trim_frames 从 context 读取，不再暴露独立输出口。"""
     @classmethod
@@ -2716,6 +3426,7 @@ class ADH3InternalTrim:
         }, "optional": {
             "audio": ("AUDIO",),
             "fps": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 120.0, "step": 0.001}),
+            "anchor_config": ("STRING", {"default": "{}"}),
         }}
     RETURN_TYPES = ("IMAGE", "AUDIO")
     RETURN_NAMES = ("images", "audio")
@@ -2723,7 +3434,7 @@ class ADH3InternalTrim:
     CATEGORY = CATEGORY
     OUTPUT_NODE = False
 
-    def run(self, images, relay_context, audio=None, fps=24.0):
+    def run(self, images, relay_context, audio=None, fps=24.0, anchor_config="{}"):
         import contextlib
         import io
 
@@ -2750,6 +3461,24 @@ class ADH3InternalTrim:
         after_images = int(trimmed_images.shape[0])
         after_audio = (int(trimmed_audio["waveform"].shape[-1])
                        if isinstance(trimmed_audio, dict) and trimmed_audio.get("waveform") is not None else None)
+        try:
+            trimmed_images = _apply_segment_correction(trimmed_images, ctx, anchor_config)
+        except Exception as exc:
+            print("[AD-颜色] 整段软校正失败（保留原画面）：%r" % (exc,))
+        try:
+            trimmed_images = _apply_texture_restore(trimmed_images, ctx, anchor_config)
+        except Exception as exc:
+            print("[AD-质感] 质感还原失败（保留原画面）：%r" % (exc,))
+        try:
+            trimmed_images = _apply_seam_transition(trimmed_images, ctx, anchor_config)
+        except Exception as exc:
+            print("[AD-接缝] 接缝曝光过渡失败（保留原画面）：%r" % (exc,))
+        try:
+            audit = _segment_effective_audit(ctx, anchor_config)
+            ctx["ad_effective"] = audit
+            print("[AD-审计] 第 %d 段实际生效：%s" % (audit["stage"], json.dumps(audit, ensure_ascii=False)))
+        except Exception as exc:
+            print("[AD-审计] 生效审计失败（不影响生成）：%r" % (exc,))
         line = "[AD-潜桥] 裁头 %d 帧：画面 %d → %d 帧" % (frames, before_images, after_images)
         if before_audio is not None and after_audio is not None:
             line += "；音频 %d → %d 采样点" % (before_audio, after_audio)
