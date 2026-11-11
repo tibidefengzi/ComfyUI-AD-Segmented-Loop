@@ -10,6 +10,7 @@ const frameStyles=document.createElement("style");
 frameStyles.id=frameStylesId;
 frameStyles.textContent=`
 .ad-h3-video.aiden-h3 .ad-h3-screen>.ad-h3-player-controls.ad-h3-native-controls-hidden{display:none!important}
+.ad-h3-video.aiden-h3 .ad-h3-preview-layout>.ad-h3-screen{flex:0 0 auto}
 .ad-h3-video.aiden-h3 .ad-h3-screen video{width:100%;height:100%;object-fit:contain;background:#08090c}
 .ad-h3-video.aiden-h3 .ad-h3-screen audio{width:88%}
 .ad-h3-video.aiden-h3 .ad-h3-frame-step{position:absolute;top:8px;right:8px;bottom:auto;z-index:8;display:flex;gap:6px}

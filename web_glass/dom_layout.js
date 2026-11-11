@@ -62,6 +62,16 @@ export function fitPreviewContent(node, root) {
             clampNodeWidth(node);
             const size = node.computeSize?.();
             const height = Number(size?.[1]);
+            const current = Number(node.size?.[1]) || 0;
+            // 预览框被压扁（节点高度不足以容纳 16:9 预览）时，按内容高度恢复一次，避免只剩缩略图。
+            const screen = root.querySelector(".ad-h3-screen");
+            const collapsed = !!screen && screen.offsetWidth > 40 && screen.clientHeight < 40;
+            if (Number.isFinite(height) && height > 0 && (collapsed || height > current + 4)) {
+                node.setSize([Math.max(MIN_NODE_WIDTH,node.size[0]),height]);
+                node.setDirtyCanvas?.(true,true);
+                return;
+            }
+            if (node._adH3Configured) return;
             if (Number.isFinite(height) && height > 0 && Math.abs(node.size[1]-height) > 2) {
                 node.setSize([Math.max(MIN_NODE_WIDTH,node.size[0]),height]);
                 node.setDirtyCanvas?.(true,true);
