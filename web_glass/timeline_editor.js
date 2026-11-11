@@ -1164,7 +1164,7 @@ export function mountTimelineEditor(node) {
     // 磁吸锚点缓存：同一帧内多次 snapTo 复用；片段位置变了用 ++snapEpoch 失效
     let snapEpoch = 0, snapCacheEpoch = -1, snapCacheAnchors = null, snapCacheTotal = 0;
     const bumpSnapCache = () => { snapEpoch++; };
-    const snapTo = (t, { withPlayhead = true } = {}) => {
+    const snapTo = (t, { withPlayhead = true, extendable = false } = {}) => {
         // 剪映同款磁吸：素材起止边、分段线、播放头游标、时间线 0/终点（默认开，🧲 可关）
         // 注意：必须先按像素距离找锚点，再回退到帧对齐；若先用 snapFrame 作 bestDist，磁吸几乎永不触发
         if (!T.magnet) return snapFrame(t);
@@ -1195,6 +1195,8 @@ export function mountTimelineEditor(node) {
             }
         }
         const picked = best != null ? best : snapFrame(t);
+        // 生成段拖右边界：总长由本次拖拽决定，不能被当前总长夹住（无音视频时可自由延长）。
+        if (extendable) return Math.max(0, picked);
         return Math.max(0, Math.min(picked, total || picked));
     };
 
@@ -3018,7 +3020,7 @@ export function mountTimelineEditor(node) {
             const delta=(ev.clientX-startX)/scale/pxs+(view.scrollLeft-startScroll)/pxs;
             let start=clip.tl_start,end=clipEnd(clip);
             if(edge==="l")start=Math.max(0,Math.min(end-FRAME,snapTo(start+delta)));
-            else if(edge==="r")end=Math.max(start+FRAME,snapTo(end+delta));
+            else if(edge==="r")end=Math.max(start+FRAME,snapTo(end+delta,{extendable:true}));
             else {start=Math.max(0,snapTo(start+delta));end=start+clip.src_out-clip.src_in;}
             T.state.generation_clips=snapshot.map(item=>({...item}));
             changeGeneration(T.state,clip.id,start,end);bumpSnapCache();
