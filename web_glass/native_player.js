@@ -17,14 +17,6 @@ frameStyles.textContent=`
 .ad-h3-video.aiden-h3 .ad-h3-frame-step button{min-height:26px;height:26px;padding:0 10px;font-size:12px;border-radius:6px;border:1px solid #4a658a;background:#1b283ce6;color:#e8f0fb;cursor:pointer}
 .ad-h3-video.aiden-h3 .ad-h3-frame-step button:hover{background:#2d405b}
 .ad-h3-video.aiden-h3.ad-h3-audio-mode .ad-h3-frame-step,.ad-h3-preview-layout.is-comparing .ad-h3-frame-step,.ad-h3-video.aiden-h3 .ad-h3-frame-step[hidden]{display:none!important}
-/* 分段生成历史：右侧竖向滚动条 —— 保留最近 10 轮，全部可在预览框内滚动查看 */
-.ad-h3-video.aiden-h3 .ad-h3-strips{max-height:min(420px,42vh);overflow-y:auto;overflow-x:hidden;padding-right:8px;scrollbar-width:thin;scrollbar-color:#4a658a #141c28}
-.ad-h3-video.aiden-h3 .ad-h3-strips::-webkit-scrollbar{width:10px}
-.ad-h3-video.aiden-h3 .ad-h3-strips::-webkit-scrollbar-track{background:#141c28;border-radius:6px}
-.ad-h3-video.aiden-h3 .ad-h3-strips::-webkit-scrollbar-thumb{background:#4a658a;border-radius:6px;border:2px solid #141c28}
-.ad-h3-video.aiden-h3 .ad-h3-strips::-webkit-scrollbar-thumb:hover{background:#5f7ea6}
-/* 三条历史行保持各自内容高度，不允许被 flex 压扁（压缩会导致行内缩略图/分组行互相重叠）。 */
-.ad-h3-video.aiden-h3 .ad-h3-strips>.ad-h3-strip-row{flex:0 0 auto}
 `;
 document.head.append(frameStyles);
 }
@@ -2302,6 +2294,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         }
         node.graph?.change?.();
         node.setDirtyCanvas?.(true,true);
+        if (node._adH3FitHeight) requestAnimationFrame(() => node._adH3FitHeight());
     }
     function hideStripRecord(kind,record) { clearRecordPreview(record,kind); }
     // 合并多选：只允许视频，且必须同一轮；Ctrl 点击的先后顺序就是合并顺序。
@@ -2800,6 +2793,19 @@ export function mountNativePlayer(node, api) {
     const height = () => Math.max(300,root.querySelector(".ad-h3-preview-layout").scrollHeight+24)+20;
     const widget = node.addDOMWidget("ad_h3_native_player","div",root,{serialize:false,hideOnZoom:false,getHeight:height});
     widget.label = "视频预览"; widget.localized_name = widget.label;
+    // 历史区恢复自然铺开后，卡片/分组行变多时节点高度跟着内容长高（只增不减，避免把预览裁掉）。
+    node._adH3FitHeight = () => {
+        try {
+            const layout = root.querySelector(".ad-h3-preview-layout");
+            if (!layout || !root.isConnected) return;
+            const wanted = Math.max(300, layout.scrollHeight + 24) + 20;
+            const current = Number(node.size?.[1]) || 0;
+            if (wanted > current + 2) {
+                node.setSize([node.size[0], Math.round(wanted)]);
+                node.setDirtyCanvas?.(true, true);
+            }
+        } catch (_error) {}
+    };
     // 外层容器默认会吃掉节点下方空白处的鼠标事件：整块穿透，只让可交互子元素接收
     try {
         const wrapper = widget.element?.parentElement || root.parentElement;
