@@ -786,7 +786,7 @@ export function mountTimelineEditor(node) {
   <span class="h3-group" role="group" aria-label="片段操作">
     <button data-separate title="分离选中视频的音轨">音视频分离</button>
     <button data-delete title="删除选中的片段（Delete 键）">删除</button>
-    <button data-remove-source title="仅移除所选可见片段的素材使用；其它片段及磁盘文件保留">删除素材</button>
+    
     <button data-merge title="只拼接同轨选中片段实际保留的内容，裁掉的内容不会恢复">合并</button>
   </span>
   <span class="h3-group h3-split-group" role="group" aria-label="分段参数">
@@ -1742,7 +1742,6 @@ export function mountTimelineEditor(node) {
         const editableCount = selectedEditableClips().length;
         $("[data-separate]").disabled = !activeClips(T.state,"video_tracks",T.selected).length;
         $("[data-delete]").disabled = !(editableCount || canDeleteGen);
-        $("[data-remove-source]").disabled = !editableCount;
         $("[data-merge]").disabled = (hasAvClips()?editableCount:T.selected.size)<2;
         const batchSegs = T.state.path_source ? Math.max(0, Number(T.batchCount) || 0) : 0;
         const actualSegs = Math.max(0, pathBatch ? batchSegs : intervals().length);
@@ -4309,11 +4308,6 @@ export function mountTimelineEditor(node) {
         if (button.hasAttribute("data-delete")) {
             if (!hasAvClips()) { editGeneration("delete"); return; }
             removeSelected(); return;
-        }
-        if (button.hasAttribute("data-remove-source")) {
-            // 只移除所选使用实例；其它轨道/隐藏片段仍引用的同一素材不得连带删除。
-            removeSelected();
-            return;
         }
         if (button.hasAttribute("data-separate")) { void separateSelected(); return; }
         if (button.hasAttribute("data-merge")) { mergeSelected(); return; }
