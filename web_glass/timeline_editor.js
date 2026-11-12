@@ -2272,34 +2272,34 @@ export function mountTimelineEditor(node) {
         try { changed = applyRelayPlan(relayContextValue()); } finally { relayPlanAuto = null; relayPlanRequest = null; }
         return { ok: changed || !auto.problem, changed, problem: auto.problem || "" };
     };
-    // 自动对齐入口：加载工作流 / 应用分段 / 点开始前调用（幂等；无法重排时保留用户编辑并提示原因）。
-    node._adH3EnsureRelayPlan = () => {
-        if (String(T.state.path_source || "").trim()) return false;
-        const context = relayContextValue();
-        if (!context) return false;
-        const auto = { on: true, label: "潜桥开启", problem: "" };
-        relayPlanAuto = auto;
-        let changed = false;
-        try { changed = applyRelayPlan(context); } finally { relayPlanAuto = null; }
-        if (changed) { relayAlignWarned = ""; return true; }
-        if (auto.problem && relaySegmentsNeedAlign() && auto.problem !== relayAlignWarned) {
-            relayAlignWarned = auto.problem;
-            hint(`潜桥已开启，但当前时间线无法自动对齐 17 帧网格：${auto.problem}；生成仍按原分段执行，段间可能出现重复/跳过。`, true);
+    // 潜桥门禁：只有点「应用分段」才允许重排时间线；开始/运行前只校验，不自动改段。
+    node._adH3RelayGate = () => {
+        if (String(T.state.path_source || "").trim()) return "";
+        if (!(Math.max(0, Number(relayContextValue()) || 0) > 0)) return "";
+        if (relaySegmentsNeedAlign()) {
+            return "潜桥已开启，但时间线还没有按 17n 重排：请先点「应用分段」再开始生成。";
         }
+        return "";
+    };
+    node._adH3RelayGateHint = () => {
+        const problem = node._adH3RelayGate();
+        if (!problem) return false;
+        hint(problem, true);
+        return true;
+    };
+    // 下拉切换潜桥：只提示，不重排（重排只由「应用分段」触发）。
+    node._adH3RelayChoiceHint = () => {
+        const on = Math.max(0, Number(relayContextValue()) || 0) > 0;
+        hint(on
+            ? "潜桥已开启：只有点「应用分段」才会按 17n 重排时间线；未重排时开始生成会被拦下提示。"
+            : "潜桥已关闭：按原分段生成。", false);
+        return true;
+    };
+    node._adH3EnsureRelayPlan = () => {
+        const problem = node._adH3RelayGate();
+        if (problem) throw new Error(problem);
         return false;
     };
-    const scheduleRelayAutoAlign = (tries = 8, delay = 0) => {
-        clearTimeout(relayAutoAlignTimer);
-        let left = Math.max(0, tries);
-        const run = () => {
-            if (!node.graph) return;
-            if (left-- <= 0) return;
-            if (!relayContextValue()) { relayAutoAlignTimer = setTimeout(run, 250); return; }
-            try { node._adH3EnsureRelayPlan(); } catch (_error) {}
-        };
-        relayAutoAlignTimer = setTimeout(run, delay);
-    };
-    node._adH3ScheduleRelayAlign = scheduleRelayAutoAlign;
 
     // ---------- 波形 ----------
     let audioCtx = null, previewDisposed = false;
@@ -5023,7 +5023,7 @@ export function mountTimelineEditor(node) {
         const result = onConfigure?.apply(this, arguments);
         // 旧隐藏控件可能还保存着上次加载的 JSON；当前 DOM 编辑器的值追加在后，优先取它。
         const saved = savedTimelineValue(info);
-        setTimeout(() => { if (node.graph) { if (saved) restoreEditor(typeof saved === "string" ? saved : JSON.stringify(saved)); else { node._adH3MaterialsReady = true; updateMaterialOutputs(node, T.state); } applyLayoutHeight(); scheduleRelayAutoAlign(); } }, 0);
+        setTimeout(() => { if (node.graph) { if (saved) restoreEditor(typeof saved === "string" ? saved : JSON.stringify(saved)); else { node._adH3MaterialsReady = true; updateMaterialOutputs(node, T.state); } applyLayoutHeight(); } }, 0);
         return result;
     };
     const onRemoved = node.onRemoved;
@@ -5072,16 +5072,12 @@ export function mountTimelineEditor(node) {
         root.querySelectorAll("[data-unit]").forEach(item => item.classList.toggle("on", item.dataset.unit === T.unit));
         syncToggleA11y();
         $("[data-count]").value = recipe.count || DEFAULT_SEG_COUNT;
-        // v0.5.47：新建/首次挂载时也尝试自动对齐（潜桥已从已保存工作流载入时 onConfigure 不一定会再次触发）。
-        scheduleRelayAutoAlign(6, 200);
     }
     render();
     
     const prevConn = node.onConnectionsChange;
     node.onConnectionsChange = function () {
         const result = prevConn?.apply(this, arguments);
-        // v0.5.47：把素材清单接到分段节点（或改连线）后，等链接生效再自动对齐潜桥段长。
-        scheduleRelayAutoAlign(4, 150);
         node._adH3SyncPromptSegments?.();
         try { updateMaterialOutputs(node, T.state); } catch {}
         return result;

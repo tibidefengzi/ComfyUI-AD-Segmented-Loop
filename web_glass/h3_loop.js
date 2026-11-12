@@ -1410,8 +1410,9 @@ function mountRelayHint(node) {
         if (app.configuringGraph) return;
         const value = relayValue(selector?.value);
         if (!value) return;
+        // 潜桥开关只改参数并提示；时间线重排只由用户在素材清单点「应用分段」触发。
         const queue = connectedQueue();
-        if (queue && typeof queue._adH3ApplyRelayPlan === "function") queue._adH3ApplyRelayPlan(value);
+        if (queue && typeof queue._adH3RelayChoiceHint === "function") queue._adH3RelayChoiceHint(value);
     };
     const messages = {
         0: "关闭：按原有逐段生成，不启用潜桥。",

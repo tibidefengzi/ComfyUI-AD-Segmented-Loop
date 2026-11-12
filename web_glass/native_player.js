@@ -1015,8 +1015,8 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
 
     // 走 ComfyUI 原生“运行”按钮，保证顶部队列/活动任务状态同步显示
     node._adH3Run = () => {
-        // v0.5.47：点「开始」走原生运行按钮前，先让素材清单把潜桥段长对齐 17n（幂等）。
-        try { node._adH3EnsureRelayPlan?.(); } catch (_error) {}
+        // 潜桥开启但时间线未按 17n 重排时拦下并提示（重排只由素材清单「应用分段」触发）。
+        try { node._adH3EnsureRelayPlan?.(); } catch (error) { node._adH3Hint?.(error.message, true); return false; }
         if (node._adH3AffectedRunning) { node._adH3Hint?.("正在运行所选段，请等待完成或先点停止。", true); return false; }
         node._adH3FollowCurrent?.();
         previewPinned = false;
