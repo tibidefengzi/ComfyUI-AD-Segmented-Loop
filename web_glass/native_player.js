@@ -23,6 +23,8 @@ frameStyles.textContent=`
 .ad-h3-video.aiden-h3 .ad-h3-strips::-webkit-scrollbar-track{background:#141c28;border-radius:6px}
 .ad-h3-video.aiden-h3 .ad-h3-strips::-webkit-scrollbar-thumb{background:#4a658a;border-radius:6px;border:2px solid #141c28}
 .ad-h3-video.aiden-h3 .ad-h3-strips::-webkit-scrollbar-thumb:hover{background:#5f7ea6}
+/* 三条历史行保持各自内容高度，不允许被 flex 压扁（压缩会导致行内缩略图/分组行互相重叠）。 */
+.ad-h3-video.aiden-h3 .ad-h3-strips>.ad-h3-strip-row{flex:0 0 auto}
 `;
 document.head.append(frameStyles);
 }
