@@ -1552,15 +1552,23 @@ function mountRelayHint(node) {
         }
         refreshPanelWidgetHeight();
     };
+    const fitRelayPanelHeight = () => {
+        try {
+            const size = node.computeSize?.();
+            const target = Math.max(240, Math.round(Number(size?.[1]) || 0));
+            const current = Number(node.size?.[1]) || 0;
+            // 展开：不够高就长高；收起：把节点收回到内容高度（用户点按钮就是要收回去）。
+            if (target > 0 && (advancedOpen ? current < target - 1 : current > target + 2)) {
+                node.setSize([node.size[0], target]);
+                node.setDirtyCanvas?.(true, true);
+            }
+        } catch (_error) {}
+    };
     toggle.addEventListener("click", () => {
         advancedOpen = !advancedOpen;
         applyAdvanced(true);
-        if (advancedOpen) {
-            try {
-                const size = node.computeSize?.();
-                if (size && node.size[1] < size[1]) node.setSize([node.size[0], Math.round(size[1])]);
-            } catch (_error) {}
-        }
+        fitRelayPanelHeight();
+        requestAnimationFrame(fitRelayPanelHeight);
         node.setDirtyCanvas?.(true, true);
     });
     const rows = [];
