@@ -3,7 +3,7 @@
 // - 旧工作流：加载时把三个外部 H3Relay 节点迁移掉，保留连线/参数；之后同样走内部注入。
 // - 选择器 0 = 关闭，5/22/39 = 开启；C 直接由选择器决定。
 
-export const INTERNAL_TYPES = ["ADH3InternalBridge", "ADH3InternalSave", "ADH3InternalTrim", "ADH3InternalAppearanceAnchor", "AD_FinalSink"];
+export const INTERNAL_TYPES = ["ADH3InternalBridge", "ADH3InternalSave", "ADH3InternalTrim", "ADH3InternalAppearanceAnchor", "ADH3InternalReanchorGuide", "AD_FinalSink"];
 export const RELAY_LABELS = {
     0: "0 · 关闭",
     5: "5 · 上下文5帧",
@@ -38,7 +38,7 @@ function widget(node, name) {
 // 锚定配置保存在节点 properties（不新增原生 widget，旧工作流 widget_values 不受影响）。
 // 默认：锚强度 1（全强）、外观锚每 3 段、历史锚/声锚关闭。
 // v0.5.50：删除无效/未验证的 锚定强度、历史锚、声锚；新增 桥接模式 / 质感还原。
-export const ANCHOR_DEFAULTS = { appearance: 3, segment_correction: 0, texture_restore: 0, bridge_mode: 0 };
+export const ANCHOR_DEFAULTS = { appearance: 3, segment_correction: 0, texture_restore: 0, bridge_mode: 0, reanchor_guide: 0 };
 const ANCHOR_APPEARANCE_STEPS = [0, 1, 2, 3, 5, 7, 10];
 
 export function normalizeAnchorConfig(raw) {
@@ -52,6 +52,8 @@ export function normalizeAnchorConfig(raw) {
     }
     const bridge = Number(raw.bridge_mode);
     cfg.bridge_mode = Number.isFinite(bridge) && bridge > 0 ? 1 : 0;
+    const guide = Number(raw.reanchor_guide);
+    cfg.reanchor_guide = [0, 5, 22, 39, 56].includes(guide) ? guide : 0;
     return cfg;
 }
 
@@ -298,6 +300,16 @@ function replaceNodeType(graph, oldNode, newType) {
     return ctor;
 }
 
+function findVideoVaeLink(prompt) {
+    for (const candidate of Object.values(prompt || {})) {
+        const cls = String(candidate?.class_type || "");
+        if (!/RemakeConditioning|ReferenceToVideo|H3.*Conditioning/i.test(cls)) continue;
+        const link = candidate?.inputs?.vae;
+        if (Array.isArray(link) && link.length === 2) return link;
+    }
+    return null;
+}
+
 function nextNumericId(prompt) {
     let max = 0;
     for (const key of Object.keys(prompt || {})) {
@@ -418,6 +430,29 @@ export function injectHiddenRelay(serialized, graph) {
                 guider.inputs.conditioning = [anchorId, 0];
             } else {
                 console.warn("[AD-潜桥] 外观/历史锚未生效：找不到 BasicGuider 的 conditioning 输入");
+            }
+        }
+        // 重锚定尾帧锚定：仅重锚定段生效；把上一段成片最后 N 帧作为硬件 guide 锚到本段预卷开头。
+        if (anchorConfig.reanchor_guide > 0) {
+            const guideVae = remakeVaeLink || findVideoVaeLink(prompt);
+            const guideGuiderLink = promptLink(sampler, "guider");
+            const guideGuider = guideGuiderLink ? prompt[String(guideGuiderLink[0])] : null;
+            const guideConditioning = guideGuider ? promptLink(guideGuider, "conditioning") : null;
+            if (guideGuider && guideConditioning && guideVae) {
+                const guideId = String(id++);
+                prompt[guideId] = {
+                    class_type: "ADH3InternalReanchorGuide",
+                    inputs: {
+                        conditioning: guideConditioning,
+                        relay_context: [segId, contextIdx],
+                        vae: guideVae,
+                        anchor_config: anchorJson,
+                    },
+                    _meta: { title: "AD-重锚定尾帧锚定" },
+                };
+                guideGuider.inputs.conditioning = [guideId, 0];
+            } else {
+                console.warn("[AD-潜桥] 重锚定尾帧锚定未生效：缺少 VAE 或 guider conditioning");
             }
         }
         prompt[saveId] = {

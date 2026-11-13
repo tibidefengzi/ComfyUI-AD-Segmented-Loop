@@ -162,7 +162,7 @@ function adSetWidgetReadOnly(widget, value){
 
 const SEGMENT_DEFAULT_WIDTH = 390;
 const SEGMENT_MIN_RESTORE_WIDTH = 350; // 保留旧版默认宽度及更宽的自定义尺寸。
-const RELAY_PANEL_HEIGHT = 334;          // 潜桥续接 + 高级设置展开（重锚定/色彩匹配/锚强度/外观锚/历史锚/声锚）
+const RELAY_PANEL_HEIGHT = 368;          // 潜桥续接 + 高级设置展开（重锚定/尾帧锚定/色彩匹配/外观锚/整段校正/质感还原/桥接模式）
 const RELAY_ADVANCED_COLLAPSED_HEIGHT = 118; // 只显示「潜桥续接」+ 高级设置开关（三块统一 30px）
 const LEGACY_RELAY_HINT_HEIGHT = 30;
 const AD_INITIAL_SIZES = {AidenH3AudioQueue: [1120, 1411], AidenH3Segment: [SEGMENT_DEFAULT_WIDTH, 0], AidenH3VideoPreview: [760, 785]};
@@ -1452,6 +1452,7 @@ function mountRelayHint(node) {
         segment_correction: [[0, "0 · 关闭"], [0.5, "0.5 · 半强"], [1, "1 · 全强"]],
         texture_restore: [[0, "0 · 关闭"], [0.5, "0.5 · 半强"], [1, "1 · 全强"]],
         bridge_mode: [[0, "0 · 直接 latent（默认）"], [1, "1 · 像素质量复位（实验）"]],
+        reanchor_guide: [[0, "0 · 关闭"], [5, "5 帧"], [22, "22 帧"], [39, "39 帧"]],
     };
     const anchorRows = [];
     const anchorHints = {
@@ -1459,6 +1460,7 @@ function mountRelayHint(node) {
         segment_correction: "生成后按第 1 段成片的皮肤/服装色均值做整段固定偏移（不逐帧）；治逐段皮肤/服装色漂。",
         texture_restore: "生成后按第 1 段成片的细节水平做自适应轻度锐化（不重新生成、不逐帧）；治后段发糊/发油。",
         bridge_mode: "桥接上下文来源：直接 latent（现状）或像素质量复位（上一段成片尾帧→锐化→VAE重编码，切断越跑越糊的复利链；失败自动回退）。",
+        reanchor_guide: "重锚定段把上一段成片最后 N 帧作为 guide 锚定到本段预卷开头（guide 每步注入、不参与去噪）；N 取 5/22/39，超过潜桥 C 时自动降到 C；0=关闭。",
     };
     const saveAnchorConfig = () => {
         try {
@@ -1633,6 +1635,7 @@ function mountRelayHint(node) {
     addAnchorRow("整段校正", "segment_correction");
     addAnchorRow("质感还原", "texture_restore");
     addAnchorRow("桥接模式", "bridge_mode");
+    addAnchorRow("重锚定锚定", "reanchor_guide");
     panel.appendChild(hint);
     applyAdvanced(false);
     const updateHint = () => {

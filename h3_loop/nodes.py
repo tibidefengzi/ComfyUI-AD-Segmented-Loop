@@ -2425,8 +2425,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
 #   · 声锚   = voice_anchor_stage=0，用第 1 段的音频 latent 作为音色锚。
 # v0.5.50：删除无效/未验证选项（锚定强度、历史锚、声锚）；保留实测有效的 外观锚/整段校正，
 # 新增 桥接模式（像素质量复位）与 质感还原。
-ANCHOR_DEFAULTS = {"appearance": 3, "segment_correction": 0.0, "texture_restore": 0.0, "bridge_mode": 0}
+ANCHOR_DEFAULTS = {"appearance": 3, "segment_correction": 0.0, "texture_restore": 0.0, "bridge_mode": 0, "reanchor_guide": 0}
 ANCHOR_APPEARANCE_STEPS = (0, 1, 2, 3, 5, 7, 10)
+ANCHOR_GUIDE_STEPS = (0, 5, 22, 39, 56)
 _CHAIN_COLOR_CACHE = {}
 _ANCHOR_STAGE_CACHE = {}
 
@@ -2458,6 +2459,11 @@ def parse_anchor_config(raw):
     except (TypeError, ValueError):
         bridge = int(data["bridge_mode"])
     data["bridge_mode"] = 1 if bridge else 0
+    try:
+        guide = int(parsed.get("reanchor_guide", data["reanchor_guide"]))
+    except (TypeError, ValueError):
+        guide = int(data["reanchor_guide"])
+    data["reanchor_guide"] = guide if guide in ANCHOR_GUIDE_STEPS else 0
     return data
 
 
@@ -2828,6 +2834,75 @@ class ADH3InternalAppearanceAnchor:
             return (conditioning,)
         ctx["ad_appearance_refs"] = 1
         print("[AD-潜桥] 第 %d 段锚定：追加 1 个外观锚参考块（第1段）" % (stage + 1,))
+        return (out,)
+
+
+class ADH3InternalReanchorGuide:
+    """内部重锚定 guide：把上一段成片最后 N 帧作为 H3 keyframe guide 锚定到本段预卷开头。
+
+    仅重锚定段生效；guide 每步注入、不参与去噪，等于给独立重锚定段一段“硬上下文”，
+    让本段从上一段画面之后继续写，压掉重锚定冷启动的接缝跳变。
+    """
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "conditioning": ("CONDITIONING",),
+            "relay_context": ("H3_LOOP_CONTEXT",),
+        }, "optional": {
+            "vae": ("VAE",),
+            "anchor_config": ("STRING", {"default": "{}"}),
+        }}
+    RETURN_TYPES = ("CONDITIONING",)
+    FUNCTION = "run"
+    CATEGORY = CATEGORY
+    OUTPUT_NODE = False
+
+    def run(self, conditioning, relay_context, vae=None, anchor_config="{}"):
+        ctx = relay_context if isinstance(relay_context, dict) else {}
+        cfg = parse_anchor_config(anchor_config)
+        want = int(cfg.get("reanchor_guide") or 0)
+        ctx["ad_reanchor_guide_frames"] = 0
+        stage = int(ctx.get("relay_stage_index") or 0)
+        if stage <= 0 or not ctx.get("relay_reanchor") or want <= 0:
+            return (conditioning,)
+        if vae is None:
+            print("[AD-重锚定] 缺少视频 VAE，跳过上一段尾帧锚定")
+            return (conditioning,)
+        trim = int(ctx.get("relay_trim_frames") or ctx.get("relay_context_frames") or 0)
+        limit = min(want, trim) if trim > 0 else want
+        candidates = [g for g in range(5, limit + 1, 17)][::-1]
+        path = _prev_segment_file(ctx)
+        images, guide = None, 0
+        for frames in candidates:
+            if path is None:
+                break
+            decoded = _decode_tail_frames(path, frames)
+            if decoded is not None:
+                images, guide = decoded, frames
+                break
+        if images is None:
+            print("[AD-重锚定] 第 %d 段：找不到上一段成片尾帧，跳过 guide 锚定" % (stage + 1,))
+            return (conditioning,)
+        try:
+            width = int(ctx.get("width") or 0)
+            height = int(ctx.get("height") or 0)
+            if width > 0 and height > 0 and (int(images.shape[1]) != height or int(images.shape[2]) != width):
+                import comfy.utils
+                images = comfy.utils.common_upscale(
+                    images.movedim(-1, 1), width, height, "bilinear", "center").movedim(1, -1)
+            latent = vae.encode(images)
+            keyframe = {"resolved_frame_index": 0, "latent": latent}
+            keyframes = list(conditioning[0][1].get("minimax_keyframes", [])) if conditioning else []
+            keyframes.append(keyframe)
+            import node_helpers
+            out = node_helpers.conditioning_set_values(conditioning, {"minimax_keyframes": keyframes})
+        except Exception as exc:
+            print("[AD-重锚定] 第 %d 段：guide 锚定失败，保持原条件（%r）" % (stage + 1, exc))
+            ctx["ad_reanchor_guide_frames"] = 0
+            return (conditioning,)
+        ctx["ad_reanchor_guide_frames"] = int(guide)
+        print("[AD-重锚定] 第 %d 段：锚定上一段成片尾 %d 帧到本段预卷开头（guide 不参与去噪）"
+              % (stage + 1, int(guide)))
         return (out,)
 
 
@@ -3423,6 +3498,7 @@ def _segment_effective_audit(ctx, anchor_config):
         "seam_deflicker_window": ((ctx or {}).get("ad_seam") or {}).get("deflicker_window"),
         "seam_deflicker_frames": ((ctx or {}).get("ad_seam") or {}).get("deflicker_frames"),
         "seam_reanchor": ((ctx or {}).get("ad_seam") or {}).get("reanchor"),
+        "reanchor_guide_frames": int((ctx or {}).get("ad_reanchor_guide_frames") or 0),
     }
 
 
@@ -3547,6 +3623,7 @@ _INTERNAL_RELAY_KEYS = {
     "ADH3InternalSave": "save",
     "ADH3InternalTrim": "trim",
     "ADH3InternalAppearanceAnchor": "anchor",
+    "ADH3InternalReanchorGuide": "guide",
 }
 if _relay_vendor_runtime is not None:
     for _key, _kind in _INTERNAL_RELAY_KEYS.items():
@@ -3562,6 +3639,9 @@ if _relay_vendor_runtime is not None:
         elif _kind == "anchor":
             NODE_CLASS_MAPPINGS[_key] = ADH3InternalAppearanceAnchor
             NODE_DISPLAY_NAME_MAPPINGS[_key] = "AD-内部锚定"
+        elif _kind == "guide":
+            NODE_CLASS_MAPPINGS[_key] = ADH3InternalReanchorGuide
+            NODE_DISPLAY_NAME_MAPPINGS[_key] = "AD-重锚定尾帧锚定"
 
     # 旧工作流无感加载：外部插件未安装时，注册上游三个旧类型为兼容层。
     # 外部插件已安装时跳过，避免同名类型重复注册。
