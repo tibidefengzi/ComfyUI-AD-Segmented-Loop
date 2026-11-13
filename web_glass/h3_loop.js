@@ -1406,6 +1406,26 @@ function mountRelayHint(node) {
     const selector = (node.widgets || []).find(item => item.name === "潜桥续接");
     const reanchor = (node.widgets || []).find(item => item.name === "潜桥重锚定");
     const colorMatch = (node.widgets || []).find(item => item.name === "参考首帧色彩匹配");
+    const LEGACY_COLOR_MATCH = {
+        "0.5 · 半强": "跟随源片",
+        "1 · 全强": "跟随源片",
+        "0.5 · 全链统一（第1段）": "全链统一（第1段）",
+        "1 · 全链统一（第1段）": "全链统一（第1段）",
+    };
+    const migrateLegacyColorMatch = () => {
+        if (!colorMatch) return false;
+        const current = String(colorMatch.value ?? "");
+        const mapped = LEGACY_COLOR_MATCH[current];
+        if (!mapped || mapped === current) return false;
+        colorMatch.value = mapped;
+        try { colorMatch.callback?.call(colorMatch, mapped); } catch (_error) {}
+        try {
+            node.properties ||= {};
+            node.properties.ad_h3_color_match_migrated = true;
+            node.graph?.change?.();
+        } catch (_error) {}
+        return true;
+    };
     const applyMaterialPlan = () => {
         if (app.configuringGraph) return;
         const value = relayValue(selector?.value);
@@ -1422,10 +1442,7 @@ function mountRelayHint(node) {
     };
     const relayOptions = ["0 · 关闭", "5 · 上下文5帧", "22 · 上下文22帧（推荐）", "39 · 上下文39帧"];
     const reanchorOptions = ["0 · 不重锚定", "2 · 每2段", "3 · 每3段", "5 · 每5段", "7 · 每7段", "10 · 每10段"];
-    const colorOptions = [
-        "0 · 关闭", "0.5 · 半强", "1 · 全强",
-        "0.5 · 全链统一（第1段）", "1 · 全链统一（第1段）",
-    ];
+    const colorOptions = ["0 · 关闭", "跟随源片", "全链统一（第1段）"];
     // ---- 潜桥锚定（锚强度 / 外观锚 / 历史锚 / 声锚）：存在 node.properties，不新增原生 widget ----
     let anchorCfg = anchorConfigOf(node);
     // v0.5.50：删除实测无效果/未验证的 锚定强度、历史锚、声锚；保留实测有效的 外观锚/整段校正，
@@ -1605,7 +1622,13 @@ function mountRelayHint(node) {
     panel.appendChild(toggle);
     panel.appendChild(advanced);
     addRow("重锚定", reanchor, reanchorOptions, undefined, advanced);
-    addRow("色彩匹配", colorMatch, colorOptions, undefined, advanced);
+    const colorRow = addRow("色彩匹配", colorMatch, colorOptions, undefined, advanced);
+    if (colorRow) {
+        try {
+            colorRow.select.title = "关闭=不校正；跟随源片=逐段按本段参考首帧校正并限制相邻段偏移（保留真实明暗/色温变化）；全链统一（第1段）=所有段固定往第1段参考首帧拉，仅适合光照固定的素材。";
+        } catch (_error) {}
+    }
+    migrateLegacyColorMatch();
     addAnchorRow("外观锚", "appearance");
     addAnchorRow("整段校正", "segment_correction");
     addAnchorRow("质感还原", "texture_restore");

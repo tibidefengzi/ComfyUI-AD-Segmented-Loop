@@ -1392,7 +1392,7 @@ class AidenH3Segment:
                              "潜桥模式": (list(RELAY_MODES), {"default": "关闭", "tooltip": "关闭=原有逐段生成；普通多参考=自选17倍数段长做潜桥；动作迁移预卷=源视频动作迁移/人物替换，前置预卷后裁头，保持65帧等任意目标帧数"}),
                              "潜桥上下文帧数": (list(RELAY_CONTEXTS), {"default": "22", "tooltip": "旧参数：兼容旧工作流，前端会自动迁移"}),
                              "潜桥重锚定": (list(RELAY_REANCHOR_CHOICES), {"default": "0 · 不重锚定", "tooltip": "每 N 段按独立段重新生成（第 N、2N…段：桥不读上一段/第 1 段 latent，跳过外观/历史锚）；预卷/裁头与潜桥续接一致：生成=输出+C、裁头C（前 C 帧为模型热身，裁掉不进成片）。既不继承上一段 latent（不产生质感复利），又保留正常预卷（成片从稳定帧开始，接缝不闪跳）；第 1 段因无前序内容固定 5 帧。0=关闭"}),
-                             "参考首帧色彩匹配": (list(_COLOR_MATCH_CHOICES), {"default": "0 · 关闭", "tooltip": "按本段参考视频首帧的亮度/白平衡校正生成画面（整段固定偏移，不逐帧自动增益，不做 VAE 往返）；0=关闭"})},
+                         "参考首帧色彩匹配": (list(_COLOR_MATCH_CHOICES), {"default": "0 · 关闭", "tooltip": "关闭=不校正；跟随源片=逐段按本段参考首帧校正，并限制相邻段偏移（保留真实明暗/色温变化）；全链统一（第1段）=所有段固定往第1段参考首帧拉，仅适合光照固定的素材。整段固定偏移、不逐帧自动增益、不做 VAE 往返。"})},
                 "hidden": {"prompt": "PROMPT", "unique_id": "UNIQUE_ID", "extra_pnginfo": "EXTRA_PNGINFO"}}
 
     RETURN_TYPES = SegmentOutputTypes(SEGMENT_FIXED_TYPES + tuple(
@@ -1643,6 +1643,9 @@ class AidenH3Segment:
                    "relay_reanchor": bool(relay_reanchor),
                    "relay_reanchor_every": int(relay_reanchor_every),
                    "color_match_blend": float(color_match_blend),
+                   "color_match_chain": bool(color_match_chain),
+                   "color_match_mode": ("chain" if color_match_chain else
+                                        ("follow" if color_match_blend > 0 else "off")),
                    **window}
         source_video = _source_video(entry["source_video"], state) if (need(12) and entry.get("source_video")) else None
         original_audio = _original_audio(entry, state, index) if need(13) and not batch_source else None

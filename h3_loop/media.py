@@ -54,6 +54,25 @@ def snap_images_to_h3(images, alpha=None):
                            "crop_xy": [left, top]}
 
 
+def _previous_color_match(state, index):
+    """上一段已提交版本的色彩校正记录（用于跟随源片的跨段平滑）；没有返回 None。"""
+    try:
+        rows = state.get("segments") or []
+        index = int(index or 0)
+        if index <= 0 or index > len(rows):
+            return None
+        row = rows[index - 1]
+        selected = row.get("selected")
+        versions = row.get("versions") or []
+        version = next((item for item in versions if item.get("id") == selected), None) or (versions[-1] if versions else None)
+        info = (version or {}).get("color_match")
+        if isinstance(info, dict) and info.get("mode") == "follow":
+            return info
+    except Exception:
+        return None
+    return None
+
+
 def normalize_video(video,context,state,directory,strict_sync=False):
     """Keep exactly the independent target frames; never freeze missing frames.
 
@@ -110,8 +129,13 @@ def normalize_video(video,context,state,directory,strict_sync=False):
     color_info=None
     try:
         from .color_match import apply_reference_color_match
-        body,color_info=apply_reference_color_match(body,context.get("color_match_reference"),context.get("color_match_blend") or 0.0)
+        color_mode=context.get("color_match_mode") or ("chain" if context.get("color_match_chain") else "follow")
+        previous_color=_previous_color_match(current,context.get("index")) if color_mode=="follow" else None
+        body,color_info=apply_reference_color_match(
+            body,context.get("color_match_reference"),context.get("color_match_blend") or 0.0,
+            previous=previous_color,smooth=(color_mode=="follow"))
         if color_info:
+            color_info["mode"]=color_mode
             print("[AD-颜色] 参考首帧色彩匹配：%s" % color_info)
     except Exception as exc:
         print("[AD-颜色] 参考首帧色彩匹配失败（保留原画面）：%r" % (exc,))
