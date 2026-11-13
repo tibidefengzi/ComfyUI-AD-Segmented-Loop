@@ -3161,18 +3161,30 @@ def _row_from_round_snapshot(session_id, round_key, stage):
         return None
 
 
-def _segment_file_last_frame(session_id, stage, round_key="", prefer_snapshot=False):
+def _segment_file_last_frame(session_id, stage, round_key="", prefer_snapshot=False, mode=None):
+    """读某会话第 stage 段（0 基）已提交成片最后一帧的 RGB 均值；失败返回 None。
+
+    mode:
+      "rows"        只读会话当前 segments（当前选用版本，含恢复旧组/换版后的状态）
+      "snapshot"    只读该轮 groups/round_XXXXXX.json 归档快照
+      "snapshot_first"/None/prefer_snapshot  旧行为（兼容旧调用/测试）
+    """
     try:
         stage = int(stage)
     except (TypeError, ValueError):
         return None
     if not session_id or stage < 0:
         return None
-    getters = [
-        lambda: _row_from_round_snapshot(session_id, round_key, stage),
-        lambda: _row_from_session_rows(session_id, stage),
-    ]
-    ordered = getters if prefer_snapshot else [getters[1], getters[0]]
+    snapshot_getter = lambda: _row_from_round_snapshot(session_id, round_key, stage)
+    rows_getter = lambda: _row_from_session_rows(session_id, stage)
+    if mode == "rows":
+        ordered = [rows_getter]
+    elif mode == "snapshot":
+        ordered = [snapshot_getter]
+    elif mode == "snapshot_first" or prefer_snapshot:
+        ordered = [snapshot_getter, rows_getter]
+    else:
+        ordered = [rows_getter, snapshot_getter]
     for getter in ordered:
         row = getter()
         path = _version_file_path(session_id, row) if row is not None else None
@@ -3184,8 +3196,17 @@ def _segment_file_last_frame(session_id, stage, round_key="", prefer_snapshot=Fa
     return None
 
 
+def _session_round_no(session_id):
+    """会话当前轮次号（恢复旧组后即为该组轮号）。"""
+    try:
+        from .storage import STORE
+        state = STORE.read(session_id)
+        return int(state.get("round_no") or 0)
+    except Exception:
+        return 0
+
+
 def _round_key_of(ctx):
-    """只有正整数 round_no 才当作历史轮键；0/空值/round_id 非数字一律视为无轮次。"""
     try:
         number = int((ctx or {}).get("round_no") or 0)
     except (TypeError, ValueError):
@@ -3194,29 +3215,36 @@ def _round_key_of(ctx):
 
 
 def _previous_segment_last_frame(ctx, stage):
+    """上一段成片末帧的 RGB 均值（0..1 tensor），失败返回 None。
+
+    取帧规则（防取错轮）：
+    1. 当前会话按当前选用版本（rows）读取；子会话文件缺失时再看父会话。
+    2. 父会话当前轮号 == 目标轮号（用户恢复旧组/换版后）→ 读父会话当前选用版本；
+       否则只读该轮归档快照。
+    3. 目标轮快照/文件缺失时直接跳过（返回 None），绝不回退到父会话当前轮。
+    """
     try:
         import torch
     except Exception:
         return None
     round_key = _round_key_of(ctx)
+    target = int(round_key) if round_key else 0
     sid = str((ctx or {}).get("session_id") or "")
     parent = str((ctx or {}).get("preview_parent_session") or "")
-    is_child = sid.startswith("trial_")
-    if is_child and not round_key:
-        print("[AD-接缝] 抽卡子会话缺少有效轮次号：跳过父会话当前轮回退（避免曝光目标取错）")
-        means = _segment_file_last_frame(sid, int(stage) - 1, "", prefer_snapshot=False)
-    else:
-        means = None
-        tries = []
-        if sid:
-            tries.append((sid, False))
-        if parent and parent != sid:
-            tries.append((parent, True))
-        for session_id, prefer_snapshot in tries:
-            means = _segment_file_last_frame(session_id, int(stage) - 1, round_key,
-                                             prefer_snapshot=prefer_snapshot)
-            if means is not None:
-                break
+    means = None
+    if sid:
+        means = _segment_file_last_frame(sid, int(stage) - 1, "", mode="rows")
+    if means is None and parent and parent != sid:
+        if not target:
+            print("[AD-接缝] 抽卡子会话缺少有效轮次号：不回退父会话（避免曝光目标取错）")
+        else:
+            parent_round = _session_round_no(parent)
+            if parent_round == target:
+                # 父会话状态就是目标轮（含恢复旧组/换版）：以当前选用版本为准，避免读到换版前快照。
+                means = _segment_file_last_frame(parent, int(stage) - 1, round_key, mode="rows")
+            else:
+                # 历史轮：只读该轮归档快照，缺失就跳过，不回退当前轮。
+                means = _segment_file_last_frame(parent, int(stage) - 1, round_key, mode="snapshot")
     if means is None:
         return None
     return torch.tensor(means, dtype=torch.float32)
@@ -3238,10 +3266,11 @@ def _smooth_curve(values, radius=2):
 
 
 def _apply_seam_transition(images, ctx, anchor_config="{}"):
-    """接缝过渡：前 N 帧每通道增益对齐上一段末 5 帧中位数；重锚定段随后做自适应整段去闪。
+    """接缝过渡：前 N 帧每通道增益对齐上一段末 5 帧中位数；重锚定段随后做自适应去闪。
 
     参数（anchor_config 可覆盖）：seam_frames / seam_strength / seam_deflicker。
-    限幅：整体亮度增益 0.8–1.25，通道相对偏差 ≤5%（色度比亮度更保守）。
+    seam_frames=0 表示显式关闭段首过渡；段首无需修正时只跳过段首，后续去闪仍执行。
+    去闪窗口两端带渐变包络，窗口进出口不改变相邻帧亮度。
     """
     try:
         stage = int((ctx or {}).get("relay_stage_index") or 0)
@@ -3262,10 +3291,12 @@ def _apply_seam_transition(images, ctx, anchor_config="{}"):
         raw = parsed if isinstance(parsed, dict) else {}
     except Exception:
         raw = {}
+    default_frames = 24 if reanchor else 12
     try:
-        frames = int(raw.get("seam_frames") or (24 if reanchor else 12))
+        explicit = "seam_frames" in raw and raw.get("seam_frames") is not None
+        frames = int(raw.get("seam_frames")) if explicit else default_frames
     except (TypeError, ValueError):
-        frames = 24 if reanchor else 12
+        frames = default_frames
     frames = max(0, min(48, frames))
     try:
         strength = float(raw.get("seam_strength", 1.0))
@@ -3283,13 +3314,16 @@ def _apply_seam_transition(images, ctx, anchor_config="{}"):
         import torch
         total = int(images.shape[0])
         out = images.clone()
-        n = 0
-        info = {"frames": 0, "method": "per_channel_gain", "strength": round(strength, 3),
-                "gain_first": [1.0, 1.0, 1.0], "gain_range": [1.0, 1.0],
+        head_window = int(min(frames, total)) if (frames > 0 and strength > 0) else 0
+        head_applied = False
+        info = {"frames": head_window, "head_applied": False, "method": "per_channel_gain",
+                "strength": round(strength, 3), "gain_first": [1.0, 1.0, 1.0],
+                "gain_range": [1.0, 1.0],
                 "prev_means": [round(float(v), 4) for v in prev.view(3).tolist()],
-                "deflicker": round(deflicker, 3), "deflicker_frames": 0, "reanchor": reanchor}
-        if frames > 0 and strength > 0:
-            n = min(frames, total)
+                "deflicker": round(deflicker, 3), "deflicker_window": 0,
+                "deflicker_frames": 0, "reanchor": reanchor}
+        if head_window >= 1:
+            n = head_window
             head = images[:n].detach().float()
             means = head.mean(dim=(1, 2))
             smooth = _smooth_curve(means, radius=2)
@@ -3307,19 +3341,19 @@ def _apply_seam_transition(images, ctx, anchor_config="{}"):
                 1.0 - _SEAM_CHROMA_REL, 1.0 + _SEAM_CHROMA_REL)
             gain = global_gain.view(n, 1) * relative
             gain = 1.0 + (gain - 1.0) * strength
-            if float((gain - 1.0).abs().max()) < 0.005:
-                return images
-            if n >= 3:
-                tail = min(3, n - 1)
-                factors = torch.tensor([1.0 - k / float(tail) for k in range(tail + 1)],
-                                       dtype=torch.float32, device=images.device).view(-1, 1)
-                gain[n - tail - 1:] = 1.0 + (gain[n - tail - 1:] - 1.0) * factors
-            out[:n] = (out[:n] * gain.view(n, 1, 1, 3)).clamp(0.0, 1.0)
-            info.update(frames=n,
-                        gain_first=[round(float(v), 4) for v in gain[0].tolist()],
-                        gain_range=[round(float(gain.min()), 4), round(float(gain.max()), 4)])
-        if deflicker > 0 and total > n:
-            start = n
+            if float((gain - 1.0).abs().max()) >= 0.005:
+                if n >= 3:
+                    tail = min(3, n - 1)
+                    factors = torch.tensor([1.0 - k / float(tail) for k in range(tail + 1)],
+                                           dtype=torch.float32, device=images.device).view(-1, 1)
+                    gain[n - tail - 1:] = 1.0 + (gain[n - tail - 1:] - 1.0) * factors
+                out[:n] = (out[:n] * gain.view(n, 1, 1, 3)).clamp(0.0, 1.0)
+                head_applied = True
+                info.update(head_applied=True,
+                            gain_first=[round(float(v), 4) for v in gain[0].tolist()],
+                            gain_range=[round(float(gain.min()), 4), round(float(gain.max()), 4)])
+        if deflicker > 0 and total > head_window:
+            start = head_window
             end = min(total, start + _SEAM_DEFLICKER_WINDOW)
             if end > start + 2:
                 body = out[start:end].detach().float()
@@ -3329,13 +3363,29 @@ def _apply_seam_transition(images, ctx, anchor_config="{}"):
                 weight = ((residual.abs() - 0.03) / 0.03).clamp(0.0, 1.0)
                 gain_luma = (smooth_luma / luma.clamp(min=1e-3)).clamp(0.85, 1.15)
                 blend = 1.0 + (gain_luma - 1.0) * deflicker * weight
+                length = int(end - start)
+                # 两端渐变：窗口首/末帧修正为 0，向中间渐入渐出，避免去闪在窗口边界“突然介入/退出”。
+                edge = max(1, min(12, int(length // 4) or 1))
+                index = torch.arange(length, dtype=torch.float32, device=images.device)
+                envelope = torch.minimum(index / float(edge), (length - 1 - index) / float(edge)).clamp(0.0, 1.0)
+                blend = 1.0 + (blend - 1.0) * envelope
                 out[start:end] = (out[start:end] * blend.view(-1, 1, 1, 1)).clamp(0.0, 1.0)
-                info["deflicker_frames"] = int(end - start)
+                changed = int(((blend - 1.0).abs() > 1e-4).sum().item())
+                info["deflicker_window"] = int(length)
+                info["deflicker_frames"] = changed
+        if not head_applied and int(info.get("deflicker_frames") or 0) == 0:
+            # 未做任何改动：显式参数时仍写审计（便于核对 0 值确实生效），否则保持旧行为不写 ad_seam。
+            if any(key in raw for key in ("seam_frames", "seam_strength", "seam_deflicker")):
+                ctx["ad_seam"] = info
+            return images
         ctx["ad_seam"] = info
-        print("[AD-接缝] 第 %d 段%s：前 %d 帧每通道增益过渡 gain0=%s 范围=[%s,%s]%s"
-              % (stage + 1, "（重锚定）" if reanchor else "", info["frames"], info["gain_first"],
+        print("[AD-接缝] 第 %d 段%s：段首 %d 帧增益%s gain0=%s 范围=[%s,%s]%s"
+              % (stage + 1, "（重锚定）" if reanchor else "", info["frames"],
+                 "生效" if head_applied else "已对齐无需修正", info["gain_first"],
                  info["gain_range"][0], info["gain_range"][1],
-                 "，自适应去闪 %.2f（%d 帧）" % (deflicker, info["deflicker_frames"]) if info["deflicker_frames"] else ""))
+                 "，自适应去闪 %.2f（窗口 %d 帧，实际改动 %d 帧）"
+                 % (deflicker, info["deflicker_window"], info["deflicker_frames"])
+                 if info["deflicker_window"] else ""))
         return out
     except Exception as exc:
         print("[AD-接缝] 接缝曝光过渡失败（保留原画面）：%r" % (exc,))
@@ -3360,12 +3410,14 @@ def _segment_effective_audit(ctx, anchor_config):
         "bridge_mode": int(cfg.get("bridge_mode") or 0),
         "bridge_used": (ctx or {}).get("ad_bridge_used"),
         "seam_frames": int(((ctx or {}).get("ad_seam") or {}).get("frames") or 0),
+        "seam_head_applied": ((ctx or {}).get("ad_seam") or {}).get("head_applied"),
         "seam_method": ((ctx or {}).get("ad_seam") or {}).get("method"),
         "seam_strength": ((ctx or {}).get("ad_seam") or {}).get("strength"),
         "seam_gain_first": ((ctx or {}).get("ad_seam") or {}).get("gain_first"),
         "seam_gain_range": ((ctx or {}).get("ad_seam") or {}).get("gain_range"),
         "seam_prev_means": ((ctx or {}).get("ad_seam") or {}).get("prev_means"),
         "seam_deflicker": ((ctx or {}).get("ad_seam") or {}).get("deflicker"),
+        "seam_deflicker_window": ((ctx or {}).get("ad_seam") or {}).get("deflicker_window"),
         "seam_deflicker_frames": ((ctx or {}).get("ad_seam") or {}).get("deflicker_frames"),
         "seam_reanchor": ((ctx or {}).get("ad_seam") or {}).get("reanchor"),
     }
