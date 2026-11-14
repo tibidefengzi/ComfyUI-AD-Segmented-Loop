@@ -158,7 +158,8 @@ def _recover_old_round_chain(sid, parent, origin_state, target, trial_round, tar
     shared = bool(relay_id) and (
         relay_id == str(parent.get("relay_run_id") or "")
         or relay_id in group_history.shared_relay_run_ids(STORE, parent))
-    stage = relay_parent_stage(target, reanchor)
+    # 重锚定已改为软重置：依赖上一段的 latent/成片，不再依赖第 1 段外观锚。
+    stage = relay_parent_stage(target, False)
     new_chain_required = not relay_id or shared
     if not new_chain_required and (stage is None or _stage_path(chain, stage).is_file()):
         return chain
@@ -166,7 +167,7 @@ def _recover_old_round_chain(sid, parent, origin_state, target, trial_round, tar
     new_chain = _stable_run(sid, new_relay)
     if stage is not None:
         parent_version = _pick_parent_version(origin_segments, stage + 1, target_version)
-        dependency = "第 1 段外观锚" if reanchor else f"第 {stage + 1} 段的 latent"
+        dependency = f"第 {stage + 1} 段的 latent"
         if not parent_version:
             raise ValueError(
                 f"第 {trial_round} 轮第 {target + 1} 段回抽无法确定{dependency}的版本。"
@@ -204,10 +205,9 @@ def _plan_current_reroll(sid, parent, target, preview, relay_on, reanchor=False)
             raise ValueError(
                 "该卡片属于上一批次的旧结果，还没有归档为独立轮次，不能直接接到当前轮。"
                 "请先点一次「新建一组」（会把当前批次归档成历史轮且保留结果），再回到该轮抽卡。")
-    stage = relay_parent_stage(target, reanchor)
+    # 重锚定已改为软重置：需要上一段的 latent/成片（不再是第 1 段外观锚）。
+    stage = relay_parent_stage(target, False)
     if stage is not None and not _stage_path(chain, stage).is_file():
-        if reanchor:
-            raise ValueError(f"第 {target + 1} 段重锚定需要本轮第 1 段外观锚。请先生成并通过第 1 段。")
         raise ValueError(
             "第 %d 段抽卡需要第 %d 段的 latent，但当前新一轮还没有 stage_%05d。"
             "请先在新一轮生成并通过第 %d 段，再抽第 %d 段。"

@@ -1396,7 +1396,7 @@ function mountRelayAdvancedPanel(node) {
         try { w.computeSize = () => [0, 0]; } catch (_) {}
     }
     const PANEL_CLOSED = 56;
-    const PANEL_OPEN = 182;   // 内容 179px + 3px 余量（原 214 会多留约 35px 空白）
+    const PANEL_OPEN = 222;   // 内容 219px（4 行）+ 3px 余量
     const panel = document.createElement("div");
     panel.style.cssText = "display:flex;flex-direction:column;gap:8px;width:100%;box-sizing:border-box;padding:3px 8px 6px";
     const toggle = document.createElement("button");
@@ -1437,6 +1437,19 @@ function mountRelayAdvancedPanel(node) {
         () => String(contextWidget?.value ?? "22"), value => setWidget(contextWidget, value));
     addRow("reanchor", "重锚定", [["0 · 不重锚定", "关闭"], ["2 · 每2段", "每 2 段"], ["3 · 每3段", "每 3 段"], ["5 · 每5段", "每 5 段"], ["7 · 每7段", "每 7 段"], ["10 · 每10段", "每 10 段"]],
         () => String(reanchorWidget?.value ?? "0 · 不重锚定"), value => setWidget(reanchorWidget, value));
+    if (rows.reanchor) rows.reanchor.title = "每 N 段做一次软重置：仍接上一段 latent 保留运动/机位，只把上下文换成上一段成片尾帧重编码，断掉逐段画质复利。";
+    addRow("appearance", "外观锚", [["0", "0 · 关闭"], ["1", "每段"], ["2", "每 2 段"], ["3", "每 3 段（默认）"], ["5", "每 5 段"], ["7", "每 7 段"], ["10", "每 10 段"]],
+        () => String(anchorConfigOf(node).appearance ?? 3), value => {
+            try {
+                // 只改 appearance，保留 settle_sharpen / segment_correction 等锚配置。
+                const cfg = { ...(node.properties?.ad_h3_anchor || {}) };
+                cfg.appearance = Number(value);
+                node.properties ||= {};
+                node.properties.ad_h3_anchor = cfg;
+                node.graph?.change?.();
+            } catch (_) {}
+        });
+    if (rows.appearance) rows.appearance.title = "每 N 段把第 1 段开头 5 帧作为参考块追加进 H3 条件（长程身份基准）；0=关闭。";
     addRow("sharpen", "沉降锐化", [["0", "0 · 关闭"], ["0.5", "0.5 · 温和（推荐）"], ["1", "1 · 强"]],
         () => String(anchorConfigOf(node).settle_sharpen ?? 0.5), value => {
             try {
@@ -1452,6 +1465,7 @@ function mountRelayAdvancedPanel(node) {
     const syncPanel = () => {
         try { rows.context.value = String(contextWidget?.value ?? "22"); } catch (_) {}
         try { rows.reanchor.value = String(reanchorWidget?.value ?? "0 · 不重锚定"); } catch (_) {}
+        try { rows.appearance.value = String(anchorConfigOf(node).appearance ?? 3); } catch (_) {}
         try { rows.sharpen.value = String(anchorConfigOf(node).settle_sharpen ?? 0.5); } catch (_) {}
     };
     node._adH3SyncRelayPanel = syncPanel;

@@ -435,7 +435,9 @@ export function injectHiddenRelay(serialized, graph) {
             anchor_config: anchorJson,
         };
         if (conditioningLink) bridgeInputs.conditioning = conditioningLink;
-        if (remakeVaeLink) bridgeInputs.vae = remakeVaeLink;
+        // 重锚定软重置与像素质量复位都需要视频 VAE：优先 RemakeConditioning 的 vae，其次条件节点的 vae。
+        const videoVaeLink = remakeVaeLink || findVideoVaeLink(prompt);
+        if (videoVaeLink) bridgeInputs.vae = videoVaeLink;
         prompt[bridgeId] = {
             class_type: "ADH3InternalBridge",
             inputs: bridgeInputs,

@@ -1569,10 +1569,11 @@ class AidenH3Segment:
                       % (effective_context, plan["generation_frames"], relay_target,
                          plan["trim_frames"], relay_context))
             elif relay_reanchor:
-                print("[AD-潜桥] 第 %d 段重锚定：独立生成（桥不读上一段/第 1 段 latent；"
-                      "生成 %d → 输出 %d，裁头 %d，其中预卷 %d 帧为模型热身、裁掉不进成片）"
+                print("[AD-潜桥] 第 %d 段重锚定：软重置（仍接上一段 latent 保留运动/机位，"
+                      "上下文改用上一段成片尾帧重编码，断掉逐段画质复利；"
+                      "生成 %d → 输出 %d，裁头 %d）"
                       % (int(index) + 1, plan["generation_frames"], relay_target,
-                         plan["trim_frames"], plan["pre_roll_frames"]))
+                         plan["trim_frames"]))
             # 潜桥输出 L 与上下文 C 都确定后，必须按最终生成帧数 G=L+C 重新核对单段上限，
             # 不能只沿用 h3_window 里按 L 算的旧上限（否则 G 会静默超限）。
             limit_frames = int(settings.get("max_frames") or DEFAULT_SEGMENT_MAX_FRAMES)
@@ -1588,11 +1589,9 @@ class AidenH3Segment:
             relay_run_id, relay_save_run_id, relay_stage_index = _relay_identity(session_id, session, index)
             # 上一段的稳定 stage 是桥接的唯一父 latent 来源；缺失说明存盘/提升还没完成，
             # 必须显式报错，不能带着空父 latent 静默生成（预览子会话用父段号校验）。
-            # v0.5.49：重锚定是真正独立段，不读取任何父 latent（也不再校验第 1 段 stage），
-            # 因此这里只在续接段校验父段。
+            # 重锚定=软重置，同样依赖上一段的 latent 与成片，父段校验与普通续接一致。
             relay_label = str((session.get("preview_parent") or {}).get("group_label") or "")
-            if not relay_reanchor:
-                _require_parent_relay_stage(relay_run_id, relay_stage_index, relay_label)
+            _require_parent_relay_stage(relay_run_id, relay_stage_index, relay_label)
         used = None
         if isinstance(prompt, dict) and unique_id is not None:
             slots = set()
@@ -2767,10 +2766,11 @@ class ADH3InternalBridge:
         audio_pinned = _relay_audio_pin_state(latent)[1] is not None
         upstream_pin = False if audio_pinned else bool(pin_audio)
         reanchor = bool(ctx.get("relay_reanchor"))
-        ctx["ad_bridge_used"] = "independent" if reanchor else "latent"
+        ctx["ad_bridge_used"] = "latent"
         # 声锚：第 2 段起统一引用第 1 段（stage_00000）的音频，避免每段各挑一个音色。
         # 第 1 段 stage 未落盘时回退 -1（沿用插件默认：取上一段尾的有声窗）。
-        voice_stage = 0 if (stage > 0 and not reanchor and _relay_stage_file(run_id, 0).is_file()) else -1
+        # 重锚定已改为软重置（仍接上一段），同样引第 1 段音色。
+        voice_stage = 0 if (stage > 0 and _relay_stage_file(run_id, 0).is_file()) else -1
         print("[AD-潜桥] 第 %d 段音频：钉住=%s 上游pin=%s 声锚=%s"
               % (stage + 1, audio_pinned, upstream_pin,
                  "stage_00000" if voice_stage == 0 else "关（上一段尾）"))
@@ -2778,18 +2778,36 @@ class ADH3InternalBridge:
         def finish(result):
             out = result[0]
             if audio_pinned:
-                out = _relay_audio_fix(out, latent, ctx, stage, reanchor=reanchor)
+                # 重锚定已改为软重置（仍接上一段），音频前导同样取上一段尾，不再用静音占位。
+                out = _relay_audio_fix(out, latent, ctx, stage)
             cond = result[3] if len(result) > 3 else conditioning
             trim = int(result[2]) if len(result) > 2 else int(context_frames)
             return (out, cond, trim)
 
         if reanchor:
-            # 重锚定段：桥 stage=0 直通，不读上一段 latent；仍保留正常预卷/裁头。
-            trim = int(ctx.get("relay_trim_frames") or 5)
-            result = upstream.bridge(latent, context_frames=int(trim), mask_mode=str(mask_mode or "hard"),
+            # 重锚定=软重置：仍从上一段 latent 续接（保留运动/机位），只把上下文视频流换成
+            # 上一段成片尾 C 帧的 VAE 重编码，断掉逐段 latent 复利的画质衰减。
+            # 没有 VAE 或上一段成片时退回直接 latent 续接，不再独立重生成（否则接缝必跳）。
+            if stage > 0 and vae is not None:
+                try:
+                    context_latent = _pixel_bridge_context(run_id, ctx, vae, int(context_frames))
+                    result = upstream.bridge(latent, context_latent=context_latent,
+                                             context_frames=int(context_frames),
+                                             mask_mode=str(mask_mode or "hard"),
+                                             pin_audio=upstream_pin, conditioning=conditioning,
+                                             voice_anchor_stage=voice_stage,
+                                             run_id=run_id, stage_index=stage)
+                    ctx["ad_bridge_used"] = "soft-reset"
+                    print("[AD-潜桥] 第 %d 段重锚定：软重置（上一段成片尾 %d 帧 -> 锐化 -> VAE 重编码，保留运动）"
+                          % (stage + 1, int(context_frames)))
+                    return finish(result)
+                except Exception as exc:
+                    print("[AD-潜桥] 重锚定软重置不可用，改用直接 latent 续接（%r）" % (exc,))
+            result = upstream.bridge(latent, context_frames=int(context_frames),
+                                     mask_mode=str(mask_mode or "hard"),
                                      pin_audio=upstream_pin, conditioning=conditioning,
-                                     voice_anchor_stage=-1,
-                                     run_id=run_id, stage_index=0)
+                                     voice_anchor_stage=voice_stage,
+                                     run_id=run_id, stage_index=stage)
             return finish(result)
         if bridge_mode == 1 and stage > 0 and vae is not None and (run_id or "").strip():
             # 像素质量复位仅作对照档；默认关闭。
@@ -2839,10 +2857,7 @@ class ADH3InternalAppearanceAnchor:
         ctx["ad_appearance_refs"] = 0
         if stage <= 0 or appearance <= 0:
             return (conditioning,)
-        if ctx.get("relay_reanchor"):
-            # 重锚定段是独立生成，任何“第 1 段”参考块都会直接串味（v0.5.49）。
-            print("[AD-潜桥] 第 %d 段为重锚定独立段：跳过外观锚（避免第 1 段画面串入）" % (stage + 1,))
-            return (conditioning,)
+        # 重锚定已改为软重置（仍接上一段 latent），外观锚不再跳过：它就是长程身份基准。
         if (stage + 1) % appearance != 0:
             return (conditioning,)
         try:
