@@ -1,4 +1,4 @@
-AD-Segmented-Loop 0.5.60 第三方依赖说明
+AD-Segmented-Loop 0.5.66 第三方依赖说明
 
 插件自身采用 GPL-3.0-only，完整许可见本压缩包内 LICENSE。
 
@@ -7,12 +7,14 @@ AD-Segmented-Loop 0.5.60 第三方依赖说明
 - SciPy（BSD 类许可）：音频重采样。
 - PyAV >= 14（BSD；其使用的 FFmpeg 构建另行适用 LGPL/GPL）：视频探测、解码与编码。
 - imageio-ffmpeg（BSD-2-Clause；随附 FFmpeg 构建适用其自身许可）：提供 FFmpeg 可执行程序。
+- Pillow（HPND 许可）：图片读写与缩略图生成。
 - librosa（ISC）：智能音频切分检测。
 
 二、外部环境
 - ComfyUI 为外部运行环境，本压缩包不捆绑 ComfyUI 源码或二进制。
-- PyTorch 与 torchaudio 复用现有 ComfyUI 环境，不随插件分发。
+- PyTorch、torchaudio 与 safetensors 复用现有 ComfyUI 环境，不随插件分发。
 - FFmpeg 优先使用系统 PATH，缺失时使用 imageio-ffmpeg 提供的构建；本包不捆绑二进制。
+- scenedetect 为可选依赖：安装后「镜头检测」用其 ContentDetector；未安装时自动退回 FFmpeg 场景检测，功能不中断但精度略有差异。
 
 三、再分发
 本包提供插件完整运行源代码；修改及再分发请保留 GPL-3.0-only 许可、LICENSE

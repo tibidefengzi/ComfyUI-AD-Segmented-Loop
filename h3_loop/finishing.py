@@ -2,7 +2,6 @@
 from fractions import Fraction
 import math
 from pathlib import Path
-import shutil
 import subprocess
 
 import numpy as np
@@ -228,7 +227,8 @@ def _stream_copy_merge(paths, output):
             result = subprocess.run([executable, "-v", "error", "-nostdin", "-n", "-copyts", "-f", "concat", "-safe", "0",
                                      "-i", str(list_file), "-map", "0:v:0", "-c", "copy", "-an",
                                      "-movflags", "+faststart", str(output)],
-                                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             if result.returncode or not output.is_file() or output.stat().st_size == 0:
                 output.unlink(missing_ok=True)
                 return False

@@ -7,7 +7,7 @@ import math
 
 from . import assets
 from . import compat
-from .color_match import COLOR_MATCH_CHOICES as _COLOR_MATCH_CHOICES, parse_blend as _color_match_blend, parse_config as _color_match_config, reference_frame_stats
+from .color_match import COLOR_MATCH_CHOICES as _COLOR_MATCH_CHOICES, parse_config as _color_match_config, reference_frame_stats
 from .normalization import normalize_source
 from .spec import relay_reanchor_interval as _relay_reanchor_interval, relay_reanchors, relay_parent_stage, relay_segment_context
 from .audio import h3_window, read_audio_entry, read_pieces
@@ -16,8 +16,8 @@ from .storage import ROOT, STORE, digest
 from .spec import (ASPECT_CHOICES, DEFAULT_ASPECT, DEFAULT_MEGAPIXELS, FPS, MEGAPIXEL_CHOICES,
                        generation_frames, resolve_canvas, target_frames, validate_fps)
 from .timeline import (DEFAULT_SEGMENT_MAX_FRAMES, EMPTY_TIMELINE, MAX_AUDIO_PORTS, MAX_IMAGE_PORTS, MAX_VIDEO_PORTS,
-                       audio_pieces, clip_span, loop_settings, output_timeline, reference_pack, source_pieces, timeline_identity, timeline_plan)
-from .video import check_alignment, video_identity, video_plan, video_window
+                       clip_span, loop_settings, output_timeline, reference_pack, timeline_identity, timeline_plan)
+from .video import video_identity, video_plan, video_window
 from .continuum import (
     continuum_available, continuum_node, continuum_status_report,
     load_continuum_state, save_continuum_state,
@@ -62,6 +62,9 @@ RELAY_CHOICES = (
     "22 · 上下文22帧（推荐）",
     "39 · 上下文39帧",
 )
+# 2026-11-14：生成方式只保留两项，第二项改为潜桥续接（原“2·镜头内连续生成”下线）。
+# 潜桥上下文帧数仍由隐藏控件提供，默认 22。
+MODE_CHOICES = ("逐段生成", "潜桥续接")
 RELAY_CHOICE_VALUES = {"0 · 关闭": 0, "5 · 上下文5帧": 5,
                        "22 · 上下文22帧（推荐）": 22, "39 · 上下文39帧": 39}
 # 潜桥链重锚定：每 N 段清一次上一段 latent 上下文（第 N、2N…段从当前段源画面/提示词重新锚定）。
@@ -1380,10 +1383,10 @@ class AidenH3Segment:
     def INPUT_TYPES(cls):
         return {"required": {},
                 "optional": {"queue": ("H3_AUDIO_QUEUE",),
-                             "潜桥续接": (list(RELAY_CHOICES), {"default": "0 · 关闭", "tooltip": "0=关闭潜桥；5/22/39=开启潜桥，C为上下文帧数。开启后每段输出=17的倍数，H3生成=输出+C，裁头=C；第1段无前序上下文，只按 H3 网格最小合法余量加5帧（生成=输出+5，裁头5），不按 C 预卷"}),
                              "aspect_ratio": (list(ASPECT_CHOICES), {"default": DEFAULT_ASPECT}),
                              "megapixels": ("FLOAT", {"default": 0.5, "min": 0.05, "max": 64.0, "step": 0.1, "tooltip": "百万像素，自由填写"}),
                              "multiple": ("INT", {"default": 32, "min": 1, "max": 64, "tooltip": "倍数（宽高按此倍数对齐）"}),
+                             "生成方式": (list(MODE_CHOICES), {"default": MODE_CHOICES[0], "tooltip": "逐段生成；潜桥续接：上一段 AV latent 逐位拷贝 + 条件钉帧，逐段采样/解码/预览，输出=17n，H3生成=输出+C，裁头=C。"}),
                              "正向提示词": ("STRING", {"multiline": True, "default": ""}),
                              "统一提示词前缀": ("STRING", {"multiline": True, "default": ""}),
                              "反向提示词": ("STRING", {"multiline": True, "default": ""}),
@@ -1529,8 +1532,11 @@ class AidenH3Segment:
         else:
             window = h3_window(entries, index, **settings)
         # ---- 潜桥续接：单下拉 0/5/22/39。0=关闭；>0=开启，输出 L=17n，G=L+C，裁头=C。 ----
-        relay_raw = kwargs.get("潜桥续接")
-        relay_context = _relay_choice_value(relay_raw)
+        mode_raw = str(kwargs.get("生成方式") or "").strip()
+        relay_on = ("潜桥" in mode_raw) or mode_raw.startswith(("1", "2"))
+        relay_context = _relay_choice_value(kwargs.get("潜桥上下文帧数") or "22") if relay_on else 0
+        if relay_on and relay_context <= 0:
+            relay_context = 22
         relay_active = bool(relay_context > 0 and not batch_source)
         effective_context = relay_context
         relay_pre_roll = 0
@@ -2729,6 +2735,7 @@ def _pixel_bridge_context(run_id, ctx, vae, frames):
 
 class ADH3InternalBridge:
     """内部桥：从 AD 分段节点的 context 输出读取 run_id/stage，不接受用户接线。"""
+
     @classmethod
     def INPUT_TYPES(cls):
         return {"required": {
@@ -2739,15 +2746,18 @@ class ADH3InternalBridge:
             "mask_mode": (["hard", "taper", "ramp", "blend", "window"], {"default": "hard"}),
             "pin_audio": ("BOOLEAN", {"default": True}),
             "anchor_config": ("STRING", {"default": "{}"}),
+            "conditioning": ("CONDITIONING",),
             "vae": ("VAE",),
         }}
-    RETURN_TYPES = ("LATENT",)
+
+    RETURN_TYPES = ("LATENT", "CONDITIONING", "INT")
+    RETURN_NAMES = ("latent", "conditioning", "trim_frames")
     FUNCTION = "run"
     CATEGORY = CATEGORY
     OUTPUT_NODE = False
 
     def run(self, latent, relay_context, context_frames=22, mask_mode="hard", pin_audio=True,
-            anchor_config="{}", vae=None):
+            anchor_config="{}", conditioning=None, vae=None):
         ctx = relay_context if isinstance(relay_context, dict) else {}
         run_id = str(ctx.get("relay_run_id") or "ad_relay")
         stage = int(ctx.get("relay_stage_index") or 0)
@@ -2758,37 +2768,51 @@ class ADH3InternalBridge:
         upstream_pin = False if audio_pinned else bool(pin_audio)
         reanchor = bool(ctx.get("relay_reanchor"))
         ctx["ad_bridge_used"] = "independent" if reanchor else "latent"
+        # 声锚：第 2 段起统一引用第 1 段（stage_00000）的音频，避免每段各挑一个音色。
+        # 第 1 段 stage 未落盘时回退 -1（沿用插件默认：取上一段尾的有声窗）。
+        voice_stage = 0 if (stage > 0 and not reanchor and _relay_stage_file(run_id, 0).is_file()) else -1
+        print("[AD-潜桥] 第 %d 段音频：钉住=%s 上游pin=%s 声锚=%s"
+              % (stage + 1, audio_pinned, upstream_pin,
+                 "stage_00000" if voice_stage == 0 else "关（上一段尾）"))
+
+        def finish(result):
+            out = result[0]
+            if audio_pinned:
+                out = _relay_audio_fix(out, latent, ctx, stage, reanchor=reanchor)
+            cond = result[3] if len(result) > 3 else conditioning
+            trim = int(result[2]) if len(result) > 2 else int(context_frames)
+            return (out, cond, trim)
+
         if reanchor:
-            # v0.5.49 分段重锚定 = 真正独立段：不读上一段 latent，也不拿第 1 段 latent 当上下文。
+            # 重锚定段：桥 stage=0 直通，不读上一段 latent；仍保留正常预卷/裁头。
             trim = int(ctx.get("relay_trim_frames") or 5)
             result = upstream.bridge(latent, context_frames=int(trim), mask_mode=str(mask_mode or "hard"),
-                                     pin_audio=upstream_pin, run_id=run_id, stage_index=0)
-            if not audio_pinned:
-                return (result[0],)
-            return (_relay_audio_fix(result[0], latent, ctx, stage, reanchor=True),)
+                                     pin_audio=upstream_pin, conditioning=conditioning,
+                                     voice_anchor_stage=-1,
+                                     run_id=run_id, stage_index=0)
+            return finish(result)
         if bridge_mode == 1 and stage > 0 and vae is not None and (run_id or "").strip():
-            # v0.5.50 像素质量复位：桥接上下文不再是“上一段生成 latent”的直接拷贝，而是
-            # 上一段成片尾帧 → 轻度锐化 → VAE 重编码，切断“越跑越糊”的复利链；失败自动回退。
+            # 像素质量复位仅作对照档；默认关闭。
             try:
                 context_latent = _pixel_bridge_context(run_id, ctx, vae, int(context_frames))
                 result = upstream.bridge(latent, context_latent=context_latent,
                                          context_frames=int(context_frames),
                                          mask_mode=str(mask_mode or "hard"),
-                                         pin_audio=upstream_pin,
+                                         pin_audio=upstream_pin, conditioning=conditioning,
+                                         voice_anchor_stage=voice_stage,
                                          run_id=run_id, stage_index=stage)
                 ctx["ad_bridge_used"] = "pixel"
-                print("[AD-潜桥] 第 %d 段桥接：像素质量复位（上一段成片尾 %d 帧 → 锐化 → VAE 重编码）"
+                print("[AD-潜桥] 第 %d 段桥接：像素质量复位（上一段成片尾 %d 帧 -> 锐化 -> VAE 重编码）"
                       % (stage + 1, int(context_frames)))
-                if not audio_pinned:
-                    return (result[0],)
-                return (_relay_audio_fix(result[0], latent, ctx, stage),)
+                return finish(result)
             except Exception as exc:
                 print("[AD-潜桥] 像素质量复位桥接不可用，回退直接 latent（%r）" % (exc,))
-        result = upstream.bridge(latent, context_frames=int(context_frames), mask_mode=str(mask_mode or "hard"),
-                                 pin_audio=upstream_pin, run_id=run_id, stage_index=stage)
-        if not audio_pinned:
-            return (result[0],)
-        return (_relay_audio_fix(result[0], latent, ctx, stage),)
+        result = upstream.bridge(latent, context_frames=int(context_frames),
+                                 mask_mode=str(mask_mode or "hard"),
+                                 pin_audio=upstream_pin, conditioning=conditioning,
+                                 voice_anchor_stage=voice_stage,
+                                 run_id=run_id, stage_index=stage)
+        return finish(result)
 
 
 class ADH3InternalAppearanceAnchor:
@@ -3583,9 +3607,19 @@ class ADH3InternalTrim:
         # 上游裁头会打印含 emoji/制表符的报告，在重定向 stdout（日志采集/服务化启动）时会抛
         # UnicodeEncodeError；这里捕获其输出，只回一行中文摘要，同时关闭无用的 PCM 边车。
         captured = io.StringIO()
+        try:
+            _anchor_cfg = json.loads(anchor_config or "{}")
+        except Exception:
+            _anchor_cfg = {}
+        try:
+            _settle = float(_anchor_cfg.get("settle_sharpen", 0.5) or 0)
+        except Exception:
+            _settle = 0.5
         with contextlib.redirect_stdout(captured):
             result = upstream.trim(images, trim_frames=frames, fps=float(fps),
-                                   audio=audio, settle_frames=0, save_pcm=False)
+                                   audio=audio, settle_frames=0,
+                                   settle_sharpen=_settle, settle_sharpen_frames=24,
+                                   save_pcm=False)
         if isinstance(result, dict):
             result = result.get("result")
         trimmed_images, trimmed_audio = result[0], result[1]

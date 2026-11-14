@@ -1,5 +1,4 @@
 """原生播放器的文件描述；已经入库的分段直接复用，不重复编码。"""
-from pathlib import Path
 import uuid
 
 from .storage import ROOT, STORE, contained

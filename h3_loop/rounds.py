@@ -15,8 +15,14 @@ from .storage import STORE, atomic_json, contained, identifier
 
 
 def _relay_choice(graph, node_id):
-    raw = ((graph or {}).get(str(node_id)) or {}).get("inputs", {}).get("潜桥续接")
-    match = re.match(r"^(\d+)", str(raw or "").strip())
+    """生成方式=1 · 潜桥续接 时返回默认上下文 22；旧 0/5/22/39 值继续兼容。"""
+    raw = ((graph or {}).get(str(node_id)) or {}).get("inputs", {}).get("生成方式")
+    text = str(raw or "").strip()
+    if "潜桥" in text or text.startswith(("1", "2")):
+        return 22
+    if "逐段" in text or text.startswith("0"):
+        return 0
+    match = re.match(r"^(\d+)", text)
     value = int(match.group(1)) if match else 0
     return value if value in (0, 5, 22, 39) else 0
 

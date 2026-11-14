@@ -18,11 +18,19 @@ export function relayValue(raw) {
     return [0, 5, 22, 39].includes(value) ? value : 0;
 }
 export function normalizeRelayWidget(node) {
-    const selector = widget(node, "潜桥续接");
+    const selector = widget(node, "生成方式");
     if (!selector) return;
-    const value = relayValue(selector.value);
-    const label = RELAY_LABELS[value];
-    if (label && selector.value !== label) selector.value = label;
+    const text = String(selector.value ?? "").trim();
+    if (text.includes("潜桥") || text.startsWith("1") || text.startsWith("2")) {
+        if (selector.value !== "潜桥续接") selector.value = "潜桥续接";
+        return;
+    }
+    if (text === "逐段生成" || text.includes("逐段") || text.startsWith("0")) {
+        if (selector.value !== "逐段生成") selector.value = "逐段生成";
+        return;
+    }
+    const legacy = relayValue(text);
+    selector.value = legacy > 0 ? "潜桥续接" : "逐段生成";
 }
 export const LEGACY_TYPES = ["H3RelayCopyBridge", "H3RelayLatentSave", "H3RelayTrimAV", "H3RelayLatentLoad", "H3RelayApplyEditMask"];
 
@@ -38,7 +46,7 @@ function widget(node, name) {
 // 锚定配置保存在节点 properties（不新增原生 widget，旧工作流 widget_values 不受影响）。
 // 默认：锚强度 1（全强）、外观锚每 3 段、历史锚/声锚关闭。
 // v0.5.50：删除无效/未验证的 锚定强度、历史锚、声锚；新增 桥接模式 / 质感还原。
-export const ANCHOR_DEFAULTS = { appearance: 3, segment_correction: 0, texture_restore: 0, bridge_mode: 0, reanchor_guide: 0 };
+export const ANCHOR_DEFAULTS = { appearance: 3, segment_correction: 0, texture_restore: 0, bridge_mode: 0, reanchor_guide: 0, settle_sharpen: 0.5 };
 const ANCHOR_APPEARANCE_STEPS = [0, 1, 2, 3, 5, 7, 10];
 
 export function normalizeAnchorConfig(raw) {
@@ -54,6 +62,8 @@ export function normalizeAnchorConfig(raw) {
     cfg.bridge_mode = Number.isFinite(bridge) && bridge > 0 ? 1 : 0;
     const guide = Number(raw.reanchor_guide);
     cfg.reanchor_guide = [0, 5, 22, 39, 56].includes(guide) ? guide : 0;
+    const sharpen = Number(raw.settle_sharpen);
+    cfg.settle_sharpen = [0, 0.5, 1].includes(sharpen) ? sharpen : 0.5;
     return cfg;
 }
 
@@ -62,9 +72,15 @@ export function anchorConfigOf(node) {
 }
 
 function relayChoice(node) {
-    const w = widget(node, "潜桥续接");
+    const w = widget(node, "生成方式");
     if (w) {
-        return relayValue(w.value);
+        const text = String(w.value ?? "").trim();
+        const on = text.includes("潜桥") || text.startsWith("1") || text.startsWith("2")
+            || (!text.includes("逐段") && !text.startsWith("0") && relayValue(text) > 0);
+        if (!on) return 0;
+        // 必须读高级设置写回的隐藏控件；否则桥永远按 22 拷贝，和后台裁头 C 错位。
+        const context = num(widget(node, "潜桥上下文帧数")?.value || 0);
+        return [5, 22, 39].includes(context) ? context : 22;
     }
     // 兼容极旧节点：从旧模式/上下文推一次
     const mode = String(widget(node, "潜桥模式")?.value || "");
@@ -80,19 +96,12 @@ export function hideLegacyWidgets(node) {
         w.hidden = true;
         try { w.computeSize = () => [0, 0]; } catch (_) {}
     }
-    const selector = widget(node, "潜桥续接");
+    const selector = widget(node, "生成方式");
     if (selector) {
-        if (node._adH3RelayPanelMounted) {
-            // 新版 AD-分段生成 已用一整块 DOM 面板承载潜桥/重锚定/色彩匹配；
-            // 原生组合框隐藏，避免重复一行。
-            selector.type = "hidden";
-            selector.hidden = true;
-            try { selector.computeSize = () => [0, -4]; } catch (_) {}
-        } else {
-            selector.type = "combo";
-            selector.hidden = false;
-            try { delete selector.computeSize; } catch (_) {}
-        }
+        // 生成方式始终作为原生组合框显示（用户要求保留在控件区第四行）。
+        selector.type = "combo";
+        selector.hidden = false;
+        try { delete selector.computeSize; } catch (_) {}
     }
     try { node.graph?.setDirtyCanvas?.(true, true); } catch (_) {}
 }
@@ -218,7 +227,7 @@ export function migrateLegacyRelay(graph) {
     if (!segment) return;
 
     // 1. 确定选择器 C：优先桥的 context_frames，其次旧 AD 上下文。
-    const selector = widget(segment, "潜桥续接");
+    const selector = widget(segment, "生成方式");
     const storedChoice = segment.properties?.ad_relay_choice;
     const hasStoredChoice = storedChoice === 0 || [5, 22, 39].includes(Number(storedChoice));
     if (hasStoredChoice) {
@@ -236,7 +245,7 @@ export function migrateLegacyRelay(graph) {
         segment.properties.ad_relay_ui_version = 2;
     }
     normalizeRelayWidget(segment);
-    try { segment.properties.ad_relay_choice = relayValue(widget(segment, "潜桥续接")?.value); } catch (_error) {}
+    try { segment.properties.ad_relay_choice = relayChoice(segment); } catch (_error) {}
     hideLegacyWidgets(segment);
     segment._adH3SyncRelayPanel?.();
 
@@ -383,6 +392,28 @@ export function injectHiddenRelay(serialized, graph) {
         const contextFrames = relayChoice(segmentNode);
         const anchorConfig = anchorConfigOf(segmentNode);
         const anchorJson = JSON.stringify(anchorConfig);
+        // 采样器分两类：guider 链路（SamplerCustomAdvanced）与直接 positive 链路（SelfLift / KSampler 等）。
+        const guiderLink = promptLink(sampler, "guider");
+        const guider = guiderLink ? prompt[String(guiderLink[0])] : null;
+        const directPositive = !guiderLink && !!promptLink(sampler, "positive");
+        // BasicGuider 的条件口叫 conditioning；CFGGuider 拆成 positive/negative（negative 不动）。
+        const guiderConditioning = guider ? promptLink(guider, "conditioning") : null;
+        const guiderPositive = guider ? promptLink(guider, "positive") : null;
+        const conditioningTarget = directPositive ? "sampler-positive"
+            : (guiderConditioning ? "guider-conditioning" : (guiderPositive ? "guider-positive" : null));
+        const conditioningLink = directPositive ? promptLink(sampler, "positive")
+            : (guiderConditioning || guiderPositive || null);
+        const currentConditioning = () => {
+            if (conditioningTarget === "sampler-positive") return promptLink(sampler, "positive");
+            if (conditioningTarget === "guider-conditioning") return promptLink(guider, "conditioning");
+            if (conditioningTarget === "guider-positive") return promptLink(guider, "positive");
+            return null;
+        };
+        const setConditioning = (link) => {
+            if (conditioningTarget === "sampler-positive") sampler.inputs.positive = link;
+            else if (conditioningTarget === "guider-conditioning") guider.inputs.conditioning = link;
+            else if (conditioningTarget === "guider-positive") guider.inputs.positive = link;
+        };
         const bridgeId = String(id++);
         const saveId = String(id++);
         const trimId = String(id++);
@@ -403,6 +434,7 @@ export function injectHiddenRelay(serialized, graph) {
             pin_audio: true,
             anchor_config: anchorJson,
         };
+        if (conditioningLink) bridgeInputs.conditioning = conditioningLink;
         if (remakeVaeLink) bridgeInputs.vae = remakeVaeLink;
         prompt[bridgeId] = {
             class_type: "ADH3InternalBridge",
@@ -410,35 +442,33 @@ export function injectHiddenRelay(serialized, graph) {
             _meta: { title: "AD-内部潜桥桥接" },
         };
         sampler.inputs.latent_image = [bridgeId, 0];
+        if (conditioningLink) setConditioning([bridgeId, 1]);
         // 外观锚：把第 1 段开头帧作为 minimax_refs 追加进 H3 conditioning。
         // 只改条件链，不改 latent / 帧数 / 裁头 ⇒ 接缝不跳。
         if (anchorConfig.appearance > 0) {
-            const guiderLink = promptLink(sampler, "guider");
-            const guider = guiderLink ? prompt[String(guiderLink[0])] : null;
-            const conditioningLink = guider ? promptLink(guider, "conditioning") : null;
-            if (guider && conditioningLink) {
+            // guider 链（BasicGuider / CFGGuider）与 direct positive 链（SelfLift / KSampler）都要能挂外观锚。
+            const anchorLink = currentConditioning();
+            if (anchorLink) {
                 const anchorId = String(id++);
                 prompt[anchorId] = {
                     class_type: "ADH3InternalAppearanceAnchor",
                     inputs: {
-                        conditioning: conditioningLink,
+                        conditioning: anchorLink,
                         relay_context: [segId, contextIdx],
                         anchor_config: anchorJson,
                     },
                     _meta: { title: "AD-内部锚定" },
                 };
-                guider.inputs.conditioning = [anchorId, 0];
+                setConditioning([anchorId, 0]);
             } else {
-                console.warn("[AD-潜桥] 外观/历史锚未生效：找不到 BasicGuider 的 conditioning 输入");
+                console.warn("[AD-潜桥] 外观锚未生效：找不到可用的 conditioning 输入（guider/positive）");
             }
         }
         // 重锚定尾帧锚定：仅重锚定段生效；把上一段成片最后 N 帧作为硬件 guide 锚到本段预卷开头。
         if (anchorConfig.reanchor_guide > 0) {
             const guideVae = remakeVaeLink || findVideoVaeLink(prompt);
-            const guideGuiderLink = promptLink(sampler, "guider");
-            const guideGuider = guideGuiderLink ? prompt[String(guideGuiderLink[0])] : null;
-            const guideConditioning = guideGuider ? promptLink(guideGuider, "conditioning") : null;
-            if (guideGuider && guideConditioning && guideVae) {
+            const guideConditioning = currentConditioning();
+            if (guideConditioning && guideVae) {
                 const guideId = String(id++);
                 prompt[guideId] = {
                     class_type: "ADH3InternalReanchorGuide",
@@ -450,9 +480,9 @@ export function injectHiddenRelay(serialized, graph) {
                     },
                     _meta: { title: "AD-重锚定尾帧锚定" },
                 };
-                guideGuider.inputs.conditioning = [guideId, 0];
+                setConditioning([guideId, 0]);
             } else {
-                console.warn("[AD-潜桥] 重锚定尾帧锚定未生效：缺少 VAE 或 guider conditioning");
+                console.warn("[AD-潜桥] 重锚定尾帧锚定未生效：缺少 VAE 或 conditioning");
             }
         }
         prompt[saveId] = {

@@ -1,7 +1,5 @@
 """Original H3 timing, boundary inspection and lossless history storage."""
 from fractions import Fraction
-import math
-from pathlib import Path
 
 import numpy as np
 

@@ -7,7 +7,6 @@ from functools import wraps
 import json
 import math
 from pathlib import Path
-import re
 import shutil
 import threading
 from urllib.parse import urlsplit
@@ -18,7 +17,7 @@ import copy
 from aiohttp import web
 from server import PromptServer
 
-from .audio import EXTENSIONS, h3_window, prepare_entries
+from .audio import h3_window, prepare_entries
 from .engine import merge_session, segment_signatures, template_for
 from . import layout
 from .storage import ROOT, STORE, contained, digest, identifier
@@ -1219,7 +1218,8 @@ def _write_thumbnail(path, target):
     if path.suffix.lower() in VIDEO_EXTS:
         result = subprocess.run([ffmpeg_executable(), "-v", "error", "-nostdin", "-i", str(path),
             "-frames:v", "1", "-vf", "scale=320:320:force_original_aspect_ratio=decrease", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"],
-            capture_output=True, check=True, timeout=30)
+            capture_output=True, check=True, timeout=30,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         handle = io.BytesIO(result.stdout)
     else:
         handle = path

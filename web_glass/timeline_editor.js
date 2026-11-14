@@ -801,7 +801,7 @@ export function mountTimelineEditor(node) {
 <div class="h3-smart-row" data-smart-row>
   <button type="button" data-run-affected class="primary" title="选中分段后仅运行所选段；未选择时重跑受影响段，完成后回原进度">运行此段</button>
   <button type="button" data-new-group class="primary" title="新开一组并从第1段待命；素材、设置与旧成果保留，运行中请先停止">新建一组</button>
-  <button type="button" data-import-timed class="primary" title="导入带时间行的文本：一块=一段，切当前选中音频轨并写入各段正向提示词（可撤销）">导入时间文本</button>
+  <button type="button" data-import-timed class="primary" title="导入带时间行的文本：一块=一段；切选中的音频/视频轨，无音视频时按时间块建立生成段，并写入各段正向提示词（可撤销）">导入时间文本</button>
   <select data-smart-kind title="选择检测方式">
     <option value="beats-bar">踩节拍 I（小节）</option>
     <option value="beats-beat">踩节拍 II（每拍）</option>
@@ -1647,8 +1647,8 @@ export function mountTimelineEditor(node) {
     const relayLength = () => {
         try {
             const seg = linkedPromptSegment(node);
-            const widget = seg?.widgets?.find(item => item.name === '潜桥续接');
-            return Number(widget?.value) > 0;
+            const widget = seg?.widgets?.find(item => item.name === '生成方式');
+            const text = String(widget?.value ?? '').trim(); return text.includes('潜桥') || text.startsWith('1') || text.startsWith('2');
         } catch (_error) { return false; }
     };
     const alignSegmentLength = value => {
@@ -2011,9 +2011,8 @@ export function mountTimelineEditor(node) {
     const relayContextValue = () => {
         try {
             const seg = linkedPromptSegment(node);
-            const raw = seg?.widgets?.find(item => item.name === "潜桥续接")?.value;
-            const value = parseFloat(String(raw ?? ""));
-            return Number.isFinite(value) && value > 0 ? value : 0;
+            const raw = seg?.widgets?.find(item => item.name === "生成方式")?.value;
+            const text = String(raw ?? "").trim(); return (text.includes("潜桥") || text.startsWith("1") || text.startsWith("2")) ? 22 : 0;
         } catch (_error) { return 0; }
     };
     const relaySegmentsNeedAlign = () => {
@@ -4205,66 +4204,124 @@ export function mountTimelineEditor(node) {
     function importTimedText(blocks) {
         if (!Array.isArray(blocks) || !blocks.length) throw new Error("时间文本没有可导入的段落。");
         if (T.playing) stopPlayback();
-        if (T.state.video_tracks.some((lane, index) => lane?.length && !trackDisabled(T.state, "video_tracks", index))) throw new Error("时间文本导入目前只支持单音频轨：请先隐藏/删除视频轨片段。");
-        const audioLanes = T.state.audio_tracks.map((lane, index) => ({lane: lane || [], index})).filter(item => item.lane.length && !trackDisabled(T.state, "audio_tracks", item.index));
-        if (audioLanes.length !== 1) throw new Error("时间文本导入目前只支持一条音频轨：请先隐藏/删除其它音频轨。");
-        const li = audioLanes[0].index, lane = audioLanes[0].lane;
-        if (!lane.some(item => T.selected.has(item.id))) throw new Error("请先选中要切分的音频片段（当前轨道唯一片段）。");
-        const head = lane[0];
-        const contiguous = lane.every((item, index) => index === 0 ||
-            (item.source === head.source &&
-             Math.abs(Number(item.tl_start) - clipEnd(lane[index - 1])) < 1e-6 &&
-             Math.abs(Number(item.src_in) - Number(lane[index - 1].src_out)) < 1e-6));
-        const covers = Math.abs(Number(lane.at(-1).src_out) - Number(head.src_in) - (clipEnd(lane.at(-1)) - Number(head.tl_start))) < 1e-6;
-        if (lane.length > 1 && (!contiguous || !covers))
-            throw new Error("当前音频轨不是一条连续同源片段；请先合并或重新导入整条音频。");
-        const clip = lane.length > 1 ? {...head, src_out: lane.at(-1).src_out} : head;
-        if (Math.round(clip.tl_start * FPS) > 0) throw new Error("当前音频片段起点不是 0；时间文本导入要求从时间线 0 开始。");
-        const trackEnd = Math.round(clipEnd(clip) * FPS);
-        const maxFrames = Math.max(5, Math.round(Number($("[data-max-frames]")?.value) || T.state.max_frames || 362));
+        if (String(T.state.path_source || "").trim()) throw new Error("素材路径批处理模式不支持时间文本切分，请先清空素材路径。");
+        if (!linkedPromptSegment(node)) throw new Error("请先把「分段清单」连到 AD-分段生成，才能写入逐段提示词。");
+        const maxFrames = Math.max(5, Math.round(Number($("[data-max-frames]")?.value) || T.state.max_frames || DEFAULT_MAX_FRAMES));
         const frames = blocks.map(block => ({start: Math.round(block.startFrame), end: Math.round(block.endFrame)}));
         frames[0].start = 0;
-        frames.forEach((block, index) => {
-            const length = block.end - block.start;
-            if (length < 5) throw new Error(`第 ${index + 1} 块只有 ${length} 帧，少于 H3 最少的 5 帧。`);
-            if (length > maxFrames) throw new Error(`第 ${index + 1} 块 ${length} 帧，超过单段上限 ${maxFrames} 帧。`);
-        });
-        if (frames.at(-1).end > trackEnd + 1) throw new Error(`文本结束（${frames.at(-1).end} 帧）超过音频长度（${trackEnd} 帧）。`);
-        if (frames.at(-1).end < trackEnd) frames.at(-1).end = trackEnd;
-        const lastLength = frames.at(-1).end - frames.at(-1).start;
-        if (lastLength > maxFrames) throw new Error(`末段并入音频尾部后为 ${lastLength} 帧，超过单段上限 ${maxFrames} 帧。`);
-        for (let index = 1; index < frames.length; index++) {
-            if (frames[index].start !== frames[index - 1].end) throw new Error("时间文本块之间存在空隙/重叠，无法连续切分。");
-        }
-        if (!linkedPromptSegment(node)) throw new Error("请先把「分段清单」连到 AD-分段生成，才能写入逐段提示词。");
+        const validateBlocks = () => {
+            for (let index = 0; index < frames.length; index++) {
+                const length = frames[index].end - frames[index].start;
+                if (length < 5) throw new Error(`第 ${index + 1} 块只有 ${length} 帧，少于 H3 最少的 5 帧。`);
+                if (length > maxFrames) throw new Error(`第 ${index + 1} 块 ${length} 帧，超过单段上限 ${maxFrames} 帧。`);
+                if (index && frames[index].start !== frames[index - 1].end)
+                    throw new Error("时间文本块之间存在空隙/重叠，无法连续切分。");
+            }
+        };
+        validateBlocks();
         const prompt = timedPromptFromBlocks(blocks);
+        const activeLanes = (key) => T.state[key].map((lane, index) => ({lane: lane || [], index}))
+            .filter(item => item.lane.length && !trackDisabled(T.state, key, item.index));
+        const videoLanes = activeLanes("video_tracks");
+        const audioLanes = activeLanes("audio_tracks");
+        const hasAv = videoLanes.length > 0 || audioLanes.length > 0;
+        const selected = selectedEditableClips();
+        const laneOf = (clip) => {
+            for (const key of ["video_tracks", "audio_tracks"])
+                for (const item of activeLanes(key))
+                    if (item.lane.some(candidate => candidate.id === clip.id)) return {key, ...item};
+            return null;
+        };
+        const groups = {video_tracks: [], audio_tracks: []};
+        for (const clip of selected) {
+            const found = laneOf(clip);
+            if (!found) continue;
+            if (!groups[found.key].some(item => item.index === found.index)) groups[found.key].push(found);
+        }
+        if (groups.video_tracks.length > 1 || groups.audio_tracks.length > 1)
+            throw new Error("一次只支持切一条音频轨和/或一条视频轨；请只选中一条轨上的片段。");
+        const virtualMode = !hasAv;
+        let carriers = [];
+        if (!virtualMode) {
+            if (!selected.length) throw new Error("请先选中要按时间文本切分的音频或视频片段。");
+            if (!groups.video_tracks.length && !groups.audio_tracks.length)
+                throw new Error("未找到可切分的选中片段；请选中音频或视频片段。");
+            if (!groups.video_tracks.length && videoLanes.length)
+                throw new Error("当前有可见视频轨：分段以视频为准，请选中视频片段（或同时选中视频+音频）。");
+            carriers = [...groups.video_tracks, ...groups.audio_tracks];
+        }
+        let laneEnds = [];
+        if (!virtualMode) {
+            for (const carrier of carriers) {
+                const lane = [...carrier.lane].sort((left, right) => Number(left.tl_start) - Number(right.tl_start));
+                const head = lane[0], tail = lane.at(-1);
+                const contiguous = lane.every((item, index) => index === 0 ||
+                    (item.source === head.source &&
+                     Math.abs(Number(item.tl_start) - clipEnd(lane[index - 1])) < 1e-6 &&
+                     Math.abs(Number(item.src_in) - Number(lane[index - 1].src_out)) < 1e-6));
+                const covers = Math.abs(Number(tail.src_out) - Number(head.src_in) - (clipEnd(tail) - Number(head.tl_start))) < 1e-6;
+                if (lane.length > 1 && (!contiguous || !covers))
+                    throw new Error("选中的轨道不是一条从 0 开始的连续同源片段；请先合并或重新导入整条素材。");
+                if (Math.round(Number(head.tl_start) * FPS) > 0)
+                    throw new Error("时间文本导入要求选中轨道从时间线 0 开始。");
+                laneEnds.push({carrier, head, tail, end: Math.round(clipEnd(tail) * FPS)});
+            }
+            if (new Set(laneEnds.map(item => item.end)).size > 1)
+                throw new Error("同时切音频+视频时，两条轨道的总长必须一致；请先对齐两条轨或只选其中一条。");
+            const trackEnd = laneEnds[0].end;
+            const textEnd = frames.at(-1).end;
+            if (textEnd > trackEnd + 1) throw new Error(`文本结束（${textEnd} 帧）超过选中轨道长度（${trackEnd} 帧）。`);
+            if (textEnd < trackEnd) frames.at(-1).end = trackEnd;
+            validateBlocks();
+        }
+        const cuts = frames.slice(1).map(block => snapFrame(block.start / FPS));
+        const modeLabel = virtualMode ? "无音视频：按时间块建立生成段"
+            : carriers.length === 2 ? "同时切选中的音频+视频轨"
+            : carriers[0].key === "video_tracks" ? "切选中的视频轨" : "切选中的音频轨";
         const preview = frames.slice(0, 8).map((block, index) =>
             `#${index + 1}  ${timedClockFrames(block.start)}–${timedClockFrames(block.end)}  (${block.end - block.start} 帧)`).join("\n");
-        if (!window.confirm(`识别到 ${frames.length} 段，音频总长 ${timedClockFrames(trackEnd)}。\n\n${preview}${frames.length > 8 ? "\n…" : ""}\n\n将切分当前选中音频轨、替换现有分段，并写入每段正向提示词。继续？`)) return;
+        if (!window.confirm(`${modeLabel}\n识别到 ${frames.length} 段。\n\n${preview}${frames.length > 8 ? "\n…" : ""}\n\n继续导入并写入每段正向提示词？`)) return;
+        const keepFrames = Math.max(5, Math.round(currentSegmentFrames() || T.state.segment_recipe?.frames || DEFAULT_SEG_FRAMES));
         pushUndo(false, currentLinkedPrompt());
-        let splitClip = clip;
-        if (lane.length > 1) {
-            // 重新导入时把上一次切开的同源连续片段还原成一条逻辑片段，再按新时间文本重切。
-            T.state.audio_tracks[li] = [clip];
-            T.selected = new Set([clip.id]);
-            splitClip = clip;
+        if (virtualMode) {
+            const clips = frames.map(block => ({
+                id: uid("timed"),
+                tl_start: snapFrame(block.start / FPS),
+                src_in: 0,
+                src_out: snapFrame((block.end - block.start) / FPS),
+            }));
+            T.state.generation_clips = clips;
+            T.state.duration = snapFrame(frames.at(-1).end / FPS);
+            T.state.split_points = [];
+            T.state.segmentation = "clips";
+            T.state.segment_recipe = {frames: keepFrames, count: frames.length, unit: T.unit, timed_text: true, manual_count: true};
+            T.selected = new Set(clips.map(clip => clip.id));
+            T.segment = -1;
+            setLinkedPromptText(prompt);
+            const countInput = $("[data-count]");
+            if (countInput) countInput.value = String(frames.length);
+            afterEdit();
+            hint(`${modeLabel}：已建立 ${frames.length} 段；实际段长按时间文本保留，每段长度保持 ${keepFrames} 帧；可撤销。`);
+            return;
         }
-        splitSelectedClips([splitClip], frames.slice(1).map(block => snapFrame(block.start / FPS)));
+        // 有音视频：只还原并切选中的轨道；未选中的轨道保持原样。
+        for (const {carrier, head, tail} of laneEnds)
+            T.state[carrier.key][carrier.index] = [{...head, src_out: tail.src_out}];
+        for (const {carrier} of laneEnds)
+            splitSelectedClips([T.state[carrier.key][carrier.index][0]], cuts);
+        const pieceIds = [];
+        for (const {carrier} of laneEnds)
+            for (const clip of T.state[carrier.key][carrier.index] || []) pieceIds.push(clip.id);
+        T.selected = new Set(pieceIds);
         T.state.segmentation = "clips";
         T.state.split_points = [];
+        T.state.segment_recipe = {frames: keepFrames, count: frames.length, unit: T.unit, timed_text: true, manual_count: true};
         T.segment = -1;
-        const pieces = T.state.audio_tracks[li] || [];
-        T.selected = new Set(pieces.map(piece => piece.id));
-        const average = Math.max(1, Math.round(frames.reduce((sum, block) => sum + block.end - block.start, 0) / frames.length));
-        T.unit = T.unit === "s" ? "s" : "f";
-        const everyInput = $("[data-every]");
-        if (everyInput) everyInput.value = T.unit === "s" ? Number((average / FPS).toFixed(6)) : average;
+        setLinkedPromptText(prompt);
         const countInput = $("[data-count]");
         if (countInput) countInput.value = String(frames.length);
-        T.state.segment_recipe = { frames: average, count: frames.length, unit: T.unit, custom: false };
-        setLinkedPromptText(prompt);
         afterEdit();
-        hint(`已导入 ${frames.length} 段：切分当前音频轨并写入正向提示词；可撤销。`);
+        hint(`${modeLabel}：已切 ${frames.length} 段；每段长度保持 ${keepFrames} 帧；可撤销。`);
     }
 
     // ---------- 工具栏 ----------

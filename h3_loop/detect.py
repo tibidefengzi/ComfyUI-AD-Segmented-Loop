@@ -64,7 +64,7 @@ def _decode_wav(path: Path, vocals: bool = False, start_time=0.0, end_time=None)
             filters=["-af","pan=mono|c0=0.5*c0+0.5*c1"]
     span = _range(path, start_time, end_time)
     command=[ffmpeg_executable(),"-v","error","-nostdin","-y","-ss",str(span[0]),"-i",str(path),"-t",str(span[1]-span[0]),*filters,"-ac","1","-ar","22050",str(tmp)]
-    finished=subprocess.run(command,capture_output=True)
+    finished=subprocess.run(command,capture_output=True,creationflags=getattr(subprocess,"CREATE_NO_WINDOW",0))
     if finished.returncode!=0 or not tmp.is_file():
         tmp.unlink(missing_ok=True)
         raise ValueError("音频解码失败："+finished.stderr.decode("utf-8","replace")[:200])
@@ -132,7 +132,7 @@ def detect_shots(path: Path, threshold: float = 0.3, min_shot: float = 1.0, max_
     if not cuts:
         command = [ffmpeg_executable(), "-v", "info", "-nostdin", "-ss", str(first), "-i", str(path), "-t", str(duration),
                    "-vf", f"select='gt(scene,{threshold})',metadata=print", "-an", "-f", "null", "-"]
-        finished = subprocess.run(command, capture_output=True)
+        finished = subprocess.run(command, capture_output=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         text = (finished.stderr or b"").decode("utf-8", "replace")
         for line in text.splitlines():
             if "pts_time:" in line:
