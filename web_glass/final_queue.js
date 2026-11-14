@@ -16,6 +16,44 @@ export function previewSources(prompt, finalId) {
     return [...found];
 }
 
+// 显式运行只保留目标及其上游；整图运行在 AD 分段预览处截止。
+export function stopAtPreview(prompt, targets = []) {
+    if (targets?.length) {
+        const needed = new Set(), pending = targets.map(String);
+        while (pending.length) {
+            const id = pending.pop();
+            if (needed.has(id) || !prompt?.[id]) continue;
+            needed.add(id);
+            for (const value of Object.values(prompt[id].inputs || {})) {
+                if (Array.isArray(value) && value.length === 2 && Number.isInteger(value[1]) && prompt[String(value[0])]) {
+                    pending.push(String(value[0]));
+                }
+            }
+        }
+        return Object.fromEntries(Object.entries(prompt || {}).filter(([id]) => needed.has(id)));
+    }
+    const sources = new Set(), children = new Map();
+    for (const [id, node] of Object.entries(prompt || {})) {
+        if (node.class_type === "AidenH3VideoPreview") sources.add(id);
+        for (const value of Object.values(node.inputs || {})) {
+            if (!Array.isArray(value) || value.length !== 2 || !Number.isInteger(value[1]) || !prompt[String(value[0])]) continue;
+            const parent = String(value[0]);
+            if (!children.has(parent)) children.set(parent, []);
+            children.get(parent).push(id);
+        }
+    }
+    const blocked = new Set(), pending = [...sources];
+    for (let index = 0; index < pending.length; index++) {
+        for (const child of children.get(pending[index]) || []) {
+            if (blocked.has(child)) continue;
+            blocked.add(child);
+            pending.push(child);
+        }
+    }
+    if (!blocked.size) return prompt;
+    return Object.fromEntries(Object.entries(prompt).filter(([id]) => !blocked.has(id)));
+}
+
 export function finalSubmission(plan, cursor, token) {
     const record = plan.records[cursor];
     if (!record) throw new Error("没有剩余加工项");

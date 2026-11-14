@@ -1373,26 +1373,20 @@ async def media(request):
 _PREVIEW_PROXY_LOCKS: dict[str, threading.Lock] = {}
 _PREVIEW_PROXY_LOCKS_GUARD = threading.Lock()
 _PREVIEW_PROXY_SEMAPHORE = threading.BoundedSemaphore(2)
-_PREVIEW_PROFILES = {"lite": "720p|30|crf26", "high": "native|crf18"}
 
 
-def _preview_profile(quality) -> str:
-    return "high" if str(quality or "").strip().lower() in {"high", "hq", "quality", "原画", "高画质"} else "lite"
-
-
-def _preview_proxy_key(path: Path, profile: str = "lite") -> str:
-    """内容键：源路径 + 大小 + mtime + 档位；源文件或档位变化后代理会自动重新生成。"""
-    tag = _PREVIEW_PROFILES.get(profile, _PREVIEW_PROFILES["lite"])
+def _preview_proxy_key(path: Path) -> str:
+    """内容键包括源文件状态与固定的轻量预览规格。"""
     stat = path.stat()
     return hashlib.sha256(
-        f"{path.resolve()}|{stat.st_size}|{stat.st_mtime_ns}|{tag}".encode("utf-8", "surrogatepass")
+        f"{path.resolve()}|{stat.st_size}|{stat.st_mtime_ns}|720p|30|crf26".encode("utf-8", "surrogatepass")
     ).hexdigest()[:24]
 
 
-def _preview_proxy_target(path: Path, profile: str = "lite") -> Path:
+def _preview_proxy_target(path: Path) -> Path:
     folder = ROOT / "thumbs"
     folder.mkdir(parents=True, exist_ok=True)
-    return folder / f"preview_{_preview_proxy_key(path, profile)}.mp4"
+    return folder / f"preview_{_preview_proxy_key(path)}.mp4"
 
 
 def _preview_proxy_lock(name: str) -> threading.Lock:
@@ -1414,8 +1408,8 @@ def _proxy_ready(path: Path) -> bool:
         return False
 
 
-def _encode_preview_proxy(source: Path, target: Path, profile: str = "lite") -> None:
-    """lite=720p/30fps/crf26（省资源）；high=原分辨率/原帧率/yuv420p/crf18（硬件解码、接近原画）。"""
+def _encode_preview_proxy(source: Path, target: Path) -> None:
+    """生成轻量 H.264/yuv420p 预览。"""
     import subprocess
     from .assets import ffmpeg_executable, has_audio_stream
     executable = ffmpeg_executable()
@@ -1423,48 +1417,36 @@ def _encode_preview_proxy(source: Path, target: Path, profile: str = "lite") -> 
         raise ValueError("需要 FFmpeg 来生成预览，请将 FFmpeg 加入 PATH 或安装 imageio-ffmpeg")
     info = _probe_media_info(source)
     fps = float(info.get("fps") or 24.0)
-    width = int(info.get("width") or 0)
-    height = int(info.get("height") or 0)
-    if profile == "high":
-        filters = []
-        if max(width, height) > 4096:
-            filters.append("scale=w='min(4096,iw)':h='min(4096,ih)':force_original_aspect_ratio=decrease")
-        filters.append("scale=trunc(iw/2)*2:trunc(ih/2)*2")
-        crf, preset, audio_bitrate = "18", "veryfast", "160k"
-    else:
-        filters = [
-            "scale=w='min(1280,iw)':h='min(1280,ih)':force_original_aspect_ratio=decrease",
-            "scale=trunc(iw/2)*2:trunc(ih/2)*2",
-        ]
-        if fps > 30.5:
-            filters.insert(0, "fps=30")
-        crf, preset, audio_bitrate = "26", "veryfast", "128k"
+    filters = [
+        "scale=w='min(1280,iw)':h='min(1280,ih)':force_original_aspect_ratio=decrease",
+        "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+    ]
+    if fps > 30.5:
+        filters.insert(0, "fps=30")
     command = [executable, "-v", "error", "-nostdin", "-y", "-i", str(source),
                "-vf", ",".join(filters),
-               "-c:v", "libx264", "-preset", preset, "-crf", crf, "-pix_fmt", "yuv420p",
+               "-c:v", "libx264", "-preset", "veryfast", "-crf", "26", "-pix_fmt", "yuv420p",
                "-movflags", "+faststart"]
-    command += (["-c:a", "aac", "-b:a", audio_bitrate] if has_audio_stream(source) else ["-an"])
+    command += (["-c:a", "aac", "-b:a", "128k"] if has_audio_stream(source) else ["-an"])
     # 临时文件后缀是 .part，FFmpeg 无法据此推断容器，显式指定 mp4。
     command += ["-f", "mp4", str(target)]
-    label = "高画质" if profile == "high" else "轻量"
     try:
         subprocess.run(command, check=True, timeout=300, capture_output=True,
                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except subprocess.CalledProcessError as error:
         detail = (error.stderr or b"").decode("utf-8", "replace").strip()[-500:]
-        raise ValueError(f"{label}预览生成失败：{detail or error}") from error
+        raise ValueError(f"预览生成失败：{detail or error}") from error
     except subprocess.TimeoutExpired as error:
-        raise ValueError(f"{label}预览生成超时（300 秒）") from error
+        raise ValueError("预览生成超时（300 秒）") from error
 
 
-def _preview_proxy_file(path: Path, profile: str = "lite") -> Path:
-    """生成/复用预览 MP4（lite=720p/30fps；high=原分辨率/原帧率、yuv420p）。
+def _preview_proxy_file(path: Path) -> Path:
+    """生成/复用轻量预览 MP4。
 
     原始文件不动；只发布完整文件：先写同目录 .part，成功后 os.replace 原子改名；
     同一内容的并发请求由文件级锁串行化，编码并发由信号量限制，避免读到半成品。
     """
-    profile = _preview_profile(profile)
-    target = _preview_proxy_target(path, profile)
+    target = _preview_proxy_target(path)
     if _proxy_ready(target):
         return target
     with _preview_proxy_lock(target.name):
@@ -1475,7 +1457,7 @@ def _preview_proxy_file(path: Path, profile: str = "lite") -> Path:
         with _PREVIEW_PROXY_SEMAPHORE:
             temporary = target.with_name(f"{target.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.part")
             try:
-                _encode_preview_proxy(path, temporary, profile)
+                _encode_preview_proxy(path, temporary)
                 if not _proxy_ready(temporary):
                     raise ValueError("预览生成结果无效，请稍后重试")
                 os.replace(temporary, target)
@@ -1487,7 +1469,7 @@ def _preview_proxy_file(path: Path, profile: str = "lite") -> Path:
 @routes.get("/aiden_h3/preview_proxy/{origin}/{file:.*}")
 @guarded
 async def preview_proxy(request):
-    """最终保存节点预览用：?quality=lite（默认，720p/30fps）或 high（原分辨率/原帧率、硬件解码友好）。"""
+    """最终保存节点的轻量视频预览。"""
     from .assets import VIDEO_EXTS
     from urllib.parse import quote
     origin = request.match_info["origin"]
@@ -1495,8 +1477,7 @@ async def preview_proxy(request):
     path = _resolve_media_path(origin, name)
     if path.suffix.lower() not in VIDEO_EXTS:
         raise ValueError("预览代理仅用于视频")
-    quality = _preview_profile(request.query.get("quality", "lite"))
-    target = await asyncio.to_thread(_preview_proxy_file, path, quality)
+    target = await asyncio.to_thread(_preview_proxy_file, path)
     response = web.FileResponse(target)
     response.headers["Content-Type"] = "video/mp4"
     response.headers["Content-Disposition"] = f"inline; filename*=UTF-8''{quote(target.name)}"
@@ -1525,12 +1506,12 @@ if hasattr(PromptServer.instance, "add_on_prompt_handler"):
 
 # 内部节点只用于 prompt 注入，不应出现在前端节点搜索里。
 # 前端自身只从 LiteGraph 注册表移除还不够：新版节点搜索会直接读 /object_info。
-_HIDDEN_OBJECT_INFO = {
-    "ADH3InternalBridge",
-    "ADH3InternalSave",
-    "ADH3InternalTrim",
-    "AD_FinalSelectedMedia",
-    "AD_RoundBlocked",
+_PUBLIC_NODE_TYPES = {
+    "AidenH3AudioQueue",
+    "AidenH3Segment",
+    "AidenH3VideoPreview",
+    "AD_FinalSave",
+    "AidenH3EditMask",
 }
 
 
@@ -1538,31 +1519,43 @@ def _install_object_info_filter():
     app = getattr(PromptServer.instance, "app", None)
     if app is None or getattr(PromptServer.instance, "_ad_hidden_object_info_filter", False):
         return
-    setattr(PromptServer.instance, "_ad_hidden_object_info_filter", True)
+
+    def hidden_nodes(data):
+        # ComfyUI stamps module ownership on each registered node. Resolve
+        # the module from our public nodes so renamed install folders work.
+        owners = {
+            data[name].get("python_module")
+            for name in _PUBLIC_NODE_TYPES.intersection(data)
+            if isinstance(data[name], dict) and data[name].get("python_module")
+        }
+        return {
+            name for name, info in data.items()
+            if name not in _PUBLIC_NODE_TYPES and isinstance(info, dict)
+            and info.get("python_module") in owners
+        }
 
     @web.middleware
     async def hide_internal_object_info(request, handler):
-        path = request.path
-        if path != "/object_info" and not path.startswith("/object_info/"):
+        path = request.path.removeprefix("/api")
+        # Direct lookups are used when restoring a saved compatibility node.
+        if path != "/object_info":
             return await handler(request)
         response = await handler(request)
         try:
-            if response.content_type != "application/json":
+            if response.status != 200 or response.content_type != "application/json":
                 return response
             data = json.loads(response.text)
-            if path == "/object_info":
-                if not isinstance(data, dict):
-                    return response
-                filtered = {key: value for key, value in data.items() if key not in _HIDDEN_OBJECT_INFO}
-                return web.json_response(filtered)
-            name = path.rsplit("/", 1)[-1]
-            if name in _HIDDEN_OBJECT_INFO:
-                return web.json_response({"error": "node is internal"}, status=404)
+            if not isinstance(data, dict):
+                return response
+            hidden = hidden_nodes(data)
+            if hidden:
+                response.text = json.dumps({key: value for key, value in data.items() if key not in hidden})
         except Exception:
             return response
         return response
 
     app.middlewares.append(hide_internal_object_info)
+    setattr(PromptServer.instance, "_ad_hidden_object_info_filter", True)
 
 
 try:

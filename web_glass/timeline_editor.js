@@ -445,6 +445,23 @@ export function updateSegmentMaterialOutputs(node, state) {
     // 工作流载入期（_adH3GraphReady 之前）连线尚未恢复，先保留现有参考口和保存档里的连线，
     // 等载入完成后再按真实连线清理，避免打开工作流时把用户连线删掉。
     const loading = !!(node._adH3Configured && node._adH3GraphReady !== true);
+    const fitMaterialHeight = () => {
+        if (loading || app.configuringGraph) return;
+        const outputNames = node.outputs.map(output => output.name).join(",");
+        if (node._adH3MaterialHeightSignature === outputNames) return;
+        node._adH3MaterialHeightSignature = outputNames;
+        cancelAnimationFrame(node._adH3MaterialHeightFrame || 0);
+        const graph = node.graph;
+        node._adH3MaterialHeightFrame = requestAnimationFrame(() => {
+            node._adH3MaterialHeightFrame = 0;
+            if (!graph || node.graph !== graph || app.configuringGraph) return;
+            const height = Number(node.computeSize?.()?.[1]);
+            if (Number.isFinite(height) && height > 0 && Math.abs(node.size[1] - height) > 1) {
+                node.setSize([node.size[0], Math.max(240, Math.ceil(height))]);
+                node.setDirtyCanvas?.(true, true);
+            }
+        });
+    };
     const linked = linkedRefCounts(node.outputs, loading ? node._adH3SavedSchema : null);
     // 载入期只能保“保存档案里确实有线”的口；不能把所有旧空口都当已连接口，
     // 否则清空参考图后 9 个参考图口会一直留着。没有保存档案（新建/程序化节点）直接按实际素材收缩。
@@ -527,6 +544,7 @@ export function updateSegmentMaterialOutputs(node, state) {
             node._adH3LastOutputSignature = labelSignature;
             node.setDirtyCanvas?.(true, true);
         }
+        fitMaterialHeight();
         return;
     }
     const alias = { "宽度": "width", "高度": "height", width: "width", height: "height" };
@@ -650,6 +668,7 @@ export function updateSegmentMaterialOutputs(node, state) {
         node._adH3LastOutputSignature = namesNow;
         node.setDirtyCanvas(true, true);
     }
+    fitMaterialHeight();
 }
 
 /** 旧隐藏控件可能携带初次状态；恢复端口和编辑器必须一致读取末尾的当前存档。 */
@@ -1920,6 +1939,7 @@ export function mountTimelineEditor(node) {
         if ((T.state.sources || []).length) return null;
         if ([...T.state.video_tracks, ...T.state.audio_tracks].some(lane => lane && lane.length)) return null;
         const segmentNode = linkedPromptSegment(node);
+        if (segmentNode?._adH3TimedPromptEditing) return null;
         const text = String(segmentNode?.widgets?.find(item => item.name === "正向提示词")?.value ?? "");
         const parts = [];
         let current = [];
@@ -4201,7 +4221,7 @@ export function mountTimelineEditor(node) {
         const minutes = Math.floor(seconds / 60), rest = seconds - minutes * 60;
         return `${minutes}:${rest.toFixed(3).padStart(6, "0")}`;
     }
-    function importTimedText(blocks) {
+    function importTimedText(blocks, options = {}) {
         if (!Array.isArray(blocks) || !blocks.length) throw new Error("时间文本没有可导入的段落。");
         if (T.playing) stopPlayback();
         if (String(T.state.path_source || "").trim()) throw new Error("素材路径批处理模式不支持时间文本切分，请先清空素材路径。");
@@ -4280,9 +4300,10 @@ export function mountTimelineEditor(node) {
             : carriers[0].key === "video_tracks" ? "切选中的视频轨" : "切选中的音频轨";
         const preview = frames.slice(0, 8).map((block, index) =>
             `#${index + 1}  ${timedClockFrames(block.start)}–${timedClockFrames(block.end)}  (${block.end - block.start} 帧)`).join("\n");
-        if (!window.confirm(`${modeLabel}\n识别到 ${frames.length} 段。\n\n${preview}${frames.length > 8 ? "\n…" : ""}\n\n继续导入并写入每段正向提示词？`)) return;
+        const confirmImport = !options.automatic || hasAv || T.state.segment_recipe?.manual_count || T.state.segment_recipe?.custom || T.state.segment_recipe?.timed_text;
+        if (confirmImport && !window.confirm(`${modeLabel}\n识别到 ${frames.length} 段。\n\n${preview}${frames.length > 8 ? "\n…" : ""}\n\n继续导入并写入每段正向提示词？`)) return;
         const keepFrames = Math.max(5, Math.round(currentSegmentFrames() || T.state.segment_recipe?.frames || DEFAULT_SEG_FRAMES));
-        pushUndo(false, currentLinkedPrompt());
+        pushUndo(false, options.promptSnapshot ?? currentLinkedPrompt());
         if (virtualMode) {
             const clips = frames.map(block => ({
                 id: uid("timed"),
@@ -4302,7 +4323,7 @@ export function mountTimelineEditor(node) {
             if (countInput) countInput.value = String(frames.length);
             afterEdit();
             hint(`${modeLabel}：已建立 ${frames.length} 段；实际段长按时间文本保留，每段长度保持 ${keepFrames} 帧；可撤销。`);
-            return;
+            return true;
         }
         // 有音视频：只还原并切选中的轨道；未选中的轨道保持原样。
         for (const {carrier, head, tail} of laneEnds)
@@ -4322,7 +4343,22 @@ export function mountTimelineEditor(node) {
         if (countInput) countInput.value = String(frames.length);
         afterEdit();
         hint(`${modeLabel}：已切 ${frames.length} 段；每段长度保持 ${keepFrames} 帧；可撤销。`);
+        return true;
     }
+    node._adH3ImportTimedPrompt = (text, options = {}) => {
+        try {
+            const segment = linkedPromptSegment(node);
+            if (segment !== options.segmentNode) throw new Error("当前提示词节点不是此素材准备的分段目标，请检查连线。");
+            if (node._adH3MaterialsReady === false) throw new Error("素材准备仍在加载，请稍后重新粘贴。");
+            const busy = [node, segment].some(item => item?._adH3LocalProgress?.busy ||
+                ["queued", "running", "merging"].includes(item?._adH3Progress?.phase));
+            if (busy) throw new Error("正在运行，请先停止，再重新粘贴带时间码的提示词。");
+            return importTimedText(parseTimedText(text), {...options, automatic: true});
+        } catch (error) {
+            hint(error?.message || "时间文本自动导入失败", true);
+            return false;
+        }
+    };
 
     // ---------- 工具栏 ----------
     root.addEventListener("click", async event => {

@@ -165,6 +165,19 @@ function findSamplerUpstream(prompt, startLink, maxDepth = 8) {
         const node = prompt[id];
         if (!node) return null;
         if (String(node.class_type || "").includes("Sampler")) return [id, node];
+        if (node.class_type === "ComfySwitchNode") {
+            // Only the selected lazy branch belongs to this generation chain.
+            const selected = node.inputs?.switch;
+            if (typeof selected !== "boolean") {
+                throw new Error("潜桥续接无法在提交前确定切换节点（" + id + "）的分支；请将 switch 设为固定的开启或关闭值。");
+            }
+            const branch = selected ? "on_true" : "on_false";
+            link = promptLink(node, branch);
+            if (!link) {
+                throw new Error("潜桥续接的切换节点（" + id + "）当前选中的 " + branch + " 分支未连线；请连接该分支后再运行。");
+            }
+            continue;
+        }
         link = promptLink(node, "samples") || promptLink(node, "latent") || promptLink(node, "images");
     }
     return null;
@@ -309,12 +322,22 @@ function replaceNodeType(graph, oldNode, newType) {
     return ctor;
 }
 
-function findVideoVaeLink(prompt) {
-    for (const candidate of Object.values(prompt || {})) {
+function findVideoVaeLink(prompt, source) {
+    const pending = source ? [source] : [];
+    const seen = new Set();
+    for (let index = 0; index < pending.length; index++) {
+        const link = pending[index];
+        if (!Array.isArray(link) || link.length !== 2) continue;
+        const id = String(link[0]);
+        if (seen.has(id)) continue;
+        seen.add(id);
+        const candidate = prompt[id];
+        if (!candidate) continue;
         const cls = String(candidate?.class_type || "");
-        if (!/RemakeConditioning|ReferenceToVideo|H3.*Conditioning/i.test(cls)) continue;
-        const link = candidate?.inputs?.vae;
-        if (Array.isArray(link) && link.length === 2) return link;
+        const vae = candidate.inputs?.vae;
+        if (/RemakeConditioning|ReferenceToVideo|H3.*Conditioning/i.test(cls)
+            && Array.isArray(vae) && vae.length === 2) return vae;
+        pending.push(...Object.values(candidate.inputs || {}));
     }
     return null;
 }
@@ -330,6 +353,132 @@ function nextNumericId(prompt) {
 
 function outputIndex(node, name) {
     return (node?.outputs || []).findIndex(o => o.name === name);
+}
+
+// Match the video path of the split → upscale → join workflow. Audio can
+// branch elsewhere, so it cannot be used to identify the first sampler.
+function findFirstUpscaleSampler(prompt, latentLink) {
+    const join = latentLink && prompt[String(latentLink[0])];
+    const videoPort = { LTXVConcatAVLatent: "video_latent", MiniMaxH3XJoinAV: "video" }[join?.class_type];
+    const video = videoPort && promptLink(join, videoPort);
+    const upscale = video && prompt[String(video[0])];
+    if (!/^MinimaxH3LatentUpscaler(?:Node2D|3D)$/i.test(upscale?.class_type || "")) return null;
+    const splitLink = promptLink(upscale, "latent");
+    const split = splitLink && prompt[String(splitLink[0])];
+    const avPort = { LTXVSeparateAVLatent: "av_latent", MiniMaxH3XSplitAV: "latent" }[split?.class_type];
+    if (!avPort || Number(splitLink[1]) !== 0) return null;
+    const av = promptLink(split, avPort);
+    const first = av && prompt[String(av[0])];
+    if (first?.class_type !== "SamplerCustomAdvanced" || !promptLink(first, "latent_image")) return null;
+    const audio = promptLink(join, videoPort === "video" ? "audio" : "audio_latent");
+    const sharesAudio = audio && String(audio[0]) === String(splitLink[0]) && Number(audio[1]) === 1;
+    return { id: String(av[0]), sampler: first, sharesAudio: Boolean(sharesAudio) };
+}
+
+function injectRelayBridge(prompt, samplerId, sampler, latentLink, relayContext, contextFrames,
+    anchorConfig, anchorJson, bridgeId, allocateId, passRole) {
+    const guiderLink = promptLink(sampler, "guider");
+    let guider = guiderLink ? prompt[String(guiderLink[0])] : null;
+    if (guider && (promptLink(guider, "conditioning") || promptLink(guider, "positive"))) {
+        const shared = Object.entries(prompt).some(([otherId, other]) => otherId !== samplerId
+            && Object.values(other.inputs || {}).some(value => Array.isArray(value) && value.length === 2
+                && String(value[0]) === String(guiderLink[0]) && Number(value[1]) === Number(guiderLink[1])));
+        if (shared) {
+            // Keep earlier sampling stages on their original conditioning; modifying
+            // their shared guider would make the bridge depend on its own output.
+            const localGuiderId = allocateId();
+            guider = {...guider, inputs: {...guider.inputs}};
+            prompt[localGuiderId] = guider;
+            sampler.inputs.guider = [localGuiderId, guiderLink[1]];
+        }
+    }
+    const directPositive = !guiderLink && !!promptLink(sampler, "positive");
+    // BasicGuider 的条件口叫 conditioning；CFGGuider 拆成 positive/negative（negative 不动）。
+    const guiderConditioning = guider ? promptLink(guider, "conditioning") : null;
+    const guiderPositive = guider ? promptLink(guider, "positive") : null;
+    const conditioningTarget = directPositive ? "sampler-positive"
+        : (guiderConditioning ? "guider-conditioning" : (guiderPositive ? "guider-positive" : null));
+    const conditioningLink = directPositive ? promptLink(sampler, "positive")
+        : (guiderConditioning || guiderPositive || null);
+    const currentConditioning = () => {
+        if (conditioningTarget === "sampler-positive") return promptLink(sampler, "positive");
+        if (conditioningTarget === "guider-conditioning") return promptLink(guider, "conditioning");
+        if (conditioningTarget === "guider-positive") return promptLink(guider, "positive");
+        return null;
+    };
+    const setConditioning = (link) => {
+        if (conditioningTarget === "sampler-positive") sampler.inputs.positive = link;
+        else if (conditioningTarget === "guider-conditioning") guider.inputs.conditioning = link;
+        else if (conditioningTarget === "guider-positive") guider.inputs.positive = link;
+    };
+    // 只沿当前采样器的条件/latent 来源查找，避免多条生成链串用其它节点的 VAE。
+    const videoVaeLink = findVideoVaeLink(prompt, conditioningLink)
+        || findVideoVaeLink(prompt, latentLink);
+    const bridgeInputs = {
+        latent: latentLink,
+        relay_context: relayContext,
+        context_frames: contextFrames,
+        mask_mode: "hard",
+        pin_audio: true,
+        anchor_config: anchorJson,
+    };
+    if (passRole) bridgeInputs.pass_role = passRole;
+    if (conditioningLink) bridgeInputs.conditioning = conditioningLink;
+    if (videoVaeLink) bridgeInputs.vae = videoVaeLink;
+    prompt[bridgeId] = {
+        class_type: "ADH3InternalBridge",
+        inputs: bridgeInputs,
+        _meta: { title: "AD-内部潜桥桥接" },
+    };
+    sampler.inputs.latent_image = [bridgeId, 0];
+    if (conditioningLink) setConditioning([bridgeId, 1]);
+    // 外观锚：把第 1 段开头帧作为 minimax_refs 追加进 H3 conditioning。
+    // 只改条件链，不改 latent / 帧数 / 裁头 ⇒ 接缝不跳。
+    if (anchorConfig.appearance > 0) {
+        // guider 链（BasicGuider / CFGGuider）与 direct positive 链（SelfLift / KSampler）都要能挂外观锚。
+        const anchorLink = currentConditioning();
+        if (anchorLink) {
+            const anchorId = allocateId();
+            prompt[anchorId] = {
+                class_type: "ADH3InternalAppearanceAnchor",
+                inputs: {
+                    conditioning: anchorLink,
+                    relay_context: relayContext,
+                    anchor_config: anchorJson,
+                },
+                _meta: { title: "AD-内部锚定" },
+            };
+            if (passRole === "first") prompt[anchorId].inputs.first_pass_latent = latentLink;
+            setConditioning([anchorId, 0]);
+        } else {
+            console.warn("[AD-潜桥] 外观锚未生效：找不到可用的 conditioning 输入（guider/positive）");
+        }
+    }
+    // 重锚定尾帧锚定：仅重锚定段生效；把上一段成片最后 N 帧作为硬件 guide 锚到本段预卷开头。
+    if (anchorConfig.reanchor_guide > 0) {
+        const guideVae = videoVaeLink;
+        const guideConditioning = currentConditioning();
+        if (guideConditioning && guideVae) {
+            const guideId = allocateId();
+            prompt[guideId] = {
+                class_type: "ADH3InternalReanchorGuide",
+                inputs: {
+                    conditioning: guideConditioning,
+                    relay_context: relayContext,
+                    vae: guideVae,
+                    anchor_config: anchorJson,
+                },
+                _meta: { title: "AD-重锚定尾帧锚定" },
+            };
+            if (passRole) {
+                prompt[guideId].inputs.stage_latent = latentLink;
+                prompt[guideId].inputs.first_pass = passRole === "first";
+            }
+            setConditioning([guideId, 0]);
+        } else {
+            console.warn("[AD-潜桥] 重锚定尾帧锚定未生效：缺少 VAE 或 conditioning");
+        }
+    }
 }
 
 export function injectHiddenRelay(serialized, graph) {
@@ -393,99 +542,23 @@ export function injectHiddenRelay(serialized, graph) {
         const anchorConfig = anchorConfigOf(segmentNode);
         const anchorJson = JSON.stringify(anchorConfig);
         // 采样器分两类：guider 链路（SamplerCustomAdvanced）与直接 positive 链路（SelfLift / KSampler 等）。
-        const guiderLink = promptLink(sampler, "guider");
-        const guider = guiderLink ? prompt[String(guiderLink[0])] : null;
-        const directPositive = !guiderLink && !!promptLink(sampler, "positive");
-        // BasicGuider 的条件口叫 conditioning；CFGGuider 拆成 positive/negative（negative 不动）。
-        const guiderConditioning = guider ? promptLink(guider, "conditioning") : null;
-        const guiderPositive = guider ? promptLink(guider, "positive") : null;
-        const conditioningTarget = directPositive ? "sampler-positive"
-            : (guiderConditioning ? "guider-conditioning" : (guiderPositive ? "guider-positive" : null));
-        const conditioningLink = directPositive ? promptLink(sampler, "positive")
-            : (guiderConditioning || guiderPositive || null);
-        const currentConditioning = () => {
-            if (conditioningTarget === "sampler-positive") return promptLink(sampler, "positive");
-            if (conditioningTarget === "guider-conditioning") return promptLink(guider, "conditioning");
-            if (conditioningTarget === "guider-positive") return promptLink(guider, "positive");
-            return null;
-        };
-        const setConditioning = (link) => {
-            if (conditioningTarget === "sampler-positive") sampler.inputs.positive = link;
-            else if (conditioningTarget === "guider-conditioning") guider.inputs.conditioning = link;
-            else if (conditioningTarget === "guider-positive") guider.inputs.positive = link;
-        };
         const bridgeId = String(id++);
         const saveId = String(id++);
         const trimId = String(id++);
-        // v0.5.50：像素质量复位桥接需要视频 VAE（用于把上一段成片尾帧重编码成上下文）；
-        // 取 RemakeConditioning 的 vae 输入连线，取不到则桥接自动回退直接 latent。
-        let remakeVaeLink = null;
-        for (const candidate of Object.values(prompt || {})) {
-            const cls = String(candidate?.class_type || "");
-            if (!cls.includes("RemakeConditioning")) continue;
-            const link = candidate?.inputs?.vae;
-            if (Array.isArray(link) && link.length === 2) { remakeVaeLink = link; break; }
+        const relayContext = [segId, contextIdx];
+        const firstSampler = findFirstUpscaleSampler(prompt, latentLink);
+        if (firstSampler && usedSamplers.has(firstSampler.id)) {
+            throw new Error("潜桥续接的两条生成链共用一采节点 " + firstSampler.id + "，请分别连接。");
         }
-        const bridgeInputs = {
-            latent: latentLink,
-            relay_context: [segId, contextIdx],
-            context_frames: contextFrames,
-            mask_mode: "hard",
-            pin_audio: true,
-            anchor_config: anchorJson,
-        };
-        if (conditioningLink) bridgeInputs.conditioning = conditioningLink;
-        // 重锚定软重置与像素质量复位都需要视频 VAE：优先 RemakeConditioning 的 vae，其次条件节点的 vae。
-        const videoVaeLink = remakeVaeLink || findVideoVaeLink(prompt);
-        if (videoVaeLink) bridgeInputs.vae = videoVaeLink;
-        prompt[bridgeId] = {
-            class_type: "ADH3InternalBridge",
-            inputs: bridgeInputs,
-            _meta: { title: "AD-内部潜桥桥接" },
-        };
-        sampler.inputs.latent_image = [bridgeId, 0];
-        if (conditioningLink) setConditioning([bridgeId, 1]);
-        // 外观锚：把第 1 段开头帧作为 minimax_refs 追加进 H3 conditioning。
-        // 只改条件链，不改 latent / 帧数 / 裁头 ⇒ 接缝不跳。
-        if (anchorConfig.appearance > 0) {
-            // guider 链（BasicGuider / CFGGuider）与 direct positive 链（SelfLift / KSampler）都要能挂外观锚。
-            const anchorLink = currentConditioning();
-            if (anchorLink) {
-                const anchorId = String(id++);
-                prompt[anchorId] = {
-                    class_type: "ADH3InternalAppearanceAnchor",
-                    inputs: {
-                        conditioning: anchorLink,
-                        relay_context: [segId, contextIdx],
-                        anchor_config: anchorJson,
-                    },
-                    _meta: { title: "AD-内部锚定" },
-                };
-                setConditioning([anchorId, 0]);
-            } else {
-                console.warn("[AD-潜桥] 外观锚未生效：找不到可用的 conditioning 输入（guider/positive）");
-            }
-        }
-        // 重锚定尾帧锚定：仅重锚定段生效；把上一段成片最后 N 帧作为硬件 guide 锚到本段预卷开头。
-        if (anchorConfig.reanchor_guide > 0) {
-            const guideVae = remakeVaeLink || findVideoVaeLink(prompt);
-            const guideConditioning = currentConditioning();
-            if (guideConditioning && guideVae) {
-                const guideId = String(id++);
-                prompt[guideId] = {
-                    class_type: "ADH3InternalReanchorGuide",
-                    inputs: {
-                        conditioning: guideConditioning,
-                        relay_context: [segId, contextIdx],
-                        vae: guideVae,
-                        anchor_config: anchorJson,
-                    },
-                    _meta: { title: "AD-重锚定尾帧锚定" },
-                };
-                setConditioning([guideId, 0]);
-            } else {
-                console.warn("[AD-潜桥] 重锚定尾帧锚定未生效：缺少 VAE 或 conditioning");
-            }
+        if (firstSampler) usedSamplers.add(firstSampler.id);
+        injectRelayBridge(prompt, samplerId, sampler, latentLink, relayContext, contextFrames,
+            anchorConfig, anchorJson, bridgeId, () => String(id++), firstSampler ? "second" : null);
+        if (firstSampler) {
+            const { id: firstId, sampler: first, sharesAudio } = firstSampler;
+            if (sharesAudio) prompt[bridgeId].inputs.audio_pre_rolled = true;
+            const firstLatent = promptLink(first, "latent_image");
+            injectRelayBridge(prompt, firstId, first, firstLatent, relayContext, contextFrames,
+                anchorConfig, anchorJson, String(id++), () => String(id++), "first");
         }
         prompt[saveId] = {
             class_type: "ADH3InternalSave",
@@ -496,6 +569,7 @@ export function injectHiddenRelay(serialized, graph) {
             },
             _meta: { title: "AD-内部潜桥存盘" },
         };
+        if (firstSampler) prompt[saveId].inputs.first_pass_latent = [firstSampler.id, 1];
         const trimInputs = {
             images: imagesLink,
             relay_context: [segId, contextIdx],
@@ -503,6 +577,8 @@ export function injectHiddenRelay(serialized, graph) {
             // v0.5.48：裁头节点顺带执行“整段软校正”（按第 1 段成片校正皮肤/服装色）。
             anchor_config: anchorJson,
         };
+        // 当前预览必须依赖本段潜桥存盘，局部运行到预览时也要完成单采/双采的续接数据保存。
+        trimInputs.saved_latent = [saveId, 0];
         if (generatedAudio) trimInputs.audio = audioLink;
         prompt[trimId] = {
             class_type: "ADH3InternalTrim",

@@ -2472,18 +2472,19 @@ def parse_anchor_config(raw):
     return data
 
 
-def _anchor_stage_latent(run_id, stage_index):
+def _anchor_stage_latent(run_id, stage_index, *, first_pass=False):
     """读某段稳定 stage 的 AV latent（带缓存，6.1MB/份，避免每段重复读盘）。"""
     path = _relay_stage_file(run_id, int(stage_index))
     if not path.is_file():
         raise FileNotFoundError(str(path))
     stat = path.stat()
-    key = (str(path), int(stat.st_mtime_ns), int(stat.st_size))
+    key = (str(path), int(stat.st_mtime_ns), int(stat.st_size), first_pass)
     cached = _ANCHOR_STAGE_CACHE.get(key)
     if cached is not None:
         return cached
     from ._relay_vendor import relay_core as _relay_core
-    latent = _relay_core.load_av_latent(str(path))
+    latent = (_relay_core.load_av_latent(str(path), first_pass=True) if first_pass
+              else _relay_core.load_av_latent(str(path)))
     if len(_ANCHOR_STAGE_CACHE) >= 8:
         _ANCHOR_STAGE_CACHE.clear()
     _ANCHOR_STAGE_CACHE[key] = latent
@@ -2494,6 +2495,30 @@ def _anchor_ref_block(run_id, stage_index, frames=5):
     """把某段开头 frames 帧构建为 H3 原生 minimax_refs 视频参考块。"""
     from ._relay_vendor import relay_core as _relay_core
     return _relay_core.build_anchor_ref(_anchor_stage_latent(run_id, int(stage_index)), int(frames))
+
+
+def _relay_canvas(latent):
+    from ._relay_vendor.relay_core import video_from_latent
+    height, width = video_from_latent(latent).shape[-2:]
+    return int(width) * 16, int(height) * 16
+
+
+def _first_pass_context(run_id, stage, target):
+    from comfy.nested_tensor import NestedTensor
+    from ._relay_vendor.relay_core import streams_from_latent
+    parent = _anchor_stage_latent(run_id, stage, first_pass=True)
+    if _relay_canvas(parent) == _relay_canvas(target):
+        return parent
+    # Older versions have only the final AV latent. Resize video spatially,
+    # preserving temporal tokens and the original audio stream.
+    import torch.nn.functional as functional
+    video, audio = streams_from_latent(parent)
+    width, height = _relay_canvas(target)
+    batch, channels, frames, old_h, old_w = video.shape
+    pixels = video.transpose(1, 2).reshape(batch * frames, channels, old_h, old_w)
+    resized = functional.interpolate(pixels.float(), size=(height // 16, width // 16), mode="area")
+    resized = resized.to(video.dtype).reshape(batch, frames, channels, height // 16, width // 16).transpose(1, 2)
+    return {"samples": NestedTensor((resized, audio))}
 
 
 def _relay_audio_pin_state(target):
@@ -2535,7 +2560,7 @@ def _relay_audio_pin_state(target):
     return (audio, audio_mask) if pinned else (None, None)
 
 
-def _relay_audio_fix(bridge_out, target, ctx, stage, reanchor=False, voice_on=False):
+def _relay_audio_fix(bridge_out, target, ctx, stage, reanchor=False, voice_on=False, *, first_pass=False):
     """潜桥音频钉住/对齐修复：保留音频条件，并把音频内容前置 pre_roll 帧。
 
     背景：Viggle Remake / VAEEncodeAudio 一类工作流把源音轨编码进 AV latent，并用
@@ -2589,7 +2614,8 @@ def _relay_audio_fix(bridge_out, target, ctx, stage, reanchor=False, voice_on=Fa
             note = "静音（重锚定独立段）"
         else:
             try:
-                parent = _anchor_stage_latent(run_id, int(head_stage))
+                parent = (_anchor_stage_latent(run_id, int(head_stage), first_pass=True) if first_pass
+                          else _anchor_stage_latent(run_id, int(head_stage)))
                 tail, take = _relay_core.audio_tail_from_latent(
                     parent, pre,
                     _relay_core.pixel_frames(int(_relay_core.video_from_latent(parent).shape[2])))[:2]
@@ -2656,7 +2682,8 @@ def _prev_segment_file(ctx):
         version = versions[-1]
     if not version or not version.get("file"):
         return None
-    path = STORE.directory(session_id) / str(version["file"])
+    owner = str(ctx.get("preview_parent_session") or session_id)
+    path = STORE.directory(owner) / str(version["file"])
     return path if path.is_file() else None
 
 
@@ -2701,7 +2728,7 @@ def _mild_sharpen(images, amount=0.25):
     return (images + float(amount) * (images - blur)).clamp(0.0, 1.0)
 
 
-def _pixel_bridge_context(run_id, ctx, vae, frames):
+def _pixel_bridge_context(run_id, ctx, vae, frames, *, target=None):
     """像素质量复位：上一段成片尾 frames 帧 → 轻度锐化 → VAE 重编码，替换上下文视频流；
     音频流沿用上一段 stage latent（音频钉住逻辑不变）。"""
     from comfy.nested_tensor import NestedTensor
@@ -2716,6 +2743,11 @@ def _pixel_bridge_context(run_id, ctx, vae, frames):
     images = _decode_tail_frames(path, frames)
     if images is None:
         raise ValueError("上一段成片不足 %d 帧" % frames)
+    if target is not None:
+        width, height = _relay_canvas(target)
+        if tuple(images.shape[1:3]) != (height, width):
+            from comfy.utils import common_upscale
+            images = common_upscale(images.movedim(-1, 1), width, height, "bilinear", "disabled").movedim(1, -1)
     images = _mild_sharpen(images, 0.25)
     z = vae.encode(images)
     expected = int(_relay_core.steps_for_frames(frames))
@@ -2747,6 +2779,8 @@ class ADH3InternalBridge:
             "anchor_config": ("STRING", {"default": "{}"}),
             "conditioning": ("CONDITIONING",),
             "vae": ("VAE",),
+            "pass_role": (["single", "first", "second"], {"default": "single"}),
+            "audio_pre_rolled": ("BOOLEAN", {"default": False}),
         }}
 
     RETURN_TYPES = ("LATENT", "CONDITIONING", "INT")
@@ -2756,8 +2790,11 @@ class ADH3InternalBridge:
     OUTPUT_NODE = False
 
     def run(self, latent, relay_context, context_frames=22, mask_mode="hard", pin_audio=True,
-            anchor_config="{}", conditioning=None, vae=None):
+            anchor_config="{}", conditioning=None, vae=None, pass_role="single", audio_pre_rolled=False):
         ctx = relay_context if isinstance(relay_context, dict) else {}
+        if pass_role == "first":
+            # Only the final pass contributes to the existing segment audit.
+            ctx = dict(ctx)
         run_id = str(ctx.get("relay_run_id") or "ad_relay")
         stage = int(ctx.get("relay_stage_index") or 0)
         cfg = parse_anchor_config(anchor_config)
@@ -2771,15 +2808,32 @@ class ADH3InternalBridge:
         # 第 1 段 stage 未落盘时回退 -1（沿用插件默认：取上一段尾的有声窗）。
         # 重锚定已改为软重置（仍接上一段），同样引第 1 段音色。
         voice_stage = 0 if (stage > 0 and _relay_stage_file(run_id, 0).is_file()) else -1
+        bridge_context = {}
+        if pass_role == "first" and stage > 0:
+            bridge_context["context_latent"] = _first_pass_context(run_id, stage - 1, latent)
         print("[AD-潜桥] 第 %d 段音频：钉住=%s 上游pin=%s 声锚=%s"
               % (stage + 1, audio_pinned, upstream_pin,
                  "stage_00000" if voice_stage == 0 else "关（上一段尾）"))
 
         def finish(result):
             out = result[0]
-            if audio_pinned:
+            if audio_pinned and pass_role == "second" and audio_pre_rolled:
+                if stage > 0:
+                    # The first pass already inserted the audio pre-roll.
+                    from comfy.nested_tensor import NestedTensor
+                    out = {**out, "noise_mask": NestedTensor((out["noise_mask"], latent["noise_mask"].unbind()[1]))}
+            elif audio_pinned and pass_role == "first":
+                out = _relay_audio_fix(out, latent, ctx, stage, first_pass=True)
+            elif audio_pinned:
                 # 重锚定已改为软重置（仍接上一段），音频前导同样取上一段尾，不再用静音占位。
                 out = _relay_audio_fix(out, latent, ctx, stage)
+            if pass_role == "first":
+                mask = out.get("noise_mask")
+                if mask is not None and not getattr(mask, "is_nested", False):
+                    import torch
+                    from comfy.nested_tensor import NestedTensor
+                    audio = out["samples"].unbind()[1]
+                    out = {**out, "noise_mask": NestedTensor((mask, torch.ones_like(audio)))}
             cond = result[3] if len(result) > 3 else conditioning
             trim = int(result[2]) if len(result) > 2 else int(context_frames)
             return (out, cond, trim)
@@ -2790,7 +2844,8 @@ class ADH3InternalBridge:
             # 没有 VAE 或上一段成片时退回直接 latent 续接，不再独立重生成（否则接缝必跳）。
             if stage > 0 and vae is not None:
                 try:
-                    context_latent = _pixel_bridge_context(run_id, ctx, vae, int(context_frames))
+                    context_latent = _pixel_bridge_context(run_id, ctx, vae, int(context_frames),
+                                                          **({"target": latent} if pass_role != "single" else {}))
                     result = upstream.bridge(latent, context_latent=context_latent,
                                              context_frames=int(context_frames),
                                              mask_mode=str(mask_mode or "hard"),
@@ -2807,12 +2862,13 @@ class ADH3InternalBridge:
                                      mask_mode=str(mask_mode or "hard"),
                                      pin_audio=upstream_pin, conditioning=conditioning,
                                      voice_anchor_stage=voice_stage,
-                                     run_id=run_id, stage_index=stage)
+                                     run_id=run_id, stage_index=stage, **bridge_context)
             return finish(result)
         if bridge_mode == 1 and stage > 0 and vae is not None and (run_id or "").strip():
             # 像素质量复位仅作对照档；默认关闭。
             try:
-                context_latent = _pixel_bridge_context(run_id, ctx, vae, int(context_frames))
+                context_latent = _pixel_bridge_context(run_id, ctx, vae, int(context_frames),
+                                                      **({"target": latent} if pass_role != "single" else {}))
                 result = upstream.bridge(latent, context_latent=context_latent,
                                          context_frames=int(context_frames),
                                          mask_mode=str(mask_mode or "hard"),
@@ -2829,7 +2885,7 @@ class ADH3InternalBridge:
                                  mask_mode=str(mask_mode or "hard"),
                                  pin_audio=upstream_pin, conditioning=conditioning,
                                  voice_anchor_stage=voice_stage,
-                                 run_id=run_id, stage_index=stage)
+                                 run_id=run_id, stage_index=stage, **bridge_context)
         return finish(result)
 
 
@@ -2842,14 +2898,17 @@ class ADH3InternalAppearanceAnchor:
             "relay_context": ("H3_LOOP_CONTEXT",),
         }, "optional": {
             "anchor_config": ("STRING", {"default": "{}"}),
+            "first_pass_latent": ("LATENT",),
         }}
     RETURN_TYPES = ("CONDITIONING",)
     FUNCTION = "run"
     CATEGORY = CATEGORY
     OUTPUT_NODE = False
 
-    def run(self, conditioning, relay_context, anchor_config="{}"):
+    def run(self, conditioning, relay_context, anchor_config="{}", first_pass_latent=None):
         ctx = relay_context if isinstance(relay_context, dict) else {}
+        if first_pass_latent is not None:
+            ctx = dict(ctx)
         run_id = str(ctx.get("relay_run_id") or "ad_relay")
         stage = int(ctx.get("relay_stage_index") or 0)
         cfg = parse_anchor_config(anchor_config)
@@ -2861,7 +2920,11 @@ class ADH3InternalAppearanceAnchor:
         if (stage + 1) % appearance != 0:
             return (conditioning,)
         try:
-            ref = _anchor_ref_block(run_id, 0)
+            if first_pass_latent is None:
+                ref = _anchor_ref_block(run_id, 0)
+            else:
+                from ._relay_vendor.relay_core import build_anchor_ref
+                ref = build_anchor_ref(_first_pass_context(run_id, 0, first_pass_latent), 5)
         except Exception as exc:
             print("[AD-潜桥] 外观锚未生效（%r）" % (exc,))
             return (conditioning,)
@@ -2890,14 +2953,18 @@ class ADH3InternalReanchorGuide:
         }, "optional": {
             "vae": ("VAE",),
             "anchor_config": ("STRING", {"default": "{}"}),
+            "stage_latent": ("LATENT",),
+            "first_pass": ("BOOLEAN", {"default": False}),
         }}
     RETURN_TYPES = ("CONDITIONING",)
     FUNCTION = "run"
     CATEGORY = CATEGORY
     OUTPUT_NODE = False
 
-    def run(self, conditioning, relay_context, vae=None, anchor_config="{}"):
+    def run(self, conditioning, relay_context, vae=None, anchor_config="{}", stage_latent=None, first_pass=False):
         ctx = relay_context if isinstance(relay_context, dict) else {}
+        if first_pass:
+            ctx = dict(ctx)
         cfg = parse_anchor_config(anchor_config)
         want = int(cfg.get("reanchor_guide") or 0)
         ctx["ad_reanchor_guide_frames"] = 0
@@ -2923,8 +2990,8 @@ class ADH3InternalReanchorGuide:
             print("[AD-重锚定] 第 %d 段：找不到上一段成片尾帧，跳过 guide 锚定" % (stage + 1,))
             return (conditioning,)
         try:
-            width = int(ctx.get("width") or 0)
-            height = int(ctx.get("height") or 0)
+            width, height = (_relay_canvas(stage_latent) if stage_latent is not None
+                             else (int(ctx.get("width") or 0), int(ctx.get("height") or 0)))
             if width > 0 and height > 0 and (int(images.shape[1]) != height or int(images.shape[2]) != width):
                 import comfy.utils
                 images = comfy.utils.common_upscale(
@@ -2952,17 +3019,24 @@ class ADH3InternalSave:
         return {"required": {
             "latent": ("LATENT",),
             "relay_context": ("H3_LOOP_CONTEXT",),
-        }, "optional": {"note": ("STRING", {"default": "AD hidden relay"})}}
+        }, "optional": {"note": ("STRING", {"default": "AD hidden relay"}), "first_pass_latent": ("LATENT",)}}
     RETURN_TYPES = ("LATENT",)
     FUNCTION = "run"
     CATEGORY = CATEGORY
     OUTPUT_NODE = True
 
-    def run(self, latent, relay_context, note="AD hidden relay"):
+    def run(self, latent, relay_context, note="AD hidden relay", first_pass_latent=None):
         ctx = relay_context if isinstance(relay_context, dict) else {}
-        upstream = _relay_vendor_runtime.H3RelayLatentSave()
-        upstream.save(latent, str(ctx.get("relay_save_run_id") or "ad_relay_save"),
-                      int(ctx.get("relay_stage_index") or 0), note=note)
+        run_id = str(ctx.get("relay_save_run_id") or "ad_relay_save")
+        stage = int(ctx.get("relay_stage_index") or 0)
+        if first_pass_latent is None:
+            _relay_vendor_runtime.H3RelayLatentSave().save(latent, run_id, stage, note=note)
+        else:
+            from ._relay_vendor.relay_core import save_av_latent
+            path = _relay_stage_file(run_id, stage)
+            lineage = _relay_vendor_runtime._stage_lineage(run_id, stage)
+            save_av_latent(latent, str(path), note=note, lineage=lineage, first_pass=first_pass_latent)
+            print("[AD-潜桥] 第 %d 段已保存同版本的一采和二采 latent" % (stage + 1))
         # 存盘与结果登记可能谁先谁后：存盘完成后再查一次，若本版本已被选中/批准就立即提升，
         # 不再依赖“登记时刻源文件已存在”这一顺序假设。
         try:
@@ -3597,6 +3671,7 @@ class ADH3InternalTrim:
             "audio": ("AUDIO",),
             "fps": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 120.0, "step": 0.001}),
             "anchor_config": ("STRING", {"default": "{}"}),
+            "saved_latent": ("LATENT",),
         }}
     RETURN_TYPES = ("IMAGE", "AUDIO")
     RETURN_NAMES = ("images", "audio")
@@ -3604,7 +3679,7 @@ class ADH3InternalTrim:
     CATEGORY = CATEGORY
     OUTPUT_NODE = False
 
-    def run(self, images, relay_context, audio=None, fps=24.0, anchor_config="{}"):
+    def run(self, images, relay_context, audio=None, fps=24.0, anchor_config="{}", saved_latent=None):
         import contextlib
         import io
 

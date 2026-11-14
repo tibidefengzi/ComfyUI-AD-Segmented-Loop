@@ -207,7 +207,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         return url ? {...(fileFromUrl(url) || {}), url} : null;
     };
     // ── A/B 对比 ──────────────────────────────────────────────
-    // 图片：沿用原有「独立左右 / 叠加滑杆」两套（本次不改）。
+    // 图片支持独立左右与叠加滑杆。
     // 视频：改为 TE MAN 式「叠加重合 + 鼠标移动分界线擦除」，按钮全部放在视频底部控制条。
     const abOverlay = document.createElement("div");
     abOverlay.className = "ad-h3-ab-overlay"; abOverlay.hidden = true;
@@ -223,9 +223,11 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         + '<span class="ad-h3-ab-tag" style="left:8px">A</span><span class="ad-h3-ab-tag" style="right:8px">B</span>'
         + '<div class="ad-h3-ab-audios" hidden><div class="ad-h3-ab-acell"><audio data-ab-aa controls preload="metadata"></audio></div>'
         + '<div class="ad-h3-ab-acell"><audio data-ab-ab controls preload="metadata"></audio></div></div>'
-        + '<button type="button" class="ad-h3-ab-mode" data-ab-mode>叠加滑杆</button>'
-        + '<button type="button" class="ad-h3-ab-fullscreen" data-ab-fullscreen>全屏</button>'
-        + '<button type="button" class="ad-h3-ab-exit" data-ab-exit>退出对比</button>'
+        + '<div class="ad-h3-ab-actions">'
+        +   '<button type="button" data-ab-fullscreen>全屏</button>'
+        +   '<button type="button" data-ab-mode>叠加滑杆</button>'
+        +   '<button type="button" data-ab-exit>退出对比</button>'
+        + '</div>'
         + '<div class="ad-h3-ab-bar" hidden>'
         +   '<button type="button" data-ab-syncplay title="从头同步播放两个视频">同步播放</button>'
         +   '<button type="button" data-ab-speed title="选择播放速度">播放速度 1x</button>'
@@ -262,8 +264,8 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
     const abAudios = abOverlay.querySelector(".ad-h3-ab-audios");
     const abAudioA = abOverlay.querySelector("[data-ab-aa]"), abAudioB = abOverlay.querySelector("[data-ab-ab]");
     const abImageModeButton = abOverlay.querySelector("[data-ab-mode]");
-    const abFloatingFullscreen = abOverlay.querySelector(".ad-h3-ab-fullscreen");
-    const abFloatingExit = abOverlay.querySelector(".ad-h3-ab-exit");
+    const abActions = abOverlay.querySelector(".ad-h3-ab-actions");
+    const abFloatingExit = abActions.querySelector("[data-ab-exit]");
     const abVideoExit = abOverlay.querySelector("[data-ab-exit-video]");
     const abErrorBanner = abOverlay.querySelector("[data-ab-error]");
     let abMode = "split";        // 图片：split=独立左右；slider=叠加滑杆
@@ -789,8 +791,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         markABMode();
         abImageModeButton.hidden = !isImage;
         abImageModeButton.textContent = abMode === "split" ? "叠加滑杆" : "独立左右";
-        abFloatingFullscreen.hidden = isVideo;
-        abFloatingExit.hidden = isVideo;
+        abActions.hidden = isVideo;
         abDivider.style.display = isImage ? "" : "none";
         const tags = abOverlay.querySelectorAll(".ad-h3-ab-tag");
         const tagLabel = (slot, side) => `${side}-${Number(slot?.serial) > 0 ? String(Number(slot.serial)).padStart(2, "0") : "-"}`;
@@ -1086,7 +1087,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         .filter(item => item && item.id).map(item => [String(item.id), Number(item.no) || 0]));
     let showHistoryRounds = !!node.properties?.ad_h3_show_history;
     const expandedHistoryRounds = new Set(node.properties?.ad_h3_expanded_rounds || []);
-    const historyPages = new Map(), mediaPages = {image:0,audio:0,video:0};
+    const historyPages = new Map();
     const persistRoundMap = () => {
         node.properties ||= {};
         node.properties.ad_h3_round_map = [...roundMap.entries()].map(([id, no]) => ({id, no}));
@@ -1349,6 +1350,25 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         }
         const text=document.createElement("span");text.textContent=`第 ${group.page+1} / ${Math.ceil(group.all.length/MEDIA_DISPLAY_LIMIT)} 页`;pager.append(text);target.append(pager);
     }
+    function appendHistoryToggle(target, group, refresh) {
+        if (group.current) return;
+        const toggle = document.createElement("button");
+        toggle.type = "button";
+        toggle.className = "ad-h3-round-toggle ad-h3-history-control";
+        toggle.dataset.round = String(group.round);
+        toggle.setAttribute("aria-expanded", String(group.open));
+        const label = group.round > 0 ? `第 ${group.round} 组历史` : "旧版历史（轮号未记录）";
+        toggle.textContent = `${group.open ? "▾" : "▸"} ${label} · ${group.all.length} 条`;
+        toggle.onclick = event => {
+            event.stopPropagation();
+            if (group.open) expandedHistoryRounds.delete(group.round);
+            else expandedHistoryRounds.add(group.round);
+            node.properties.ad_h3_expanded_rounds = [...expandedHistoryRounds];
+            refresh();
+            node.graph?.change?.();
+        };
+        target.append(toggle);
+    }
     // 工作流没存过分段缩略图时，用已保存的媒体记录兜底，保证重新打开后预览区仍有历史缩略图。
     if (!stripStore.segment.length && !stripStore.merged.length) {
         const fallback = [];
@@ -1424,10 +1444,12 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
                                               : "该预览缺少段号，本段抽卡将重抽当前段");
         }
     }
-    function renderMediaGroup(kind, groupKey, list, owned, recordsAll, pageStoreKey) {
+    function renderMediaGroup(kind, groupKey, list, owned, recordsAll) {
         if (!list) return;
-        const page = Math.max(0, Math.min(Number(mediaPages[pageStoreKey]) || 0, Math.ceil(recordsAll.length / MEDIA_DISPLAY_LIMIT) - 1));
-        const records = recordsAll.slice(page * MEDIA_DISPLAY_LIMIT, (page + 1) * MEDIA_DISPLAY_LIMIT);
+        const refresh = () => renderMedia(kind);
+        const groups = previewHistoryGroups(recordsAll, activeRoundNo(), expandedHistoryRounds,
+            historyPages, `media:${kind}:${groupKey}`);
+        const records = groups.flatMap(group => group.visible);
         const wanted = new Set();
         records.forEach((record, index) => {
             const key = mediaCardKey(kind, record);
@@ -1481,18 +1503,18 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
                 }
                 const pickedForAB = pickAB(record, kind);
                 if (!pickedForAB && !abOverlay.hidden) exitAB();
-                show({...record, kind, label: recordLabel(record, index), url: mediaUrl(record.origin || "media", record.file)});
+                selectForProcessing(record, kind, labelText);
+                show({...record, kind, label: labelText, url: mediaUrl(record.origin || "media", record.file)});
                 markActiveCard(record);
                 setRedoTarget(record, button);
             };
-            list.append(button);
         });
         for (const [key, button] of [...owned]) {
             if (wanted.has(key)) continue;
             button.remove(); owned.delete(key);
         }
         let empty = list.querySelector(".ad-h3-strip-empty");
-        if (!records.length) {
+        if (!groups.length) {
             if (!empty) {
                 empty = document.createElement("span");
                 empty.className = "ad-h3-strip-empty";
@@ -1501,26 +1523,31 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
             list.append(empty);
         } else if (empty) empty.remove();
         for (const stale of list.querySelectorAll(".ad-h3-history-control")) stale.remove();
-        const pageKey = `media:${kind}:${groupKey}`;
-        historyPages.set(pageKey, page);
-        appendHistoryPager(list, {all: recordsAll, page, key: pageKey, open: true}, () => {
-            mediaPages[pageStoreKey] = historyPages.get(pageKey);
-            renderMedia(kind);
-        });
+        for (const group of groups) {
+            appendHistoryToggle(list, group, refresh);
+            for (const record of group.visible) list.append(owned.get(mediaCardKey(kind, record)));
+            appendHistoryPager(list, group, refresh);
+        }
     }
     function renderMedia(kind) {
-        const current = activeRoundNo();
-        const all = mediaRecords[kind].filter(record => !current || recordRoundNo(record) === current);
+        const all = mediaRecords[kind];
         if (kind === "video") {
-            renderMediaGroup(kind, "all", mediaLists[kind], mediaCards[kind], all, kind);
+            renderMediaGroup(kind, "all", mediaLists[kind], mediaCards[kind], all);
         } else {
-            renderMediaGroup(kind, "A", mediaLists[kind], mediaCards[kind], all.filter(record => (record.role || "A") !== "B"), kind);
-            renderMediaGroup(kind, "B", mediaListsB[kind], mediaCardsB[kind], all.filter(record => record.role === "B"), `${kind}B`);
+            renderMediaGroup(kind, "A", mediaLists[kind], mediaCards[kind], all.filter(record => (record.role || "A") !== "B"));
+            renderMediaGroup(kind, "B", mediaListsB[kind], mediaCardsB[kind], all.filter(record => record.role === "B"));
         }
         const visiblePanel = !panels[kind] || !panels[kind].hidden;
         scheduleMediaResize(visiblePanel ? 200 : 240);
     }
-    for (const button of tabButtons) button.onclick = () => setTab(button.dataset.tab);
+    for (const button of tabButtons) button.onclick = () => {
+        const kind = button.dataset.tab;
+        if (kind === "video") {
+            renderRecords(segments, stripStore.segment.filter(record => record.role !== "B"), "segment");
+            renderRecords(segmentsB, stripStore.segment.filter(record => record.role === "B"), "segmentB");
+        } else renderMedia(kind);
+        setTab(kind);
+    };
     const purgeBytesText = value => {
         const bytes = Number(value) || 0;
         if (bytes >= 1024 ** 3) return (bytes / 1024 ** 3).toFixed(1) + " GB";
@@ -1540,7 +1567,6 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
             mediaRecords[kind].length = 0;
             mediaCards[kind].clear();
             mediaCardsB[kind]?.clear();
-            mediaPages[kind] = 0;
             lastShown[kind] = null;
             mediaLists[kind]?.replaceChildren();
             mediaListsB[kind]?.replaceChildren();
@@ -1722,6 +1748,10 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         persistStripPreviews();
         mediaRecords[kind] = [];
         lastShown[kind] = null;
+        for (const [key, record] of mergeSelection) {
+            if (sameKind(record)) mergeSelection.delete(key);
+        }
+        paintMergeSelection();
         if (hadRedoTarget) setRedoTarget(null, null);
         persistMedia();
         renderMedia(kind);
@@ -2211,9 +2241,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
                 }
                 const pickedForAB = pickAB({...record, kind: itemKind}, itemKind);
                 if (!pickedForAB && !abOverlay.hidden) exitAB();
-                mergeSelection.clear();
-                processingRecord = {...record, kind: itemKind, label: record.label || recordLabel(record, 0)};
-                paintMergeSelection();
+                selectForProcessing(record, itemKind, record.label || recordLabel(record, 0));
                 if (!pickedForAB && stripKind==="segment" && itemKind==="video" && playlistEnabled) playPlaylistRecord(record);
                 else show({...record, key: keyOf(record), kind: itemKind, url: mediaUrl(record.origin || "session",record.file)});
                 // 分段生成A/B缩略图：点选即成为「本段抽卡」目标（合并片段无段号，只预览）。
@@ -2229,15 +2257,10 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         }
         for (const stale of target.querySelectorAll(".ad-h3-history-control,.ad-h3-round-toggle")) stale.remove();
         for (const group of groups) {
-            if (!group.current && stripKind!=="merged") {
-                const toggle=document.createElement("button");
-                toggle.className="ad-h3-round-toggle ad-h3-history-control";toggle.dataset.round=String(group.round);
-                toggle.setAttribute("aria-expanded",String(group.open));
-                toggle.style.cssText="flex-basis:100%;width:100%;text-align:left;margin:4px 0 2px;padding:3px 8px;font-size:12px;background:transparent;border:0;border-top:1px solid rgba(255,255,255,.16);cursor:pointer;color:inherit";
-                toggle.textContent=`${group.open?"▾":"▸"} ${group.round>0?`第 ${group.round} 组历史`:'旧版历史（轮号未记录）'} · ${group.all.length} 条`;
-                toggle.onclick=event=>{event.preventDefault();event.stopPropagation();if(expandedHistoryRounds.has(group.round))expandedHistoryRounds.delete(group.round);else expandedHistoryRounds.add(group.round);node.properties.ad_h3_expanded_rounds=[...expandedHistoryRounds];renderRecords(segments,stripStore.segment.filter(r=>r.role!=="B"),"segment");renderRecords(segmentsB,stripStore.segment.filter(r=>r.role==="B"),"segmentB");node.graph?.change?.();};
-                target.append(toggle);
-            }
+            appendHistoryToggle(target, group, () => {
+                renderRecords(segments, stripStore.segment.filter(record => record.role !== "B"), "segment");
+                renderRecords(segmentsB, stripStore.segment.filter(record => record.role === "B"), "segmentB");
+            });
             for (const record of group.visible) {
                 const button=cards.get(cardKey(record));if(button)target.append(button);
             }
@@ -2297,7 +2320,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         if (node._adH3FitHeight) requestAnimationFrame(() => node._adH3FitHeight());
     }
     function hideStripRecord(kind,record) { clearRecordPreview(record,kind); }
-    // 合并多选：只允许视频，且必须同一轮；Ctrl 点击的先后顺序就是合并顺序。
+    // 多选用于加工；视频也可按点击顺序合并。
     const mergeOrderKey = record => [recordRoundNo(record), recordSegmentNo(record),
         record?.redraw ? (Number(record.redraw_count) || 1) : 0, Number(record?.serial) || 0];
     function paintMergeSelection() {
@@ -2319,8 +2342,22 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
             }
         }
     }
+    function selectForProcessing(record, kind, label) {
+        mergeSelection.clear();
+        processingRecord = {...record, kind, label};
+        paintMergeSelection();
+    }
     function toggleMergeSelection(record, kind, role = "") {
         // 普通单选后Ctrl追加时，把原单选纳入同一选择集合；取消最后一项则为空。
+        const first = mergeSelection.values().next().value || processingRecord;
+        if (first && first.kind !== kind) {
+            node._adH3Hint?.("请在同一媒体分类内多选，单击一条成果可重新选择", true);
+            return;
+        }
+        if (first && recordRoundNo(first) !== recordRoundNo(record)) {
+            node._adH3Hint?.("请在同一轮内多选，单击一条成果可切换到该轮", true);
+            return;
+        }
         if (!mergeSelection.size && processingRecord) {
             const single = processingRecord;
             mergeSelection.set(keyOf(single), {...single, kind: inferMediaKind(single.file,single.kind), merge_source: single.role === "B" ? "B" : "A"});
@@ -2330,18 +2367,12 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         if (mergeSelection.has(key)) {
             mergeSelection.delete(key);
         } else {
-            const round = recordRoundNo(record);
-            const other = [...mergeSelection.values()].find(item => recordRoundNo(item) !== round);
-            if (other) {
-                node._adH3Hint?.("不同轮次的片段不能一起合并，请只选同一轮的结果", true);
-                return;
-            }
             mergeSelection.set(key, {...record, kind, label: recordLabel(record, 0), merge_source: role || (record.role === "B" ? "B" : "A")});
         }
         paintMergeSelection();
         node._adH3Hint?.(mergeSelection.size
-            ? `已按点击顺序选中 ${mergeSelection.size} 个片段（${[...mergeSelection.values()].map(item => recordLabel(item, 0)).join(" → ")}），点「合并片段」按此顺序合并`
-            : "已取消合并选中", false);
+            ? `已按点击顺序选中 ${mergeSelection.size} 条成果（${[...mergeSelection.values()].map(item => recordLabel(item, 0)).join(" → ")}），${kind === "video" ? "可加工或合并片段" : "可在最终保存点击「加工所选」"}`
+            : "已取消多选", false);
     }
     function numberMergedHistory(items) {
         let serial = 0;
@@ -2552,7 +2583,6 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         rememberRound(state);
         if (previousRound !== activeRoundNo()) {
             expandedHistoryRounds.clear();historyPages.clear();
-            for (const kind of ["image","audio","video"]) mediaPages[kind]=0;
             enforceHistoryRetention();persistMedia();persistMergeIndex();
             syncStripFromMedia();
             for (const kind of ["image","audio","video"]) renderMedia(kind);

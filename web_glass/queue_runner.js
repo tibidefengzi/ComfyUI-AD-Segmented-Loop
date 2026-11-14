@@ -19,11 +19,12 @@ export async function interruptOwnedPrompt(api, owner) {
 }
 export async function executeQueueOnce(app, api, segmentId, {isStopped=()=>false, timeoutMs=3600000, pause=ms=>new Promise(resolve=>setTimeout(resolve,ms)), serialized=null, owner=null, waitForCompletion=true}={}) {
     if(isStopped()) return {stopped:true};
+    const previewTarget = (owner?.comfyClass || owner?.type) === "AidenH3VideoPreview" ? String(owner.id) : null;
     let promptId;
     if (serialized) {
         // 直接使用这一次调用的返回值，不拦截共享API上的其它工作流提交。
         await runSubmitStage(async () => {
-            const result=await api.queuePrompt(0,serialized);
+            const result=await api.queuePrompt(0,serialized,previewTarget ? {partialExecutionTargets:[previewTarget]} : undefined);
             promptId=result?.prompt_id;
             if(owner&&promptId)owner._adH3PromptId=promptId;
         });
@@ -42,7 +43,7 @@ export async function executeQueueOnce(app, api, segmentId, {isStopped=()=>false
                 if(enabled&&matches&&!promptId){promptId=result?.prompt_id;if(owner&&promptId)owner._adH3PromptId=promptId;}
                 return result;
             };
-            try{await app.queuePrompt(0,1);}
+            try{await app.queuePrompt(0,1,previewTarget ? [previewTarget] : undefined);}
             finally{enabled=false;api.queuePrompt=original;capturing=false;}
         });
     }

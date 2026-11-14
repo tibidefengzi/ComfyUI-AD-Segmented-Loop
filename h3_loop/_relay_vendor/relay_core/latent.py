@@ -213,7 +213,7 @@ _LATENT_META_KEY = "relay_kit_meta"
 
 
 def save_av_latent(latent: Any, path: str, note: str = "",
-                   lineage: Dict[str, Any] | None = None) -> str:
+                   lineage: Dict[str, Any] | None = None, *, first_pass=None) -> str:
     """把 H3 的 AV latent 落盘，供下一段当 context_latent 读回。
 
     ``lineage``（B1 谱系簿记）：写进头 metadata 的结构谱系（run_id / stage_index /
@@ -236,6 +236,10 @@ def save_av_latent(latent: Any, path: str, note: str = "",
         if tc.device.type != "cpu":
             tc = tc.cpu()
         tensors["streams." + name] = tc.contiguous()
+    if first_pass is not None:
+        video, audio = streams_from_latent(first_pass)
+        tensors["ad_first_pass.video"] = video.detach().cpu().contiguous()
+        tensors["ad_first_pass.audio"] = audio.detach().cpu().contiguous()
     meta = {
         "format": 2,   # 2 = 带头谱系簿记（B1）；1 = 旧版（无谱系键）。读取方兼容两者
         "streams": names,
@@ -263,7 +267,7 @@ def save_av_latent(latent: Any, path: str, note: str = "",
     return path
 
 
-def load_av_latent(path: str):
+def load_av_latent(path: str, *, first_pass=False):
     """读回落盘的 AV latent，重建 NestedTensor。"""
     from safetensors.torch import load_file
 
@@ -279,7 +283,10 @@ def load_av_latent(path: str):
     if meta_t is None:
         raise ValueError("%s 不是本工具写的 AV latent（缺少元数据）。" % path)
     meta = json.loads(bytes(meta_t.tolist()).decode("utf-8"))
-    parts = [raw["streams." + n] for n in meta["streams"]]
+    if first_pass and "ad_first_pass.video" in raw:
+        parts = [raw["ad_first_pass.video"], raw["ad_first_pass.audio"]]
+    else:
+        parts = [raw["streams." + n] for n in meta["streams"]]
     if _nt is not None:
         samples = _nt.NestedTensor(parts)
     else:  # pragma: no cover

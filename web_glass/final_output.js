@@ -38,9 +38,8 @@ document.head.append(style);
 const mediaUrl = record => api.apiURL(`/aiden_h3/media/${encodeURIComponent(record.origin || "media")}/${String(record.file).split("/").map(encodeURIComponent).join("/")}`);
 const thumbnailUrl = record => api.apiURL(`/aiden_h3/thumbnail/${encodeURIComponent(record.origin || "media")}/${String(record.file).split("/").map(encodeURIComponent).join("/")}`);
 // 大分辨率/高帧率/非安全编码视频不再直接播放原文件：走后台预览代理。
-// quality=lite（默认 720p/30fps）或 high（原分辨率/原帧率、yuv420p，硬件解码更接近原画）。
 // 判断同时考虑尺寸、帧率、编码、像素格式、容器与码率，避免 4:4:4/10bit/高码率/H.265 直接播放。
-const previewProxyUrl = (record, quality = "lite") => api.apiURL(`/aiden_h3/preview_proxy/${encodeURIComponent(record.origin || "media")}/${String(record.file).split("/").map(encodeURIComponent).join("/")}${quality === "high" ? "?quality=high" : ""}`);
+const previewProxyUrl = record => api.apiURL(`/aiden_h3/preview_proxy/${encodeURIComponent(record.origin || "media")}/${String(record.file).split("/").map(encodeURIComponent).join("/")}`);
 const PROXY_SAFE_CODECS = new Set(["h264","av1","vp9"]);
 const PROXY_SAFE_PIX_FMTS = new Set(["yuv420p","yuvj420p","nv12","nv21"]);
 const PROXY_SAFE_CONTAINERS = new Set(["mp4","m4v","webm"]);
@@ -78,7 +77,7 @@ export function mountFinalSave(node) {
 <div class="ad-final-ab-divider" data-ab-divider></div><div class="ad-final-ab-labels"><span>源 · 分段预览</span><span>成品 · 最终保存</span></div><div class="ad-final-ab-hint" data-ab-hint hidden></div>
 <div class="ad-final-ab-bar"><button type="button" data-ab-play>播放</button><input type="range" data-ab-seek min="0" max="0" step="0.001" value="0" aria-label="对比播放位置"><span data-ab-time>0:00.00 / 0:00.00</span><button type="button" data-ab-retry hidden>重试</button><button type="button" data-ab-full>全屏</button><button type="button" data-ab-exit>退出对比</button></div></div>
 </div>
-<div class="ad-final-tools"><button data-start>加工所选</button><button data-stop>停止</button><button data-resume>继续剩余</button><button data-merge>合并片段</button><button data-ab-source hidden title="对比这条成品的源预览与最终成品">源/成品 A/B</button><button data-quality title="打开后预览/对比使用原分辨率、原帧率、yuv420p 高画质代理（硬件解码，接近原画）；关闭使用 720p/30fps 轻量预览">高画质预览</button><button data-download hidden title="保存当前成果的母版文件（最终_*.mp4），不是预览代理">下载母版</button></div>
+<div class="ad-final-tools"><button data-start>加工所选</button><button data-stop>停止</button><button data-resume>继续剩余</button><button data-merge>合并片段</button><button data-ab-source hidden title="对比这条成品的源预览与最终成品">源/成品 A/B</button><button data-download hidden title="保存当前成果的母版文件（最终_*.mp4），不是预览代理">下载母版</button></div>
 <div class="ad-final-status" aria-live="polite"></div><div class="ad-final-tabs"><button data-kind="image">图片</button><button data-kind="audio">音频</button><button data-kind="video">视频</button></div>
 <div class="ad-final-row"><span>最终成果</span><div class="ad-final-list" data-results></div></div><div class="ad-final-row"><span>合并成果</span><div class="ad-final-list" data-merges></div></div>`;
     const $=selector=>root.querySelector(selector);
@@ -122,7 +121,7 @@ export function mountFinalSave(node) {
     dropLegacyAudioInput();
     for (const input of node.inputs || []) if (input.name === "media") input.label = "处理后媒体（图片/音频/视频）";
     node.properties ||= {};
-    let previewQuality = node.properties.ad_final_quality === "high" ? "high" : "lite";
+    delete node.properties.ad_final_quality;
     let records=node.properties.ad_final_records || [],kind=node.properties.ad_final_tab || "video",selected=new Map(),busy=false,preparing=false,stopped=false,disposed=false;
     let batch=node.properties.ad_final_batch || null,active=null,owner={};
     // 仅当渲染数据真正变化时才保存并标脏工作流，避免每次 render 都把工作流标记为已修改。
@@ -136,7 +135,7 @@ export function mountFinalSave(node) {
     const abPlay=$("[data-ab-play]"),abSeek=$("[data-ab-seek]"),abTime=$("[data-ab-time]"),abExit=$("[data-ab-exit]"),abRetry=$("[data-ab-retry]"),abFull=$("[data-ab-full]");
     let abOpen=false,abMode="",abRatio=.5,abDragging=false,abToken=0,abDuration=0;
     let abReadyA=false,abReadyB=false,abFailedA=false,abFailedB=false,abBuffering=false,abRecord=null,abSource=null;
-    const qualityButton=$("[data-quality]"),downloadButton=$("[data-download]");
+    const downloadButton=$("[data-download]");
     const finalScreen=$(".ad-final-screen");
     // 与分段预览一致：点击最终成果画面 = 本条最终视频循环播放 / 暂停。
     const togglePreviewPlayback=()=>{
@@ -196,7 +195,7 @@ export function mountFinalSave(node) {
         const waiting=[];
         if(!abReadyA)waiting.push(`源（${abSideLabel(abSource,"源")}）`);
         if(!abReadyB)waiting.push(`成品（${abSideLabel(abRecord,"成品")}）`);
-        abSetHint(`正在加载${waiting.join("、")}…（${previewQuality==="high"?"高画质":"轻量"}预览生成中，请稍候或退出对比）`);
+        abSetHint(`正在加载${waiting.join("、")}…（预览生成中，请稍候或退出对比）`);
     };
     const abResetView=()=>{
         abOpen=false;abToken++;abPause();abDragging=false;
@@ -221,18 +220,7 @@ export function mountFinalSave(node) {
         if(!record||!["image","video"].includes(record.kind)||!source?.origin||!source?.file)return false;
         return (source.kind||record.kind)===record.kind;
     };
-    const abUrl=record=>record.kind==="video"&&needsPreviewProxy(record)?previewProxyUrl(record,previewQuality):mediaUrl(record);
-    const updateQualityButton=()=>{
-        if(!qualityButton)return;
-        qualityButton.classList.toggle("on",previewQuality==="high");
-        qualityButton.textContent=previewQuality==="high"?"高画质预览：开":"高画质预览";
-    };
-    const reloadActivePreview=()=>{
-        
-        if(abOpen){const record=active;abResetView();active=record;openAB();}
-        else if(active)show(active);
-        buttons();
-    };
+    const abUrl=record=>record.kind==="video"&&needsPreviewProxy(record)?previewProxyUrl(record):mediaUrl(record);
     const dirty=()=>{node.graph?.change?.();node.setDirtyCanvas?.(true,true);};
     const saveState=()=>{node.properties.ad_final_records=records;node.properties.ad_final_batch=batch;node.properties.ad_final_tab=kind;dirty();};
     const say=(text,error=false)=>{const box=$(".ad-final-status");box.textContent=text;box.classList.toggle("error",error);};
@@ -254,8 +242,6 @@ export function mountFinalSave(node) {
         const media=record.kind==="video"?video:record.kind==="audio"?audio:image;
         const meta=`${label(record)}${record.width?` · ${record.width}×${record.height} · ${record.fps} FPS`:""}`;
         const useProxy=needsPreviewProxy(record);
-        const proxyQuality=previewQuality;
-        const qualityLabel=proxyQuality==="high"?"高画质":"轻量";
         const restoreTime=Number(keepTime)>0?Number(keepTime):0;
         if(record.kind==="video"){
             const restore=()=>{
@@ -264,7 +250,7 @@ export function mountFinalSave(node) {
             };
             video.onloadedmetadata=()=>{
                 if(media!==video)return;
-                say(useProxy?`${meta} · ${qualityLabel}预览 ${video.videoWidth}×${video.videoHeight}（预览代理）`:meta);
+                say(useProxy?`${meta} · 预览 ${video.videoWidth}×${video.videoHeight}（预览代理）`:meta);
                 restore();
             };
             video.onerror=()=>{
@@ -273,12 +259,12 @@ export function mountFinalSave(node) {
                 video.pause();
                 media.hidden=true;
                 $("[data-idle]").hidden=false;
-                say(useProxy?`${meta} · ${qualityLabel}预览生成失败，请稍后重试；原文件已保存，可下载/外部播放查看。`
+                say(useProxy?`${meta} · 预览生成失败，请稍后重试；原文件已保存，可下载/外部播放查看。`
                            :`${meta} · 视频加载失败，请稍后重试。`,true);
             };
             video.oncontextmenu=useProxy?(event=>{event.preventDefault();say("当前播放的是预览代理；请用「下载母版」保存原文件。",true);return false;}):null;
-            media.src=useProxy?previewProxyUrl(record,proxyQuality):mediaUrl(record);
-            say(useProxy?`${meta} · 正在生成${qualityLabel}预览…（预览代理，下载请用「下载母版」）`:meta);
+            media.src=useProxy?previewProxyUrl(record):mediaUrl(record);
+            say(useProxy?`${meta} · 正在生成预览…（预览代理，下载请用「下载母版」）`:meta);
         }else{
             media.src=mediaUrl(record);
             say(meta);
@@ -417,12 +403,6 @@ export function mountFinalSave(node) {
         abTime.textContent=`${abClock(time)} / ${abClock(abDuration)}`;
     });
     $("[data-ab-source]").onclick=()=>openAB();
-    if(qualityButton)qualityButton.onclick=()=>{
-        if(busy||preparing)return;
-        previewQuality=previewQuality==="high"?"lite":"high";
-        node.properties.ad_final_quality=previewQuality;dirty();
-        updateQualityButton();reloadActivePreview();
-    };
     // 下载母版：只保存当前成果的最终文件（最终_*.mp4 / final_*.mp4），绝不下发 preview_* 代理。
     if(downloadButton)downloadButton.onclick=async()=>{
         const record=active;
@@ -589,10 +569,10 @@ export function mountFinalSave(node) {
     const scheduleLayout=()=>{if(resizeFrame)return;resizeFrame=requestAnimationFrame(()=>{resizeFrame=0;if(disposed||!root.isConnected)return;const height=node.computeSize?.()[1];if(height&&Math.abs(node.size[1]-height)>2)node.setSize([node.size[0],height]);node.setDirtyCanvas?.(true,true);});};
     const observer=new ResizeObserver(scheduleLayout);observer.observe(root);
     const executed=node.onExecuted;node.onExecuted=function(message){const result=executed?.apply(this,arguments);const incoming=(message?.ad_final||[]).filter(r=>!r.source_record?.final_task_id||!this.properties.ad_task_id||r.source_record.final_task_id===this.properties.ad_task_id);for(const record of incoming)if(!records.some(item=>key(item)===key(record)))records.push(record);if(incoming.length){kind=incoming[0].kind;followPage(incoming[0]);render();show(incoming[0]);}return result;};
-    const configured=node.onConfigure;node.onConfigure=function(){const result=configured?.apply(this,arguments);dropLegacyAudioInput();busy=false;preparing=false;finalCards.clear();pages.clear();records=this.properties.ad_final_records||[];batch=this.properties.ad_final_batch||null;kind=this.properties.ad_final_tab||'video';previewQuality=this.properties.ad_final_quality==="high"?"high":"lite";selected.clear();renderedStateKey=JSON.stringify([kind,records.map(key),batch?.cursor??-1,batch?.status||""]);render();updateQualityButton();normalizeQualityWidget();return result;};
+    const configured=node.onConfigure;node.onConfigure=function(){const result=configured?.apply(this,arguments);dropLegacyAudioInput();delete this.properties.ad_final_quality;busy=false;preparing=false;finalCards.clear();pages.clear();records=this.properties.ad_final_records||[];batch=this.properties.ad_final_batch||null;kind=this.properties.ad_final_tab||'video';selected.clear();renderedStateKey=JSON.stringify([kind,records.map(key),batch?.cursor??-1,batch?.status||""]);render();normalizeQualityWidget();return result;};
     const removed=node.onRemoved;node.onRemoved=function(){disposed=true;stopped=true;busy=false;preparing=false;observer.disconnect();if(resizeFrame)cancelAnimationFrame(resizeFrame);try{}catch{}try{if(abOpen)abResetView();}catch{}for(const media of [video,audio]){media.pause();if(media.hasAttribute("src")){media.removeAttribute("src");media.load();}}for(const image of root.querySelectorAll("img"))image.removeAttribute("src");finalCards.clear();root.remove();delete node._adFinal;return removed?.apply(this,arguments);};
     node._adFinal={root,run,selection:()=>[...selected.values()],get batch(){return batch;},resetTask(){if(abOpen)abResetView();records=[];batch=null;selected.clear();finalCards.clear();pages.clear();active=null;video.pause();audio.pause();for(const media of [video,audio,image])media.hidden=true;$("[data-idle]").hidden=false;render();}};
-    render();updateQualityButton();if(batch&&batch.status!=="completed")say('上次加工记录已保留，可点击继续剩余。');
+    render();if(batch&&batch.status!=="completed")say('上次加工记录已保留，可点击继续剩余。');
 }
 
 app.registerExtension({name:"AD.SegmentedLoop.FinalSave",nodeCreated(node){if((node.comfyClass||node.type)==="AD_FinalSave")mountFinalSave(node);}});

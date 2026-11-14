@@ -142,15 +142,14 @@ const CSS = `
 .ad-h3-preview-layout.is-comparing .ad-h3-screen > *:not(.ad-h3-ab-overlay){visibility:hidden!important}
 .ad-h3-preview-layout.is-comparing .ad-h3-player-controls,.ad-h3-preview-layout.is-comparing .ad-h3-preview-title{display:none!important}
 .ad-h3-preview-layout.is-comparing .ad-h3-screen > .ad-h3-ab-overlay{visibility:visible!important}
-.ad-h3-ab-exit{position:absolute;top:auto!important;bottom:8px;right:8px;z-index:8;min-height:26px;height:26px;padding:0 12px;font-size:12px;border-radius:6px;background:#23354fe6!important;border:1px solid #98a6ba!important;color:#f0f6ff!important;cursor:pointer;transform:scale(.65);transform-origin:right bottom}
-.ad-h3-ab-exit:hover{background:#324969!important}
-.ad-h3-ab-fullscreen{position:absolute;top:auto!important;bottom:8px;right:104px;z-index:8;min-height:26px;height:26px;padding:0 12px;font-size:12px;border-radius:6px;background:#23354fe6!important;border:1px solid #98a6ba!important;color:#f0f6ff!important;cursor:pointer;transform:scale(.65);transform-origin:right bottom}
-.ad-h3-ab-fullscreen:hover{background:#324969!important}
+.ad-h3-ab-actions{position:absolute;right:8px;bottom:8px;z-index:8;display:flex;justify-content:flex-end;flex-wrap:wrap;gap:6px;max-width:calc(100% - 16px);pointer-events:none}
+.ad-h3-ab-actions[hidden],.ad-h3-ab-actions button[hidden]{display:none!important}
+.ad-h3-ab-actions button{height:28px;min-height:28px;padding:0 10px;font-size:12px;border-radius:6px;background:#23354fe6!important;border:1px solid #98a6ba!important;color:#f0f6ff!important;cursor:pointer;white-space:nowrap}
+.ad-h3-ab-actions button:hover{background:#324969!important}
 .ad-h3-ab-overlay:fullscreen{width:100vw!important;height:100vh!important;aspect-ratio:auto!important;max-height:none!important;border-radius:0!important;background:#000!important}
 .ad-h3-ab-overlay:fullscreen .ad-h3-ab-layer img{object-fit:contain}
-.ad-h3-ab-overlay:fullscreen .ad-h3-ab-fullscreen,.ad-h3-ab-overlay:fullscreen .ad-h3-ab-exit{transform:none;bottom:16px;font-size:13px;height:32px;min-height:32px}
-.ad-h3-ab-overlay:fullscreen .ad-h3-ab-fullscreen{right:150px}
-.ad-h3-ab-overlay:fullscreen .ad-h3-ab-exit{right:24px}
+.ad-h3-ab-overlay:fullscreen .ad-h3-ab-actions{right:16px;bottom:16px;max-width:calc(100% - 32px)}
+.ad-h3-ab-overlay:fullscreen .ad-h3-ab-actions button{font-size:13px;height:32px;min-height:32px}
 .ad-h3-ab-overlay:fullscreen .ad-h3-ab-stage{min-height:0}
 .ad-h3-ab-overlay:fullscreen .ad-h3-ab-bar{padding:8px 12px;gap:7px;background:#0b0e13e6}
 .ad-h3-ab-overlay:fullscreen .ad-h3-ab-bar button{height:30px;min-height:30px;font-size:13px;padding:0 12px}
@@ -168,7 +167,6 @@ const CSS = `
 .ad-h3-ab-audios{position:absolute;inset:0;display:grid;grid-template-columns:1fr 1fr;gap:10px;padding:12px;background:#202c41;z-index:2;box-sizing:border-box}
 .ad-h3-ab-acell{display:flex;align-items:center;justify-content:center;background:#202d41;border:1px solid #3a4c65;border-radius:8px;padding:10px}
 .ad-h3-ab-acell audio{width:100%}
-.ad-h3-ab-mode{position:absolute;top:auto!important;left:auto!important;bottom:8px;right:76px;z-index:8;min-height:26px;height:26px;padding:0 10px;font-size:12px;border-radius:6px;background:#23354fe6!important;border:1px solid #98a6ba!important;color:#f0f6ff!important;cursor:pointer;transform:scale(.65)!important;transform-origin:right bottom}
 .ad-h3-ab-bar{display:flex;flex-wrap:wrap;align-items:center;gap:5px;padding:5px 8px;box-sizing:border-box;background:#191e25e6;border-top:1px solid rgba(255,255,255,.14);z-index:6;flex:0 0 auto;cursor:default}
 .ad-h3-ab-bar[hidden]{display:none!important}
 .ad-h3-ab-bar button{min-height:26px;height:26px;padding:0 8px;font-size:12px;border-radius:5px;border:1px solid #4a658a;background:#23354f;color:#e8f0fb;cursor:pointer;white-space:nowrap;flex:0 0 auto}
@@ -278,6 +276,8 @@ const CSS = `
 .ad-h3-video.aiden-h3 .ad-h3-screen{background:#1d2d44;border-color:#42546e;border-radius:8px}
 .ad-h3-video.aiden-h3 .ad-h3-media-list{background:#1d2e45;border-color:#415675;box-shadow:inset 0 1px 4px #0003;border-radius:8px}
 .ad-h3-video.aiden-h3 .ad-h3-panel .ad-h3-media-list{height:auto!important;min-height:0!important;max-height:none!important;overflow-y:auto!important}
+.ad-h3-cat-strips .ad-h3-media-list{flex:1 1 0;min-width:0}
+.ad-h3-round-toggle{flex-basis:100%;grid-column:1/-1;width:100%;text-align:left;margin:4px 0 2px;padding:3px 8px;font-size:12px;background:transparent;border:0;border-top:1px solid rgba(255,255,255,.16);cursor:pointer;color:inherit}
 .ad-h3-video.aiden-h3 .ad-h3-screen>.ad-h3-player-controls{position:absolute;left:0;right:0;bottom:0;z-index:7;display:flex;flex-wrap:wrap;gap:5px;align-items:center;margin:0;padding:7px;background:#1b283ceF;border-top:1px solid #465b78;box-sizing:border-box}
 .ad-h3-video.aiden-h3 .ad-h3-player-controls [data-seek]{flex:1 1 90px;min-width:50px;width:auto}
 .ad-h3-video.aiden-h3.ad-h3-audio-mode [data-frame]{display:none}

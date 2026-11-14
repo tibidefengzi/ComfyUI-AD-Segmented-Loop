@@ -1,5 +1,6 @@
 // 只处理提交副本；编辑器始终展示用户最新内容，不回写旧参数或旧连线。
 import {currentTaskId} from "./workflow_task.js";
+import {stopAtPreview} from "./final_queue.js";
 export function installRoundQueue(api, app) {
     if (api._adRoundQueueInstalled) return;
     api._adRoundQueueInstalled = true;
@@ -7,7 +8,9 @@ export function installRoundQueue(api, app) {
     api.queuePrompt = async function(number, serialized, ...rest) {
         const bindings = (serialized?.workflow?.nodes || []).map(node=>node.properties?.ad_execution_round).filter(Boolean);
         const connected = Object.values(serialized?.output || {}).some(node=>node.class_type === "AidenH3Segment" && node.inputs?.queue);
-        if (!connected && !bindings.length) return original.call(this, number, serialized, ...rest);
+        if (!connected && !bindings.length) {
+            return original.call(this, number, {...serialized, output:stopAtPreview(serialized?.output, rest[0]?.partialExecutionTargets)}, ...rest);
+        }
         const response = await api.fetchApi("/aiden_h3/round/prepare", {
             method:"POST", headers:{"Content-Type":"application/json"},
             body:JSON.stringify({prompt:serialized.output, workflow:serialized.workflow, round_bindings:bindings, client_id:api.clientId})
@@ -27,6 +30,6 @@ export function installRoundQueue(api, app) {
         // 避免每次排队重复 sync/freeze 与写轮次快照。
         const prepared=result.workflow||serialized.workflow||{};
         const workflow={...prepared,extra:{...(prepared.extra||{}),ad_round_prepared:true}};
-        return original.call(this, number, {...serialized, output:result.prompt, workflow}, ...rest);
+        return original.call(this, number, {...serialized, output:stopAtPreview(result.prompt, rest[0]?.partialExecutionTargets), workflow}, ...rest);
     };
 }

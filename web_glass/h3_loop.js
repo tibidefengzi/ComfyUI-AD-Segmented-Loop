@@ -10,6 +10,8 @@ import { installGlassTheme } from "./glass_ui.js";
 import { executeQueueOnce, interruptOwnedPrompt } from "./queue_runner.js";
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
+import { mountSelfLiftSwitch } from "./selflift_switch.js";
+import { bindTimedPromptInput } from "./timed_prompt_input.js";
 import { mountTimelineEditor, segmentRefCounts, updateSegmentMaterialOutputs, savedTimelineValue } from "./timeline_editor.js";
 import { mountNativePlayer } from "./native_player.js";
 import { bindWidgetWidth, fitPreviewContent } from "./dom_layout.js";
@@ -17,7 +19,7 @@ import { installVueNodesGuard } from "./compat_nodes2.js";
 import { mountNodeProgress, updateSessionProgress, installProgressEvents } from "./run_progress.js";
 
 import { installRoundQueue } from "./round_queue.js";
-import { migrateLegacyRelay, hideInternalNodeTypes, hideLegacyTypesAfterLoad, restoreLegacyTypesForGraph, prepareSegmentNode, normalizeRelayWidget, anchorConfigOf } from "./relay_hidden.js";
+import { LEGACY_TYPES, migrateLegacyRelay, hideInternalNodeTypes, hideLegacyTypesAfterLoad, restoreLegacyTypesForGraph, prepareSegmentNode, normalizeRelayWidget, anchorConfigOf } from "./relay_hidden.js";
 installRoundQueue(api, app);
 installProgressEvents(api);
 
@@ -52,6 +54,7 @@ styles.textContent = `
 .ad-h3-cat-strips{display:flex;flex-direction:column;gap:6px;min-width:0;padding:2px 4px}
 .ad-h3-cat-strips .ad-h3-strip-row{min-height:0;padding:4px 8px}
 .ad-h3-cat-strips .ad-h3-strip-row>span{flex:0 0 56px}
+.ad-h3-panel[data-panel="image"] .ad-h3-cat-strips .ad-h3-media-list{flex:1 1 0;min-width:0}
 .ad-h3-strip-row{display:flex;gap:8px;align-items:flex-start;min-width:0;width:100%;border:1px solid #3d5a80;border-radius:8px;background:#141b26;padding:4px 8px;min-height:104px;box-sizing:border-box}.ad-h3-strip-row>span{flex:0 0 64px;white-space:nowrap}
 .ad-h3-segments,.ad-h3-segments-b,.ad-h3-merges{display:flex;gap:6px;overflow:auto;min-width:0;flex:1;min-height:96px;align-items:flex-start;padding:2px 0}
 .aiden-h3 .ad-h3-preview-thumb{width:112px;min-width:112px;padding:4px;font-size:12px;overflow-wrap:anywhere;position:relative}
@@ -877,7 +880,7 @@ function mountReview(node) {
 function adPinSegmentWidgetOrder(node){
     if(!node?.widgets) return;
     // 固定控件顺序：宽高比 → 百万像素 → 对齐倍数 → 分辨率 → 正向提示词 → 反向提示词 → 段索引 → 统一提示词前缀（其余隐藏控件排最后）
-    const order=["session_id","aspect_ratio","megapixels","multiple","生成方式","ad_h3_resolution","ad_h3_advanced","ad_h3_prompt_editor","正向提示词",
+    const order=["session_id","aspect_ratio","megapixels","multiple","生成方式","ad_h3_selflift_switch","ad_h3_resolution","ad_h3_advanced","ad_h3_prompt_editor","正向提示词",
         "ad_h3_negative_editor","反向提示词","段索引","ad_h3_prefix_editor","统一提示词前缀","ref_counts","reanchor_every","run_token",
         "fps","overlap_frames","guard_frames","max_frames"];
     const rank=name=>{const index=order.indexOf(name);return index<0?order.length:index;};
@@ -1214,11 +1217,18 @@ function mountResolutionBadge(node) {
     }
 }
 
-function syncLinkedPromptTimeline(segment) {
+function syncLinkedPromptTimeline(segment, timedText = null, promptSnapshot = null) {
     const graph = segment?.graph;
     const input = segment?.inputs?.find(item => item.name === "queue");
     const link = graph?.links?.get?.(input?.link) || graph?.links?.[input?.link];
     const queue = link && graph?.getNodeById?.(link.origin_id);
+    if (timedText !== null) {
+        if (!queue?._adH3ImportTimedPrompt) {
+            window.alert("请先把素材准备的「分段清单」连到当前 AD-分段生成，才能自动导入时间文本。");
+            return false;
+        }
+        return queue._adH3ImportTimedPrompt(timedText, {promptSnapshot, segmentNode: segment});
+    }
     queue?._adH3SyncPromptSegments?.({promptChanged: true});
 }
 
@@ -1244,10 +1254,9 @@ function mountPromptEditor(node) {
     let initial = String(native.value || "");
     if (initial.trim() === "# 第一段提示词\n# 第二段提示词") { initial = ""; native.value = ""; }
     area.value = initial;
-    area.addEventListener("input", () => {
-        native.value = area.value;
-        try { native.callback?.(area.value); } catch {}
-        syncLinkedPromptTimeline(node);
+    bindTimedPromptInput(area, node, native, {
+        syncOrdinary: () => syncLinkedPromptTimeline(node),
+        importText: (text, snapshot) => syncLinkedPromptTimeline(node, text, snapshot),
     });
     wrap.append(area);
     const fitAreaWidth = () => {
@@ -1461,22 +1470,31 @@ function mountRelayAdvancedPanel(node) {
                 node.graph?.change?.();
             } catch (_) {}
         });
-    // 重载/延迟恢复：把面板下拉同步到当前真实控件与 properties，避免显示旧默认值。
+    const render = () => {
+        toggle.textContent = (open ? "▾ " : "▸ ") + "高级设置";
+        body.style.display = open ? "flex" : "none";
+    };
+    // 重载/延迟恢复：同步真实参数与展开状态。
     const syncPanel = () => {
         try { rows.context.value = String(contextWidget?.value ?? "22"); } catch (_) {}
         try { rows.reanchor.value = String(reanchorWidget?.value ?? "0 · 不重锚定"); } catch (_) {}
         try { rows.appearance.value = String(anchorConfigOf(node).appearance ?? 3); } catch (_) {}
         try { rows.sharpen.value = String(anchorConfigOf(node).settle_sharpen ?? 0.5); } catch (_) {}
+        open = node.properties?.ad_h3_advanced === true;
+        render();
+        node.setDirtyCanvas?.(true, true);
     };
     node._adH3SyncRelayPanel = syncPanel;
-    const render = () => {
-        toggle.textContent = (open ? "▾ " : "▸ ") + "高级设置";
-        body.style.display = open ? "flex" : "none";
-    };
     toggle.addEventListener("click", () => {
         open = !open;
-        try { node.properties ||= {}; node.properties.ad_h3_advanced = open; } catch (_) {}
+        try { node.properties ||= {}; node.properties.ad_h3_advanced = open; node.graph?.change?.(); } catch (_) {}
         render();
+        try {
+            const size = node.computeSize?.();
+            if (Number.isFinite(size?.[1]) && size[1] > 0) {
+                node.setSize?.([node.size?.[0] || size[0], Math.max(240, Math.ceil(size[1]))]);
+            }
+        } catch (_) {}
         try { node.setDirtyCanvas?.(true, true); } catch (_) {}
     });
     panel.append(toggle, body);
@@ -1641,7 +1659,7 @@ function setupNode(node) {
         normalizeAspectWidget(node);reorderSegmentWidgets(node);normalizeRelayWidget(node);syncSegmentOutputs();
         setTimeout(()=>{try{applyNamedValues();node.setDirtyCanvas?.(true,true);}catch(_error){}},0);
         setTimeout(()=>{try{applyNamedValues();node.setDirtyCanvas?.(true,true);}catch(_error){}},300);const repairLinks=()=>{try{migrateSegmentLinksBySavedOutputs(node,savedOutputs);}catch(_error){}try{migrateLegacySegmentLinks(node);}catch(_error){}};repairLinks();setTimeout(syncSegmentOutputs,0);setTimeout(syncSegmentOutputs,400);setTimeout(repairLinks,0);setTimeout(repairLinks,120);return out;};
-      mountResolutionBadge(node);mountPromptEditor(node);mountNegativeEditor(node);mountPromptPrefix(node);mountRelayHint(node);
+      mountSelfLiftSwitch(node, {bindWidth: bindWidgetWidth});mountResolutionBadge(node);mountPromptEditor(node);mountNegativeEditor(node);mountPromptPrefix(node);mountRelayHint(node);
       startSegmentRepairTimer(); repairSegmentNode(node);
       const relabel={"正向提示词":"正向提示词","统一提示词前缀":"统一提示词前缀","反向提示词":"反向提示词",multiple:"倍数"};
       syncSegmentOutputs();
@@ -1769,7 +1787,51 @@ function h3ResolveCanvas(aspectRatio="16:9 (Landscape)", megapixels="0.5", multi
 /* ad-res-footer-glue-widgets 20261025-0458 */
 
 
-// 把本插件自定义端口类型登记为“默认连接节点”：从输出口拉线时，菜单里直接出现可连接的 AD 节点。
+const previewSaveMenus = new WeakSet();
+
+function registerPreviewSaveMenu(canvas, litegraph) {
+    if (!canvas || previewSaveMenus.has(canvas)
+        || typeof canvas.showConnectionMenu !== "function"
+        || typeof canvas.createDefaultNodeForSlot !== "function") return;
+    previewSaveMenus.add(canvas);
+    const saveType = "AD_FinalSave";
+    const typeOf = entry => typeof entry === "string" ? entry : entry?.node;
+    for (const method of ["showConnectionMenu", "createDefaultNodeForSlot"]) {
+        const original = canvas[method];
+        canvas[method] = function(options, ...args) {
+            const defaults = litegraph.slot_types_default_out;
+            const previous = defaults["*"];
+            const entries = Array.isArray(previous) ? previous : previous ? [previous] : [];
+            const visible = entries.filter(entry => typeOf(entry) !== "AD_FinalSink");
+            const node = options?.nodeFrom;
+            const from = options?.slotFrom;
+            const slot = typeof from === "number" ? node?.outputs?.[from]
+                : typeof from === "string" ? node?.outputs?.find(output => output.name === from)
+                : from;
+            const recommend = (node?.comfyClass || node?.type) === "AidenH3VideoPreview"
+                && slot?.name === "media" && slot.type === "*" && litegraph.registered_node_types?.[saveType];
+            if (!recommend && visible.length === entries.length) {
+                return original.call(this, options, ...args);
+            }
+            // The native menu looks up the defaults again when an item is clicked.
+            // Keep this wildcard recommendation scoped to the preview's media port.
+            defaults["*"] = recommend ? [{node: saveType, title: "AD-最终保存"},
+                ...visible.filter(entry => typeOf(entry) !== saveType)] : visible;
+            try {
+                const result = original.call(this, options, ...args);
+                const item = method === "showConnectionMenu"
+                    ? result?.root?.querySelector?.('[data-value="AD_FinalSave"]') : null;
+                if (item) item.textContent = "AD-最终保存";
+                return result;
+            } finally {
+                if (previous === undefined) delete defaults["*"];
+                else defaults["*"] = previous;
+            }
+        };
+    }
+}
+
+// 从自定义端口拉线时，菜单直接列出对应的 AD 节点。
 function registerCustomSlotDefaults(){
     const litegraph = window.LiteGraph || (typeof LiteGraph!=="undefined"?LiteGraph:null);
     if(!litegraph) return false;
@@ -1777,9 +1839,9 @@ function registerCustomSlotDefaults(){
     litegraph.slot_types_default_in = litegraph.slot_types_default_in || {};
     litegraph.slot_types_default_out["H3_AUDIO_QUEUE"] = [{node:"AidenH3Segment"}];
     litegraph.slot_types_default_in["H3_AUDIO_QUEUE"] = [{node:"AidenH3AudioQueue"}];
-    // 插件只注册 3 个节点（AidenH3Commit 只是历史遗留类，未注册），这里只给真实存在的节点
     litegraph.slot_types_default_out["H3_LOOP_CONTEXT"] = [{node:"AidenH3VideoPreview"}];
     litegraph.slot_types_default_in["H3_LOOP_CONTEXT"] = [{node:"AidenH3Segment"}];
+    registerPreviewSaveMenu(app.canvas, litegraph);
     return true;
 }
 const AD_SEG_WIDGET_NEW_ORDER = ["aspect_ratio", "megapixels", "multiple", "生成方式",
@@ -1886,8 +1948,19 @@ app.registerExtension({
         try { hideLegacyTypesAfterLoad(); } catch (_error) {}
         try { hideInternalNodeTypes(); } catch (_error) {}
     },
-    beforeConfigureGraph(graphData){
+    async beforeConfigureGraph(graphData){
         try { restoreLegacyTypesForGraph(graphData); } catch (_error) {}
+        const registry = window.LiteGraph?.registered_node_types;
+        const missing = new Set((graphData?.nodes || []).map(node => node?.type)
+            .filter(type => LEGACY_TYPES.includes(type) && registry && !registry[type]));
+        if (missing.size && typeof app.registerNodeDef === "function") {
+            await Promise.allSettled([...missing].map(async type => {
+                const response = await api.fetchApi("/object_info/" + encodeURIComponent(type));
+                if (!response.ok) return;
+                const definition = (await response.json())[type];
+                if (definition) await app.registerNodeDef(type, definition);
+            }));
+        }
         savedSegmentSchemas.clear();
         const infos = new Map((graphData?.nodes || []).map(info => [String(info.id), info]));
         const rawLinks = graphData?.links || [];

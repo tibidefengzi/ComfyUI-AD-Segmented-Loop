@@ -14,6 +14,38 @@ def linked_node(value,prompt):
     return None
 
 
+def preview_only_prompt(prompt, targets=None):
+    """显式运行只提交目标祖先；普通生成在最终加工的来源预览处截止。"""
+    if not isinstance(prompt, dict):
+        return prompt
+    if targets:
+        needed, pending = set(), [str(key) for key in targets]
+        while pending:
+            key = pending.pop()
+            if key in needed or key not in prompt:
+                continue
+            needed.add(key)
+            for value in prompt[key].get("inputs", {}).values():
+                parent = linked_node(value, prompt)
+                if parent is not None:
+                    pending.append(parent)
+        return {key: node for key, node in prompt.items() if key in needed}
+    sources = {key for key, node in prompt.items() if node.get("class_type") == "AidenH3VideoPreview"}
+    children = {}
+    for key, node in prompt.items():
+        for value in node.get("inputs", {}).values():
+            parent = linked_node(value, prompt)
+            if parent is not None:
+                children.setdefault(parent, []).append(key)
+    blocked, pending = set(), list(sources)
+    for key in pending:
+        for child in children.get(key, []):
+            if child not in blocked:
+                blocked.add(child)
+                pending.append(child)
+    return {key: node for key, node in prompt.items() if key not in blocked} if blocked else prompt
+
+
 def prepare_final(prompt,final_id,records):
     if not isinstance(prompt,dict): raise ValueError('工作流提交内容无效')
     final_id=str(final_id)
@@ -79,3 +111,13 @@ async def merge(request):
     except MergeSpecificationError as error:
         return web.json_response({'error':str(error),'code':'spec_mismatch'},status=409)
     return web.json_response({'record':record})
+
+
+def preview_prompt_handler(data):
+    if isinstance(data, dict) and "prompt" in data:
+        data["prompt"] = preview_only_prompt(data["prompt"], data.get("partial_execution_targets"))
+    return data
+
+
+if hasattr(PromptServer.instance, "add_on_prompt_handler"):
+    PromptServer.instance.add_on_prompt_handler(preview_prompt_handler)
