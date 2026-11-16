@@ -817,4 +817,6 @@ def prompt_handler(data):
         # 让用户在本轮错误里看到真实原因；不能悄悄使用新编辑。
         data["prompt"] = {"AD_round_error": {"class_type": "AD_RoundBlocked",
                                              "inputs": {"reason": str(exc)}}}
+        if data.get("partial_execution_targets") is not None:
+            data["partial_execution_targets"] = ["AD_round_error"]
     return data

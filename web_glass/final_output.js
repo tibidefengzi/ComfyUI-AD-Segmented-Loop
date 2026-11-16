@@ -19,10 +19,11 @@ style.textContent = `
 .ad-final-ab-labels{position:absolute;left:8px;right:8px;top:6px;display:flex;justify-content:space-between;color:#fff;font-size:12px;font-weight:700;text-shadow:0 1px 3px #000;pointer-events:none;z-index:6}
 .ad-final-ab-hint{position:absolute;left:10px;right:10px;bottom:44px;color:var(--ad-warn,#e8c26a);font-size:12px;line-height:1.45;text-shadow:0 1px 3px #000;pointer-events:none;z-index:6}
 .ad-final-ab-bar{position:absolute;left:0;right:0;bottom:0;display:flex;align-items:center;gap:8px;padding:6px 10px;background:#000b;z-index:7}
-.ad-final-ab-bar button{min-height:28px;padding:3px 10px}
+.ad-final-ab-bar button,.ad-final-ab-bar select{min-height:28px;padding:3px 10px}
+.ad-final-ab-bar select{font:inherit;color:#e6e9ef;background:#23354f;border:1px solid #4d7ed8;border-radius:5px}
 .ad-final-ab-bar input[type=range]{flex:1;min-width:80px}
 .ad-final-ab-bar [data-ab-time]{color:#dfe7f3;font-size:12px;white-space:nowrap;min-width:112px;text-align:right}
-.ad-final-ab[data-mode=image] .ad-final-ab-bar [data-ab-play],.ad-final-ab[data-mode=image] .ad-final-ab-bar [data-ab-seek],.ad-final-ab[data-mode=image] .ad-final-ab-bar [data-ab-time]{display:none}
+.ad-final-ab[data-mode=image] .ad-final-ab-bar :is([data-ab-play],[data-ab-seek],[data-ab-time],[data-ab-audio]){display:none}
 .ad-final-ab[data-mode=image] .ad-final-ab-bar{justify-content:flex-end;background:#0008}
 .ad-final-ab:fullscreen{width:100vw;height:100vh;border-radius:0;background:#000}
 .ad-final-ab:fullscreen .ad-final-ab-labels{font-size:14px;left:16px;right:16px;top:10px}
@@ -37,26 +38,37 @@ document.head.append(style);
 // 媒体地址统一走 ComfyUI 的 api.apiURL，origin/file 逐段编码（部署在子路径时也能正确访问）。
 const mediaUrl = record => api.apiURL(`/aiden_h3/media/${encodeURIComponent(record.origin || "media")}/${String(record.file).split("/").map(encodeURIComponent).join("/")}`);
 const thumbnailUrl = record => api.apiURL(`/aiden_h3/thumbnail/${encodeURIComponent(record.origin || "media")}/${String(record.file).split("/").map(encodeURIComponent).join("/")}`);
-// 大分辨率/高帧率/非安全编码视频不再直接播放原文件：走后台预览代理。
-// 判断同时考虑尺寸、帧率、编码、像素格式、容器与码率，避免 4:4:4/10bit/高码率/H.265 直接播放。
+// 浏览器可解码的成品直接预览原文件，兼容编码或解码失败时使用代理。
 const previewProxyUrl = record => api.apiURL(`/aiden_h3/preview_proxy/${encodeURIComponent(record.origin || "media")}/${String(record.file).split("/").map(encodeURIComponent).join("/")}`);
 const PROXY_SAFE_CODECS = new Set(["h264","av1","vp9"]);
 const PROXY_SAFE_PIX_FMTS = new Set(["yuv420p","yuvj420p","nv12","nv21"]);
 const PROXY_SAFE_CONTAINERS = new Set(["mp4","m4v","webm"]);
-const PROXY_BITRATE_LIMIT = 16_000_000;
 const needsPreviewProxy = record => {
     if(record?.kind !== "video")return false;
-    if(Number(record.width) > 1920 || Number(record.height) > 1920 || Number(record.fps) > 30.5)return true;
     const pix = String(record.pix_fmt || "").trim().toLowerCase();
     if(pix && !PROXY_SAFE_PIX_FMTS.has(pix))return true;
     const codec = String(record.codec || "").trim().toLowerCase();
     if(codec && !PROXY_SAFE_CODECS.has(codec))return true;
     const container = String(record.container || String(record.file || "").split(".").pop() || "").trim().toLowerCase();
     if(container && !PROXY_SAFE_CONTAINERS.has(container))return true;
-    const bitrate = Number(record.bitrate) || 0;
-    if(bitrate > PROXY_BITRATE_LIMIT)return true;
     return false;
 };
+function loadPreviewVideo(element, record, onSource, onFailure) {
+    let usingProxy = needsPreviewProxy(record);
+    const load = () => {
+        onSource(usingProxy);
+        element.src = usingProxy ? previewProxyUrl(record) : mediaUrl(record);
+    };
+    element.onerror = () => {
+        if (usingProxy) {
+            onFailure();
+            return;
+        }
+        usingProxy = true;
+        load();
+    };
+    load();
+}
 const label = record => record.label || record.file?.split("/").at(-1) || "成果";
 const getWidget = (node,name) => node.widgets?.find(widget => widget.name === name);
 async function request(path,body) {
@@ -75,7 +87,7 @@ export function mountFinalSave(node) {
     root.innerHTML=`<div class="ad-final-screen"><img hidden><video hidden controls controlslist="nodownload" playsinline preload="metadata"></video><audio hidden controls preload="metadata"></audio><span data-idle>在来源预览中选择成果，再点加工所选</span>
 <div class="ad-final-ab" data-ab hidden><img data-ab-img-a alt="源" hidden><img data-ab-img-b class="ad-final-ab-b" alt="成品" hidden><video data-ab-video-a class="ad-final-ab-a" muted playsinline preload="auto" hidden></video><video data-ab-video-b class="ad-final-ab-b" muted playsinline preload="auto" hidden></video>
 <div class="ad-final-ab-divider" data-ab-divider></div><div class="ad-final-ab-labels"><span>源 · 分段预览</span><span>成品 · 最终保存</span></div><div class="ad-final-ab-hint" data-ab-hint hidden></div>
-<div class="ad-final-ab-bar"><button type="button" data-ab-play>播放</button><input type="range" data-ab-seek min="0" max="0" step="0.001" value="0" aria-label="对比播放位置"><span data-ab-time>0:00.00 / 0:00.00</span><button type="button" data-ab-retry hidden>重试</button><button type="button" data-ab-full>全屏</button><button type="button" data-ab-exit>退出对比</button></div></div>
+<div class="ad-final-ab-bar"><button type="button" data-ab-play>播放</button><input type="range" data-ab-seek min="0" max="0" step="0.001" value="0" aria-label="对比播放位置"><span data-ab-time>0:00.00 / 0:00.00</span><select data-ab-audio aria-label="对比声音"><option value="final">成品声</option><option value="source">源声</option><option value="muted">静音</option></select><button type="button" data-ab-retry hidden>重试</button><button type="button" data-ab-full>全屏</button><button type="button" data-ab-exit>退出对比</button></div></div>
 </div>
 <div class="ad-final-tools"><button data-start>加工所选</button><button data-stop>停止</button><button data-resume>继续剩余</button><button data-merge>合并片段</button><button data-ab-source hidden title="对比这条成品的源预览与最终成品">源/成品 A/B</button><button data-download hidden title="保存当前成果的母版文件（最终_*.mp4），不是预览代理">下载母版</button></div>
 <div class="ad-final-status" aria-live="polite"></div><div class="ad-final-tabs"><button data-kind="image">图片</button><button data-kind="audio">音频</button><button data-kind="video">视频</button></div>
@@ -128,13 +140,20 @@ export function mountFinalSave(node) {
     let renderedStateKey="";
     const finalCards=new Map(),pages=new Map();
     const PAGE_SIZE=200;
-    const video=$("video"),image=$("img"),audio=$("audio");video.muted=true;audio.muted=true;
+    const video=$("video"),image=$("img"),audio=$("audio");
     const abOverlay=$("[data-ab]"),abImgA=$("[data-ab-img-a]"),abImgB=$("[data-ab-img-b]");
     const abVideoA=$("[data-ab-video-a]"),abVideoB=$("[data-ab-video-b]");
     const abDivider=$("[data-ab-divider]"),abHint=$("[data-ab-hint]");
     const abPlay=$("[data-ab-play]"),abSeek=$("[data-ab-seek]"),abTime=$("[data-ab-time]"),abExit=$("[data-ab-exit]"),abRetry=$("[data-ab-retry]"),abFull=$("[data-ab-full]");
     let abOpen=false,abMode="",abRatio=.5,abDragging=false,abToken=0,abDuration=0;
     let abReadyA=false,abReadyB=false,abFailedA=false,abFailedB=false,abBuffering=false,abRecord=null,abSource=null;
+    let abPlaying = false, abPlayRequest = 0;
+    const abAudio = $("[data-ab-audio]");
+    const syncABAudio = () => {
+        abVideoA.muted = abAudio.value !== "source";
+        abVideoB.muted = abAudio.value !== "final";
+    };
+    abAudio.onchange = syncABAudio;
     const downloadButton=$("[data-download]");
     const finalScreen=$(".ad-final-screen");
     // 与分段预览一致：点击最终成果画面 = 本条最终视频循环播放 / 暂停。
@@ -165,7 +184,13 @@ export function mountFinalSave(node) {
         for(const el of [abImgB,abVideoB])if(el)el.style.clipPath=clip;
         if(abDivider)abDivider.style.left=`${(abRatio*100).toFixed(3)}%`;
     };
-    const abPause=()=>{try{abVideoA.pause();abVideoB.pause();}catch{}if(abPlay)abPlay.textContent="播放";};
+    const abPause = () => {
+        abPlaying = false;
+        abPlayRequest += 1;
+        abVideoA.pause();
+        abVideoB.pause();
+        abPlay.textContent = "播放";
+    };
     const abToggleControls=ready=>{if(abPlay)abPlay.disabled=!ready;if(abSeek)abSeek.disabled=!ready;};
     const abSideLabel=(record,fallback)=>record?label(record):fallback;
     // 根据“两路是否就绪/是否失败/是否缓冲”统一刷新按钮、进度条和提示文案。
@@ -220,7 +245,6 @@ export function mountFinalSave(node) {
         if(!record||!["image","video"].includes(record.kind)||!source?.origin||!source?.file)return false;
         return (source.kind||record.kind)===record.kind;
     };
-    const abUrl=record=>record.kind==="video"&&needsPreviewProxy(record)?previewProxyUrl(record):mediaUrl(record);
     const dirty=()=>{node.graph?.change?.();node.setDirtyCanvas?.(true,true);};
     const saveState=()=>{node.properties.ad_final_records=records;node.properties.ad_final_batch=batch;node.properties.ad_final_tab=kind;dirty();};
     const say=(text,error=false)=>{const box=$(".ad-final-status");box.textContent=text;box.classList.toggle("error",error);};
@@ -241,9 +265,9 @@ export function mountFinalSave(node) {
         $("[data-idle]").hidden=true;
         const media=record.kind==="video"?video:record.kind==="audio"?audio:image;
         const meta=`${label(record)}${record.width?` · ${record.width}×${record.height} · ${record.fps} FPS`:""}`;
-        const useProxy=needsPreviewProxy(record);
         const restoreTime=Number(keepTime)>0?Number(keepTime):0;
         if(record.kind==="video"){
+            let useProxy = false;
             const restore=()=>{
                 if(restoreTime>0){try{video.currentTime=Math.min(restoreTime,Math.max(0,(video.duration||0)-0.05));}catch{}}
                 if(autoPlay)void video.play().catch(()=>{});
@@ -253,18 +277,19 @@ export function mountFinalSave(node) {
                 say(useProxy?`${meta} · 预览 ${video.videoWidth}×${video.videoHeight}（预览代理）`:meta);
                 restore();
             };
-            video.onerror=()=>{
-                if(media!==video)return;
-                // 方案1：节点内永不回退播放原文件；大文件代理失败只提示，避免浏览器解码卡死。
+            loadPreviewVideo(video, record, proxy => {
+                useProxy = proxy;
+                video.oncontextmenu = proxy ? event => {
+                    event.preventDefault();
+                    say("当前播放的是预览代理，请用「下载母版」保存原文件。");
+                } : null;
+                say(proxy ? `${meta} · 正在加载兼容预览…` : meta);
+            }, () => {
                 video.pause();
                 media.hidden=true;
                 $("[data-idle]").hidden=false;
-                say(useProxy?`${meta} · 预览生成失败，请稍后重试；原文件已保存，可下载/外部播放查看。`
-                           :`${meta} · 视频加载失败，请稍后重试。`,true);
-            };
-            video.oncontextmenu=useProxy?(event=>{event.preventDefault();say("当前播放的是预览代理；请用「下载母版」保存原文件。",true);return false;}):null;
-            media.src=useProxy?previewProxyUrl(record):mediaUrl(record);
-            say(useProxy?`${meta} · 正在生成预览…（预览代理，下载请用「下载母版」）`:meta);
+                say(`${meta} · 兼容预览加载失败，可下载母版查看。`,true);
+            });
         }else{
             media.src=mediaUrl(record);
             say(meta);
@@ -293,17 +318,30 @@ export function mountFinalSave(node) {
             abImgA.hidden=false;abImgB.hidden=false;
             abImgA.onerror=()=>{if(abOpen){abSetHint(`源图加载失败：${abSideLabel(source,"源")}。可点「重试」或退出对比后单独查看。`);if(abRetry)abRetry.hidden=false;}};
             abImgB.onerror=()=>{if(abOpen){abSetHint(`成品图加载失败：${abSideLabel(record,"成品")}。可点「重试」或退出对比后单独查看。`);if(abRetry)abRetry.hidden=false;}};
-            abImgA.src=abUrl(source);abImgB.src=abUrl(record);
+            abImgA.src=mediaUrl(source);abImgB.src=mediaUrl(record);
             abSetHint("源（左）vs 成品（右）：拖动中间分界线对比");
             return;
         }
         const token=abToken;
         abVideoA.hidden=false;abVideoB.hidden=false;
+        abAudio.value = record.sample_rate === 0 && Number(source.sample_rate) > 0 ? "source" : "final";
+        syncABAudio();
         abVideoA.onloadedmetadata=()=>{if(!abOpen||token!==abToken||abMode!=="video")return;abReadyA=true;abRefresh();};
         abVideoB.onloadedmetadata=()=>{if(!abOpen||token!==abToken||abMode!=="video")return;abReadyB=true;abRefresh();};
-        abVideoA.onerror=()=>{if(!abOpen||token!==abToken||abMode!=="video")return;abFailedA=true;abRefresh();};
-        abVideoB.onerror=()=>{if(!abOpen||token!==abToken||abMode!=="video")return;abFailedB=true;abRefresh();};
-        abVideoA.src=abUrl(source);abVideoB.src=abUrl(record);
+        loadPreviewVideo(abVideoA, {...source, kind:"video"}, () => {
+            abReadyA = false;
+            abRefresh();
+        }, () => {
+            abFailedA = true;
+            abRefresh();
+        });
+        loadPreviewVideo(abVideoB, record, () => {
+            abReadyB = false;
+            abRefresh();
+        }, () => {
+            abFailedB = true;
+            abRefresh();
+        });
         abRefresh();
     };
     const closeAB=()=>{
@@ -322,7 +360,7 @@ export function mountFinalSave(node) {
     };
     for(const [element,side] of [[abVideoA,"源"],[abVideoB,"成品"]]){
         element.addEventListener("waiting",()=>{
-            if(!abOpen||abMode!=="video"||abFailedA||abFailedB)return;
+            if(!abPlaying||abFailedA||abFailedB)return;
             abBuffering=true;abSetHint(`对比播放缓冲中…（${side}）`);
         });
         element.addEventListener("playing",()=>{
@@ -341,15 +379,30 @@ export function mountFinalSave(node) {
     });
     abDivider.addEventListener("pointerup",()=>{abDragging=false;});
     abDivider.addEventListener("pointercancel",()=>{abDragging=false;});
-    const abTogglePlay=()=>{
-        if(!abOpen||abMode!=="video"||abFailedA||abFailedB||!abReadyA||!abReadyB)return;
-        if(abVideoB.paused){
-            if(abDuration>0&&abVideoB.currentTime>=abDuration-.05){abVideoB.currentTime=0;abVideoA.currentTime=0;}
-            void abVideoB.play().catch(()=>{});
-            void abVideoA.play().catch(()=>{});
-        }else{
+    const startABPlayback = () => {
+        const request = ++abPlayRequest;
+        abPlaying = true;
+        abPlay.textContent = "暂停";
+        void Promise.all([abVideoA.play(), abVideoB.play()]).catch(() => {
+            if (request !== abPlayRequest) return;
             abPause();
+            abSetHint("对比播放未启动，请再次点击播放。");
+        });
+    };
+    const resetABTime = () => {
+        abVideoA.currentTime = 0;
+        abVideoB.currentTime = 0;
+        abSeek.value = 0;
+        abTime.textContent = `0:00.00 / ${abClock(abDuration)}`;
+    };
+    const abTogglePlay = () => {
+        if (!abOpen || abMode !== "video" || abFailedA || abFailedB || !abReadyA || !abReadyB) return;
+        if (abPlaying) {
+            abPause();
+            return;
         }
+        if (abVideoA.ended || abVideoB.ended || (abDuration > 0 && abVideoB.currentTime >= abDuration)) resetABTime();
+        startABPlayback();
     };
     abPlay.onclick=()=>abTogglePlay();
     // 点击对比画面 = 播放/停止；拖动分界线或点底部控件不触发。
@@ -358,43 +411,24 @@ export function mountFinalSave(node) {
         if(event.target?.closest?.(".ad-final-ab-bar, .ad-final-ab-divider, [data-ab-divider]"))return;
         abTogglePlay();
     });
-    abVideoB.addEventListener("play",()=>{
-        if(!abOpen||abMode!=="video")return;
-        abPlay.textContent="暂停";
-        void abVideoA.play().catch(()=>{});
-    });
-    abVideoB.addEventListener("pause",()=>{
-        if(!abOpen||abMode!=="video")return;
-        try{abVideoA.pause();}catch{}
-        abPlay.textContent="播放";
-    });
+    for (const media of [abVideoA, abVideoB]) {
+        media.addEventListener("ended", () => {
+            if (!abPlaying || !media.ended) return;
+            resetABTime();
+            startABPlayback();
+        });
+    }
     abVideoB.addEventListener("timeupdate",()=>{
         if(!abOpen||abMode!=="video"||abFailedA||abFailedB)return;
         const duration=abDuration||abVideoB.duration||0;
         const time=Math.min(abVideoB.currentTime,duration||abVideoB.currentTime);
         abSeek.value=time;abTime.textContent=`${abClock(time)} / ${abClock(duration)}`;
-        // 到两路较短时长：播放中则两路一起回到 0 一直循环；暂停中则停在末帧。
-        if(abDuration>0&&abVideoB.currentTime>=abDuration-0.02){
-            if(abVideoB.paused){
-                try{abVideoB.currentTime=abDuration;abVideoA.currentTime=abDuration;}catch{}
-                abSeek.value=abDuration;abTime.textContent=`${abClock(abDuration)} / ${abClock(abDuration)}`;abPlay.textContent="播放";
-            }else{
-                try{abVideoB.currentTime=0;abVideoA.currentTime=0;}catch{}
-                abSeek.value=0;abTime.textContent=`0:00.00 / ${abClock(abDuration)}`;
-                void abVideoB.play().catch(()=>{});void abVideoA.play().catch(()=>{});
-            }
+        if (abPlaying && abDuration > 0 && abVideoB.currentTime >= abDuration) {
+            resetABTime();
+            startABPlayback();
             return;
         }
-        if(abVideoA.readyState>=1&&Math.abs(abVideoA.currentTime-time)>0.18){try{abVideoA.currentTime=time;}catch{}}
-    });
-    abVideoB.addEventListener("ended",()=>{
-        if(!abOpen||abMode!=="video")return;
-        if(!abVideoB.paused){
-            try{abVideoB.currentTime=0;abVideoA.currentTime=0;}catch{}
-            void abVideoB.play().catch(()=>{});void abVideoA.play().catch(()=>{});
-            return;
-        }
-        abSeek.value=abDuration;abTime.textContent=`${abClock(abDuration)} / ${abClock(abDuration)}`;
+        if(abPlaying&&!abVideoA.ended&&abVideoA.readyState>=1&&Math.abs(abVideoA.currentTime-time)>0.18){try{abVideoA.currentTime=time;}catch{}}
     });
     abSeek.addEventListener("input",()=>{
         if(!abOpen||abMode!=="video"||abFailedA||abFailedB)return;

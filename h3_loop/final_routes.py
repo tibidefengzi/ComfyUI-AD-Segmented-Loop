@@ -114,10 +114,22 @@ async def merge(request):
 
 
 def preview_prompt_handler(data):
-    if isinstance(data, dict) and "prompt" in data:
-        data["prompt"] = preview_only_prompt(data["prompt"], data.get("partial_execution_targets"))
+    if isinstance(data, dict) and isinstance(data.get("prompt"), dict):
+        prompt = data["prompt"]
+        errors = [key for key, node in prompt.items() if node.get("class_type") == "AD_RoundBlocked"]
+        extra = (((data.get("extra_data") or {}).get("extra_pnginfo") or {}).get("workflow") or {}).get("extra") or {}
+        targets = errors or extra.get("ad_execution_targets") or data.get("partial_execution_targets")
+        if targets:
+            data["partial_execution_targets"] = [str(key) for key in targets]
+        data["prompt"] = preview_only_prompt(prompt, targets)
     return data
 
 
 if hasattr(PromptServer.instance, "add_on_prompt_handler"):
+    # 热重载保留的旧回调会再次裁剪请求，只替换本模块自己的同名回调。
+    handlers = getattr(PromptServer.instance, "on_prompt_handlers", None)
+    if isinstance(handlers, list):
+        handlers[:] = [handler for handler in handlers
+                       if (getattr(handler, "__module__", None), getattr(handler, "__name__", None)) !=
+                       (preview_prompt_handler.__module__, preview_prompt_handler.__name__)]
     PromptServer.instance.add_on_prompt_handler(preview_prompt_handler)

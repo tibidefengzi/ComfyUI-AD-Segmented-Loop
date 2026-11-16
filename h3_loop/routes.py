@@ -1502,6 +1502,11 @@ async def prepare_round(request):
 
 from .rounds import prompt_handler as _round_prompt_handler
 if hasattr(PromptServer.instance, "add_on_prompt_handler"):
+    handlers = getattr(PromptServer.instance, "on_prompt_handlers", None)
+    if isinstance(handlers, list):
+        handlers[:] = [handler for handler in handlers
+                       if (getattr(handler, "__module__", None), getattr(handler, "__name__", None)) !=
+                       (_round_prompt_handler.__module__, _round_prompt_handler.__name__)]
     PromptServer.instance.add_on_prompt_handler(_round_prompt_handler)
 
 # 内部节点只用于 prompt 注入，不应出现在前端节点搜索里。

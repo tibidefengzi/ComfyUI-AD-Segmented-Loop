@@ -6,10 +6,18 @@ export function installRoundQueue(api, app) {
     api._adRoundQueueInstalled = true;
     const original = api.queuePrompt;
     api.queuePrompt = async function(number, serialized, ...rest) {
+        const targets = rest[0]?.partialExecutionTargets?.map(String);
+        const stampTargets = value => {
+            const extra = {...(value?.extra || {})};
+            if (targets?.length) extra.ad_execution_targets = targets;
+            else delete extra.ad_execution_targets;
+            return {...value, extra};
+        };
         const bindings = (serialized?.workflow?.nodes || []).map(node=>node.properties?.ad_execution_round).filter(Boolean);
         const connected = Object.values(serialized?.output || {}).some(node=>node.class_type === "AidenH3Segment" && node.inputs?.queue);
         if (!connected && !bindings.length) {
-            return original.call(this, number, {...serialized, output:stopAtPreview(serialized?.output, rest[0]?.partialExecutionTargets)}, ...rest);
+            return original.call(this, number, {...serialized, output:stopAtPreview(serialized?.output, targets),
+                workflow:stampTargets(serialized?.workflow)}, ...rest);
         }
         const response = await api.fetchApi("/aiden_h3/round/prepare", {
             method:"POST", headers:{"Content-Type":"application/json"},
@@ -29,7 +37,7 @@ export function installRoundQueue(api, app) {
         // 标记本次提交已由 /round/prepare 处理过：ComfyUI 的 on_prompt 钩子据此跳过二次 prepare，
         // 避免每次排队重复 sync/freeze 与写轮次快照。
         const prepared=result.workflow||serialized.workflow||{};
-        const workflow={...prepared,extra:{...(prepared.extra||{}),ad_round_prepared:true}};
-        return original.call(this, number, {...serialized, output:stopAtPreview(result.prompt, rest[0]?.partialExecutionTargets), workflow}, ...rest);
+        const workflow=stampTargets({...prepared,extra:{...(prepared.extra||{}),ad_round_prepared:true}});
+        return original.call(this, number, {...serialized, output:stopAtPreview(result.prompt, targets), workflow}, ...rest);
     };
 }
