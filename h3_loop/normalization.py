@@ -92,6 +92,8 @@ def _transcode(arguments, seconds, progress):
                 del errors[:-8192]
     reader = threading.Thread(target=read_errors, daemon=True)
     reader.start()
+    from .assets import ffmpeg_watchdog
+    guard, guard_state = ffmpeg_watchdog(process, 3600)
     try:
         for line in process.stdout:
             if line.startswith(b"out_time_us="):
@@ -101,9 +103,12 @@ def _transcode(arguments, seconds, progress):
                     pass
         code = process.wait()
         reader.join()
+        if guard_state["timeout"]:
+            raise ValueError("素材规范化超时（超过 1 小时），已终止；请检查素材或缩短时长")
         if code:
             raise ValueError("素材规范化失败：" + errors.decode("utf-8", "replace")[-1200:])
     finally:
+        guard.cancel()
         if process.poll() is None:
             process.terminate(); process.wait()
         process.stdout.close(); process.stderr.close()

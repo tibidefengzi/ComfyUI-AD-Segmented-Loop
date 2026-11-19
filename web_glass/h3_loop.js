@@ -607,7 +607,7 @@ function mountReview(node) {
             state=await request("/aiden_h3/action",{command:"resume_after",session_id:currentState.id,index:selectedSegment,preview:selectedPreview,group_previews:node._adH3Preview?.groupRecords?.(selectedPreview),segment_node:String(segment.id),prompt:serialized.output,workflow:serialized.workflow,client_id:api.clientId,frontend_queue:true,auto_accept:true});
             node._adH3Preview?.consumeResumeTarget?.();
             safeDraw(state);
-            say(state.status==="completed" ? "所选为本轮最后一段，本轮已完成，没有后续段。" : "已从选中的第 "+state.cursor+" 段之后继续；本轮素材与前段结果保留。");
+            say(state.status==="completed" ? "所选为本轮最后一段，本轮已完成，没有后续段。" : "已从选中的第 "+state.cursor+" 段之后继续（第 "+state.cursor+" 段采用你点选的那一版接力）；本轮素材与前段结果保留。");
         } else if(currentState?.status==="error"){
             state=await request("/aiden_h3/action",{command:"resume_round",session_id:currentState.id,segment_node:String(segment.id),prompt:serialized.output,workflow:serialized.workflow,client_id:api.clientId,frontend_queue:true,auto_accept:true});
             safeDraw(state);
@@ -617,6 +617,10 @@ function mountReview(node) {
         }
         const finish=async({restart=false}={})=>{
             const batch=state.segments.some(row=>row.entry?.batch_source);
+            if(selectedSegment>0 && !batch){
+                say("续跑已完成，可以合并本轮已选用的片段。");
+                return null;
+            }
             try {
                 state=await request("/aiden_h3/action",{command:"clear",session_id:state.id,confirmed:true});
                 safeDraw(state);

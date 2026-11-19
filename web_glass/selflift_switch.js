@@ -1,5 +1,13 @@
 // A front-end control for the existing, explicitly wired ComfySwitchNode.
 // The native switch widget remains the serialized source of truth.
+import { app } from "../../scripts/app.js";
+
+const CHAIN_CACHE_MS = 2000;
+const chainCache = new WeakMap();   // graph -> {version, stamp, map}
+
+function graphVersion(graph) {
+    return Number(graph?._version) || 0;
+}
 const kind = node => String(node?.comfyClass || node?.type || "");
 const isSampler = node => /Sampler/.test(kind(node));
 const isSelfLift = node => /SelfLift/i.test(kind(node)) && isSampler(node);
@@ -38,7 +46,7 @@ function samplerFrom(node) {
     }
     return null;
 }
-function chainFor(segment) {
+function computeChainFor(segment) {
     const graph = segment?.graph;
     const previews = (graph?._nodes || []).filter(node => kind(node) === "AidenH3VideoPreview"
         && source(node, "context") === segment);
@@ -63,6 +71,24 @@ function chainFor(segment) {
         }
     }
     return {previews, candidates: [...candidates.values()]};
+}
+
+function chainFor(segment) {
+    // 1Hz 巡检会反复遍历图；按 graph 版本 + 2s 兜底缓存，避免 O(段数²) 的重复扫描。
+    const graph = segment?.graph;
+    if (!graph) return {previews: [], candidates: []};
+    const version = graphVersion(graph);
+    const now = Date.now();
+    let entry = chainCache.get(graph);
+    if (!entry || entry.version !== version || now - entry.stamp > CHAIN_CACHE_MS) {
+        entry = {version, stamp: now, map: new WeakMap()};
+        chainCache.set(graph, entry);
+    } else if (entry.map.has(segment)) {
+        return entry.map.get(segment);
+    }
+    const computed = computeChainFor(segment);
+    entry.map.set(segment, computed);
+    return computed;
 }
 export function inspectSelfLiftSwitch(segment) {
     const {previews, candidates} = chainFor(segment);
@@ -133,11 +159,19 @@ export function mountSelfLiftSwitch(node, {bindWidth = () => {}} = {}) {
             : "开启：SelfLift 采样；关闭：当前接入的其它采样。外置切换节点与采样参数保留。";
         button.title = root.title;
     };
+    const notify = text => {
+        // 不再用 alert 阻塞画布；优先走 ComfyUI 的 toast，旧前端退回控制台。
+        try {
+            const toast = app?.extensionManager?.toast;
+            if (toast?.add) { toast.add({severity: "warn", summary: "SelfLift 采样", detail: String(text), life: 6000}); return; }
+        } catch (_error) {}
+        try { console.warn("[AD-Segmented-Loop] " + text); } catch (_error) {}
+    };
     button.addEventListener("click", () => {
         const current = inspectSelfLiftSwitch(node);
         const result = setSelfLiftEnabled(node, !current.enabled);
         sync();
-        if (!result.ok) window.alert(result.reason);
+        if (!result.ok) notify(result.reason);
     });
     const widget = node.addDOMWidget("ad_h3_selflift_switch", "div", root, {
         serialize: false, hideOnZoom: false, getHeight: () => 32,

@@ -5,6 +5,7 @@ import numpy as np
 
 from .audio import read_audio_entry
 from . import frames
+from .debuglog import debug as debug_log
 from .spec import FPS, snap_resolution, target_frames, validate_resolution
 
 DEFAULT_THRESHOLDS={"frame_difference":.07,"brightness_jump":3.0,"histogram_distance":.19,"motion_jump":.015}
@@ -47,7 +48,7 @@ def snap_images_to_h3(images, alpha=None):
     if alpha is not None:
         alpha = alpha[:, top:top + target_h, left:left + target_w]
     note = f"AidenH3: 解码分辨率 {width}×{height} 非 32 倍数，已中心裁切为 {target_w}×{target_h}"
-    print(note)
+    debug_log(note)
     return images, alpha, {"from": [width, height], "to": [target_w, target_h],
                            "crop_xy": [left, top]}
 
@@ -116,7 +117,7 @@ def normalize_video(video,context,state,directory,strict_sync=False):
         raise ValueError(f"有效生成帧不足：需要 {target+overlap} 帧（含重叠），实际 {available} 帧。请重做；不会冻结补帧。")
     if continuum_trimmed:
         why = "本次任务绑定的 Continuum 状态"
-        print(f"AidenH3: Continuum 已裁重叠（{why}），按目标 {commit_target} 帧入库（收到 {available}）")
+        debug_log(f"AidenH3: Continuum 已裁重叠（{why}），按目标 {commit_target} 帧入库（收到 {available}）")
         prefix = None
         overlap = 0
     else:
@@ -134,9 +135,9 @@ def normalize_video(video,context,state,directory,strict_sync=False):
             previous=previous_color,smooth=(color_mode=="follow"))
         if color_info:
             color_info["mode"]=color_mode
-            print("[AD-颜色] 参考首帧色彩匹配：%s" % color_info)
+            debug_log("[AD-颜色] 参考首帧色彩匹配：%s" % color_info)
     except Exception as exc:
-        print("[AD-颜色] 参考首帧色彩匹配失败（保留原画面）：%r" % (exc,))
+        debug_log("[AD-颜色] 参考首帧色彩匹配失败（保留原画面）：%r" % (exc,))
     audio=components.audio or read_audio_entry(entry)
     if audio is not None:
         rate=int(audio["sample_rate"])

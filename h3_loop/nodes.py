@@ -7,6 +7,7 @@ import math
 
 from . import assets
 from . import compat
+from .debuglog import debug as debug_log
 from .color_match import COLOR_MATCH_CHOICES as _COLOR_MATCH_CHOICES, parse_config as _color_match_config, reference_frame_stats
 from .normalization import normalize_source
 from .spec import relay_reanchor_interval as _relay_reanchor_interval, relay_reanchors, relay_parent_stage, relay_segment_context
@@ -16,7 +17,7 @@ from .storage import ROOT, STORE, digest
 from .spec import (ASPECT_CHOICES, DEFAULT_ASPECT, DEFAULT_MEGAPIXELS, FPS, MEGAPIXEL_CHOICES,
                        generation_frames, resolve_canvas, target_frames, validate_fps)
 from .timeline import (DEFAULT_SEGMENT_MAX_FRAMES, EMPTY_TIMELINE, MAX_AUDIO_PORTS, MAX_IMAGE_PORTS, MAX_VIDEO_PORTS,
-                       clip_span, loop_settings, output_timeline, reference_pack, timeline_identity, timeline_plan)
+                       audio_piece, clip_span, loop_settings, output_timeline, reference_pack, timeline_identity, timeline_plan)
 from .video import video_identity, video_plan, video_window
 from .continuum import (
     continuum_available, continuum_node, continuum_status_report,
@@ -412,9 +413,19 @@ def _segment_audio(entry, window):
         try:
             import torch
             sample_rate = 48000
-            start = float(int(window.get("start_frame") or 0)) / float(FPS)
+            # 潜桥段：音频按 17n 累计网格连续取（relay_audio_start），不能再用原段边界，
+            # 否则每段音频会与下一段重叠 6~7 帧、拼接处重复/断音。
             seconds = float(int(window.get("target_frames") or window.get("frame_count") or 0)) / float(FPS)
-            begin = max(0, int(round(start * sample_rate)))
+            # 两种起点含义不同：
+            # - 普通模式 start_frame 已经是源视频帧（含裁剪偏移），直接用；
+            # - 潜桥模式 relay_audio_start 是时间线累计帧，要换成“原片里的位置”＝片段 src_in + 偏移。
+            relay_start = window.get("relay_audio_start")
+            if relay_start is None:
+                begin = max(0, int(round(float(int(window.get("start_frame") or 0)) / float(FPS) * sample_rate)))
+            else:
+                base = float((entry.get("video_source") or {}).get("src_in") or 0.0)
+                delta = float(int(relay_start)) / float(FPS) - float(entry.get("source_start") or 0.0)
+                begin = max(0, int(round((base + max(0.0, delta)) * sample_rate)))
             want = int(round(seconds * sample_rate))
             path = assets.resolve_source(_original_source(source))
             import os
@@ -427,6 +438,17 @@ def _segment_audio(entry, window):
         except Exception:
             pass
     return read_audio_entry(entry)
+
+
+def _video_owns_audio(entry):
+    """本段声音是否真的来自视频音轨：没音轨的静音视频不能挡住时间线音频。"""
+    source = entry.get("source_video")
+    if not source or entry.get("video_audio_muted"):
+        return False
+    try:
+        return bool(assets.has_audio_stream(assets.resolve_source(_original_source(source))))
+    except Exception:
+        return False
 
 
 def _frame_buffer(shape):
@@ -900,8 +922,7 @@ def _full_lane_audio_pieces(lane, source_map):
         first, last = float(clip["src_in"]), float(clip["src_out"])
         if last <= first:
             continue
-        pieces.append({"origin": source["origin"], "file": source["file"],
-                       "src_in": first, "src_out": last})
+        pieces.append(audio_piece(source, first, last))
     return pieces
 
 
@@ -994,7 +1015,7 @@ def _chain_color_stats(entries):
         _CHAIN_COLOR_CACHE[key] = stats
         return dict(stats)
     except Exception as exc:
-        print("[AD-颜色] 全链统一色彩目标读取失败：%r" % (exc,))
+        debug_log("[AD-颜色] 全链统一色彩目标读取失败：%r" % (exc,))
         return None
 
 
@@ -1089,8 +1110,7 @@ def _timeline_material_values(queue, used=None, index=None, window=None, *,
             else:
                 clip = clips[segment_index % len(clips)]
                 source = source_map[clip["source"]]
-                pieces = [{"origin": source["origin"], "file": source["file"],
-                           "src_in": float(clip["src_in"]), "src_out": float(clip["src_out"])}]
+                pieces = [audio_piece(source, clip["src_in"], clip["src_out"])]
             values.append(read_pieces(pieces) if pieces else None)
         else:
             values.append(None)
@@ -1119,7 +1139,7 @@ def _timeline_material_values(queue, used=None, index=None, window=None, *,
                         color_stats = reference_frame_stats(frame[0], source, first)
                         color_stats["track"] = primary_index + 1
                 except Exception as exc:
-                    print("[AD-颜色] 读取本段参考色彩失败：%r" % (exc,))
+                    debug_log("[AD-颜色] 读取本段参考色彩失败：%r" % (exc,))
             media_details["color_match_reference"] = color_stats or None
     return values
 
@@ -1139,7 +1159,7 @@ def _board_image(state, source_map, index):
     try:
         return assets.load_image_tensor(source)
     except Exception as exc:
-        print("[AD-分镜] 读取第 %d 段分镜参考图失败：%r" % (int(index) + 1, exc))
+        debug_log("[AD-分镜] 读取第 %d 段分镜参考图失败：%r" % (int(index) + 1, exc))
         return None
 
 
@@ -1507,7 +1527,7 @@ class AidenH3Segment:
             # ComfyUI 私有执行上下文接口缺失（版本差异）：跳过进度监听，不影响本次生成。
             if "executing_context" not in _WARNED_ONCE:
                 _WARNED_ONCE.add("executing_context")
-                print("AidenH3: 未找到 ComfyUI 执行上下文接口，已跳过进度监听（不影响本次生成）")
+                debug_log("AidenH3: 未找到 ComfyUI 执行上下文接口，已跳过进度监听（不影响本次生成）")
         elif not session["active"].get("prompt_id"):
             import asyncio
             from server import PromptServer
@@ -1544,6 +1564,8 @@ class AidenH3Segment:
         relay_reanchor_every = 0
         relay_reanchor = False
         relay_run_id = ""
+        relay_target = 0
+        relay_targets = []
         # v0.5.51：重锚定=独立生成 + 正常预卷。预卷/裁头照常按潜桥续接 C 计算
         # （第 1 段固定 5、第 2 段起=C）；重锚定只改变“桥接方式”（桥 stage_index=0
         # 直通，不读上一段/第 1 段 latent），因此不会再出现“第 1 段画面串入”；
@@ -1557,7 +1579,8 @@ class AidenH3Segment:
             relay_reanchor_every = _relay_reanchor_interval(kwargs.get("潜桥重锚定"))
             relay_reanchor = relay_reanchors(relay_reanchor_every, int(index))
             source_target = int(window["target_frames"])
-            relay_target = _relay_targets_for_entries(entries)[index]
+            relay_targets = _relay_targets_for_entries(entries)
+            relay_target = relay_targets[index]
             if relay_target < 17:
                 raise ValueError("潜桥开启时每段至少需要 17 帧目标长度")
             effective_context = _effective_relay_context(relay_context, int(index), relay_reanchor)
@@ -1565,11 +1588,11 @@ class AidenH3Segment:
                 raise ValueError(f"潜桥上下文 C={effective_context} 必须小于本段输出帧数 {relay_target}")
             plan = relay_plan(relay_target, effective_context)
             if int(index) == 0 and effective_context != relay_context:
-                print("[AD-潜桥] 第 1 段无前序上下文：只加 %d 帧（生成 %d → 输出 %d，裁头 %d），不按 C=%d 预卷"
+                debug_log("[AD-潜桥] 第 1 段无前序上下文：只加 %d 帧（生成 %d → 输出 %d，裁头 %d），不按 C=%d 预卷"
                       % (effective_context, plan["generation_frames"], relay_target,
                          plan["trim_frames"], relay_context))
             elif relay_reanchor:
-                print("[AD-潜桥] 第 %d 段重锚定：软重置（仍接上一段 latent 保留运动/机位，"
+                debug_log("[AD-潜桥] 第 %d 段重锚定：软重置（仍接上一段 latent 保留运动/机位，"
                       "上下文改用上一段成片尾帧重编码，断掉逐段画质复利；"
                       "生成 %d → 输出 %d，裁头 %d）"
                       % (int(index) + 1, plan["generation_frames"], relay_target,
@@ -1583,6 +1606,8 @@ class AidenH3Segment:
                     f"潜桥开启后本段需要生成 {need_frames} 帧（输出 {relay_target} 帧 + 上下文 C={effective_context} 帧），"
                     f"超过单段上限 {limit_frames} 帧；请缩短本段、降低上下文 C，或提高单段上限后再运行。")
             window["target_frames"] = relay_target
+            # 音频按 17n 累计网格连续取，避免每段音频与下一段重叠（拼接处重复/断音）。
+            window["relay_audio_start"] = sum(relay_targets[:int(index)])
             window["frame_count"] = plan["generation_frames"]
             relay_trim_frames = plan["trim_frames"]
             relay_pre_roll = plan["pre_roll_frames"]
@@ -1661,6 +1686,19 @@ class AidenH3Segment:
         round_audio = (_segment_audio(entry, window) if use_segment_audio else _round_audio(state, index)) if need(10) and not batch_source else None
         if round_audio is None and need(10) and not batch_source:
             round_audio = _segment_audio(entry, window)
+        # 潜桥：段输出长度由 17n 计划决定，本段音频必须按同一累计网格连续取。
+        # 否则每段音频比画面短 6~7 帧、尾部用静音补到画面长度，拼接处出现 0.25~0.3 秒断音
+        # （2026-11-18 三段实测：段 1/2/3 音频 95/96/95 帧，画面 102 帧）。
+        # 视频自带音轨时仍用视频声音（_segment_audio 内部已改用 relay_audio_start），不能换成时间线混音。
+        video_owns_audio = _video_owns_audio(entry)
+        if relay_active and use_segment_audio and need(10) and not batch_source and relay_targets and not video_owns_audio:
+            from .audio import read_relay_audio
+            round_audio = read_relay_audio(entries, int(window.get("relay_audio_start") or 0), int(relay_target))
+            missing_audio = round_audio.get("missing") or []
+            if missing_audio:
+                names = "、".join(sorted({item["file"] for item in missing_audio if item.get("file")})) or "音频素材"
+                seconds = sum(float(item.get("seconds") or 0) for item in missing_audio)
+                raise ValueError(f"第 {int(index) + 1} 段本段音频缺失：{names}，缺少约 {int(round(seconds * 1000))} 毫秒；请补回素材或调整分段后再生成")
         segment_source = (entry.get("video_source") if batch_source else _segment_video_source(state, index, entry)) if need(2) or need(11) or need(extra_slot) else None
         first_frame = (assets.video_first_frame(segment_source, float(segment_source["src_in"]), float(segment_source["src_out"]))
                        if need(2) and segment_source is not None else None)
@@ -2338,7 +2376,7 @@ class AidenH3ContinuumCapture:
             f"[Aiden←Continuum] session={context['session_id']} 段{int(context['index']) + 1} "
             f"状态已写入 {path}。 {report}"
         )
-        print(report)
+        debug_log(report)
         return trimmed_images, trimmed_audio, state, path, report
 
 
@@ -2580,7 +2618,7 @@ def _relay_audio_fix(bridge_out, target, ctx, stage, reanchor=False, voice_on=Fa
         from comfy.nested_tensor import NestedTensor
         from ._relay_vendor import relay_core as _relay_core
     except Exception as exc:
-        print("[AD-潜桥] 音频钉住修复跳过（依赖不可用）：%r" % (exc,))
+        debug_log("[AD-潜桥] 音频钉住修复跳过（依赖不可用）：%r" % (exc,))
         return bridge_out
     if not isinstance(bridge_out, dict) or not isinstance(target, dict):
         return bridge_out
@@ -2625,7 +2663,7 @@ def _relay_audio_fix(bridge_out, target, ctx, stage, reanchor=False, voice_on=Fa
                     head = tail[..., take - shift:]
                     note = "第 %d 段音频尾" % (int(head_stage) + 1)
             except Exception as exc:
-                print("[AD-潜桥] 音频前导读取失败，改用静音占位（%r）" % (exc,))
+                debug_log("[AD-潜桥] 音频前导读取失败，改用静音占位（%r）" % (exc,))
                 head = None
     if shift <= 0:
         return bridge_out
@@ -2655,7 +2693,7 @@ def _relay_audio_fix(bridge_out, target, ctx, stage, reanchor=False, voice_on=Fa
     out = dict(bridge_out)
     out["samples"] = NestedTensor((video, new_audio))
     out["noise_mask"] = NestedTensor((video_mask, new_mask))
-    print("[AD-潜桥] 音频钉住保留 + 前导 %d tick（%s，%d→%d）"
+    debug_log("[AD-潜桥] 音频钉住保留 + 前导 %d tick（%s，%d→%d）"
           % (shift, note, total, int(new_audio.shape[-1])))
     return out
 
@@ -2811,7 +2849,7 @@ class ADH3InternalBridge:
         bridge_context = {}
         if pass_role == "first" and stage > 0:
             bridge_context["context_latent"] = _first_pass_context(run_id, stage - 1, latent)
-        print("[AD-潜桥] 第 %d 段音频：钉住=%s 上游pin=%s 声锚=%s"
+        debug_log("[AD-潜桥] 第 %d 段音频：钉住=%s 上游pin=%s 声锚=%s"
               % (stage + 1, audio_pinned, upstream_pin,
                  "stage_00000" if voice_stage == 0 else "关（上一段尾）"))
 
@@ -2853,11 +2891,11 @@ class ADH3InternalBridge:
                                              voice_anchor_stage=voice_stage,
                                              run_id=run_id, stage_index=stage)
                     ctx["ad_bridge_used"] = "soft-reset"
-                    print("[AD-潜桥] 第 %d 段重锚定：软重置（上一段成片尾 %d 帧 -> 锐化 -> VAE 重编码，保留运动）"
+                    debug_log("[AD-潜桥] 第 %d 段重锚定：软重置（上一段成片尾 %d 帧 -> 锐化 -> VAE 重编码，保留运动）"
                           % (stage + 1, int(context_frames)))
                     return finish(result)
                 except Exception as exc:
-                    print("[AD-潜桥] 重锚定软重置不可用，改用直接 latent 续接（%r）" % (exc,))
+                    debug_log("[AD-潜桥] 重锚定软重置不可用，改用直接 latent 续接（%r）" % (exc,))
             result = upstream.bridge(latent, context_frames=int(context_frames),
                                      mask_mode=str(mask_mode or "hard"),
                                      pin_audio=upstream_pin, conditioning=conditioning,
@@ -2876,11 +2914,11 @@ class ADH3InternalBridge:
                                          voice_anchor_stage=voice_stage,
                                          run_id=run_id, stage_index=stage)
                 ctx["ad_bridge_used"] = "pixel"
-                print("[AD-潜桥] 第 %d 段桥接：像素质量复位（上一段成片尾 %d 帧 -> 锐化 -> VAE 重编码）"
+                debug_log("[AD-潜桥] 第 %d 段桥接：像素质量复位（上一段成片尾 %d 帧 -> 锐化 -> VAE 重编码）"
                       % (stage + 1, int(context_frames)))
                 return finish(result)
             except Exception as exc:
-                print("[AD-潜桥] 像素质量复位桥接不可用，回退直接 latent（%r）" % (exc,))
+                debug_log("[AD-潜桥] 像素质量复位桥接不可用，回退直接 latent（%r）" % (exc,))
         result = upstream.bridge(latent, context_frames=int(context_frames),
                                  mask_mode=str(mask_mode or "hard"),
                                  pin_audio=upstream_pin, conditioning=conditioning,
@@ -2926,16 +2964,16 @@ class ADH3InternalAppearanceAnchor:
                 from ._relay_vendor.relay_core import build_anchor_ref
                 ref = build_anchor_ref(_first_pass_context(run_id, 0, first_pass_latent), 5)
         except Exception as exc:
-            print("[AD-潜桥] 外观锚未生效（%r）" % (exc,))
+            debug_log("[AD-潜桥] 外观锚未生效（%r）" % (exc,))
             return (conditioning,)
         try:
             import node_helpers
             out = node_helpers.conditioning_set_values(conditioning, {"minimax_refs": [ref]}, append=True)
         except Exception as exc:
-            print("[AD-潜桥] 锚定参考块注入失败，保持原条件（%r）" % (exc,))
+            debug_log("[AD-潜桥] 锚定参考块注入失败，保持原条件（%r）" % (exc,))
             return (conditioning,)
         ctx["ad_appearance_refs"] = 1
-        print("[AD-潜桥] 第 %d 段锚定：追加 1 个外观锚参考块（第1段）" % (stage + 1,))
+        debug_log("[AD-潜桥] 第 %d 段锚定：追加 1 个外观锚参考块（第1段）" % (stage + 1,))
         return (out,)
 
 
@@ -2972,7 +3010,7 @@ class ADH3InternalReanchorGuide:
         if stage <= 0 or not ctx.get("relay_reanchor") or want <= 0:
             return (conditioning,)
         if vae is None:
-            print("[AD-重锚定] 缺少视频 VAE，跳过上一段尾帧锚定")
+            debug_log("[AD-重锚定] 缺少视频 VAE，跳过上一段尾帧锚定")
             return (conditioning,)
         trim = int(ctx.get("relay_trim_frames") or ctx.get("relay_context_frames") or 0)
         limit = min(want, trim) if trim > 0 else want
@@ -2987,7 +3025,7 @@ class ADH3InternalReanchorGuide:
                 images, guide = decoded, frames
                 break
         if images is None:
-            print("[AD-重锚定] 第 %d 段：找不到上一段成片尾帧，跳过 guide 锚定" % (stage + 1,))
+            debug_log("[AD-重锚定] 第 %d 段：找不到上一段成片尾帧，跳过 guide 锚定" % (stage + 1,))
             return (conditioning,)
         try:
             width, height = (_relay_canvas(stage_latent) if stage_latent is not None
@@ -3003,11 +3041,11 @@ class ADH3InternalReanchorGuide:
             import node_helpers
             out = node_helpers.conditioning_set_values(conditioning, {"minimax_keyframes": keyframes})
         except Exception as exc:
-            print("[AD-重锚定] 第 %d 段：guide 锚定失败，保持原条件（%r）" % (stage + 1, exc))
+            debug_log("[AD-重锚定] 第 %d 段：guide 锚定失败，保持原条件（%r）" % (stage + 1, exc))
             ctx["ad_reanchor_guide_frames"] = 0
             return (conditioning,)
         ctx["ad_reanchor_guide_frames"] = int(guide)
-        print("[AD-重锚定] 第 %d 段：锚定上一段成片尾 %d 帧到本段预卷开头（guide 不参与去噪）"
+        debug_log("[AD-重锚定] 第 %d 段：锚定上一段成片尾 %d 帧到本段预卷开头（guide 不参与去噪）"
               % (stage + 1, int(guide)))
         return (out,)
 
@@ -3036,7 +3074,7 @@ class ADH3InternalSave:
             path = _relay_stage_file(run_id, stage)
             lineage = _relay_vendor_runtime._stage_lineage(run_id, stage)
             save_av_latent(latent, str(path), note=note, lineage=lineage, first_pass=first_pass_latent)
-            print("[AD-潜桥] 第 %d 段已保存同版本的一采和二采 latent" % (stage + 1))
+            debug_log("[AD-潜桥] 第 %d 段已保存同版本的一采和二采 latent" % (stage + 1))
         # 存盘与结果登记可能谁先谁后：存盘完成后再查一次，若本版本已被选中/批准就立即提升，
         # 不再依赖“登记时刻源文件已存在”这一顺序假设。
         try:
@@ -3048,7 +3086,7 @@ class ADH3InternalSave:
                     str(ctx.get("relay_save_run_id") or ""),
                     int(ctx.get("relay_stage_index") or 0))
         except Exception as exc:  # 提升失败不影响本段生成，但必须可见
-            print("[AD-潜桥] 存盘后提升检查失败（不影响本段生成）：%r" % (exc,))
+            debug_log("[AD-潜桥] 存盘后提升检查失败（不影响本段生成）：%r" % (exc,))
         return (latent,)
 
 
@@ -3126,7 +3164,7 @@ def _first_segment_frames(ctx, max_frames=6):
         chosen = picked[::step][:max_frames]
         return torch.from_numpy(np.stack([np.asarray(f, dtype=np.float32) / 255.0 for f in chosen]))
     except Exception as exc:
-        print("[AD-颜色] 读取第 1 段成片失败：%r" % (exc,))
+        debug_log("[AD-颜色] 读取第 1 段成片失败：%r" % (exc,))
         return None
 
 
@@ -3209,17 +3247,17 @@ def _apply_texture_restore(images, ctx, anchor_config="{}"):
     target = _first_segment_detail(ctx)
     current = _image_detail(images)
     if target is None or current is None or current <= 1e-6:
-        print("[AD-质感] 缺少第 1 段/本段细节统计，跳过质感还原")
+        debug_log("[AD-质感] 缺少第 1 段/本段细节统计，跳过质感还原")
         return images
     ratio = float(target) / float(current)
     if ratio <= 1.15:
-        print("[AD-质感] 细节已达标（第1段 %.0f / 本段 %.0f），跳过" % (target, current))
+        debug_log("[AD-质感] 细节已达标（第1段 %.0f / 本段 %.0f），跳过" % (target, current))
         return images
     amount = min(0.8, (ratio - 1.0) * blend * 0.8)
     if amount < 0.03:
         return images
     corrected = _unsharp_images(images, amount)
-    print("[AD-质感] 质感还原：第1段细节 %.0f / 本段 %.0f → 锐化 %.2f" % (target, current, amount))
+    debug_log("[AD-质感] 质感还原：第1段细节 %.0f / 本段 %.0f → 锐化 %.2f" % (target, current, amount))
     return corrected
 
 
@@ -3427,7 +3465,7 @@ def _previous_segment_last_frame(ctx, stage):
         means = _segment_file_last_frame(sid, int(stage) - 1, "", mode="rows")
     if means is None and parent and parent != sid:
         if not target:
-            print("[AD-接缝] 抽卡子会话缺少有效轮次号：不回退父会话（避免曝光目标取错）")
+            debug_log("[AD-接缝] 抽卡子会话缺少有效轮次号：不回退父会话（避免曝光目标取错）")
         else:
             parent_round = _session_round_no(parent)
             if parent_round == target:
@@ -3570,7 +3608,7 @@ def _apply_seam_transition(images, ctx, anchor_config="{}"):
                 ctx["ad_seam"] = info
             return images
         ctx["ad_seam"] = info
-        print("[AD-接缝] 第 %d 段%s：段首 %d 帧增益%s gain0=%s 范围=[%s,%s]%s"
+        debug_log("[AD-接缝] 第 %d 段%s：段首 %d 帧增益%s gain0=%s 范围=[%s,%s]%s"
               % (stage + 1, "（重锚定）" if reanchor else "", info["frames"],
                  "生效" if head_applied else "已对齐无需修正", info["gain_first"],
                  info["gain_range"][0], info["gain_range"][1],
@@ -3579,7 +3617,7 @@ def _apply_seam_transition(images, ctx, anchor_config="{}"):
                  if info["deflicker_window"] else ""))
         return out
     except Exception as exc:
-        print("[AD-接缝] 接缝曝光过渡失败（保留原画面）：%r" % (exc,))
+        debug_log("[AD-接缝] 接缝曝光过渡失败（保留原画面）：%r" % (exc,))
         return images
 
 
@@ -3648,7 +3686,7 @@ def _apply_segment_correction(images, ctx, anchor_config="{}"):
     offset = np.average(np.stack(offsets), axis=0, weights=np.asarray(weights, dtype=np.float64))
     offset = np.clip(offset * blend, -0.18, 0.18).astype(np.float32)
     if float(np.abs(offset).max()) < 0.002:
-        print("[AD-颜色] 整段软校正：偏移过小，跳过")
+        debug_log("[AD-颜色] 整段软校正：偏移过小，跳过")
         return images
     correction = torch.as_tensor(offset, device=images.device, dtype=images.dtype).view(1, 1, 1, 3)
     corrected = images.clone()
@@ -3656,7 +3694,7 @@ def _apply_segment_correction(images, ctx, anchor_config="{}"):
     for start in range(0, int(corrected.shape[0]), chunk):
         part = corrected[start:start + chunk]
         part.add_(correction).clamp_(0.0, 1.0)
-    print("[AD-颜色] 整段软校正（第1段成片目标，blend=%.1f）：offset=%s" % (blend, [round(float(v), 4) for v in offset]))
+    debug_log("[AD-颜色] 整段软校正（第1段成片目标，blend=%.1f）：offset=%s" % (blend, [round(float(v), 4) for v in offset]))
     return corrected
 
 
@@ -3719,25 +3757,25 @@ class ADH3InternalTrim:
         try:
             trimmed_images = _apply_segment_correction(trimmed_images, ctx, anchor_config)
         except Exception as exc:
-            print("[AD-颜色] 整段软校正失败（保留原画面）：%r" % (exc,))
+            debug_log("[AD-颜色] 整段软校正失败（保留原画面）：%r" % (exc,))
         try:
             trimmed_images = _apply_texture_restore(trimmed_images, ctx, anchor_config)
         except Exception as exc:
-            print("[AD-质感] 质感还原失败（保留原画面）：%r" % (exc,))
+            debug_log("[AD-质感] 质感还原失败（保留原画面）：%r" % (exc,))
         try:
             trimmed_images = _apply_seam_transition(trimmed_images, ctx, anchor_config)
         except Exception as exc:
-            print("[AD-接缝] 接缝曝光过渡失败（保留原画面）：%r" % (exc,))
+            debug_log("[AD-接缝] 接缝曝光过渡失败（保留原画面）：%r" % (exc,))
         try:
             audit = _segment_effective_audit(ctx, anchor_config)
             ctx["ad_effective"] = audit
-            print("[AD-审计] 第 %d 段实际生效：%s" % (audit["stage"], json.dumps(audit, ensure_ascii=False)))
+            debug_log("[AD-审计] 第 %d 段实际生效：%s" % (audit["stage"], json.dumps(audit, ensure_ascii=False)))
         except Exception as exc:
-            print("[AD-审计] 生效审计失败（不影响生成）：%r" % (exc,))
+            debug_log("[AD-审计] 生效审计失败（不影响生成）：%r" % (exc,))
         line = "[AD-潜桥] 裁头 %d 帧：画面 %d → %d 帧" % (frames, before_images, after_images)
         if before_audio is not None and after_audio is not None:
             line += "；音频 %d → %d 采样点" % (before_audio, after_audio)
-        print(line)
+        debug_log(line)
         return (trimmed_images, trimmed_audio)
 
 

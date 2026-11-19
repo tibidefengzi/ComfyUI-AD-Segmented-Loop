@@ -240,13 +240,35 @@ def ffmpeg_executable():
         return None
 
 
-def _run(arguments, log_path=None):
+def ffmpeg_watchdog(process, seconds=3600):
+    """超时强杀 ffmpeg：管道写入/读取卡死时不再永久占用执行线程。"""
+    import threading
+    state = {"timeout": False}
+
+    def _kill():
+        state["timeout"] = True
+        try:
+            process.kill()
+        except Exception:
+            pass
+
+    timer = threading.Timer(max(1, int(seconds)), _kill)
+    timer.daemon = True
+    timer.start()
+    return timer, state
+
+
+def _run(arguments, log_path=None, timeout=3600):
     executable = ffmpeg_executable()
     if executable is None:
         raise ValueError("需要 FFmpeg 来处理视频素材，请将 FFmpeg 加入 PATH 或安装 imageio-ffmpeg")
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    finished = subprocess.run([executable, *arguments], stdout=subprocess.PIPE,
-                              stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, creationflags=creationflags)
+    try:
+        finished = subprocess.run([executable, *arguments], stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
+                                  creationflags=creationflags, timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        raise ValueError("FFmpeg 处理超时（超过 %d 秒），已终止；请检查素材或缩短时长" % int(timeout)) from error
     if log_path:
         # 只保留失败日志；成功的空 .log 文件会误导排查。
         try:
@@ -279,7 +301,7 @@ def probe_duration(path):
             if cached is not None:
                 _DURATION_CACHE.move_to_end(key)
                 return cached[0]
-    finished = _run(["-v", "info", "-i", str(path)])
+    finished = _run(["-v", "info", "-i", str(path)], timeout=120)
     match = _DURATION.search(finished.stderr or b"")
     duration = None
     if match:
@@ -299,12 +321,15 @@ def _flags():
     return getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
-def _exec(arguments):
+def _exec(arguments, timeout=3600):
     executable = ffmpeg_executable()
     if executable is None:
         raise ValueError("需要 FFmpeg 来处理视频素材，请将 FFmpeg 加入 PATH 或安装 imageio-ffmpeg")
-    return subprocess.run([executable, *arguments], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                          stdin=subprocess.DEVNULL, creationflags=_flags())
+    try:
+        return subprocess.run([executable, *arguments], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              stdin=subprocess.DEVNULL, creationflags=_flags(), timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        raise ValueError("FFmpeg 处理超时（超过 %d 秒），已终止；请检查素材或缩短时长" % int(timeout)) from error
 
 
 def has_audio_stream(path):
@@ -315,26 +340,68 @@ def _has_audio_stream(path):
     """ffprobe 可用则直接查询；否则用 ffmpeg 映射音轨到空输出探测（无音轨时映射报错）。"""
     probe = shutil.which("ffprobe")
     if probe:
-        finished = subprocess.run([probe, "-v", "error", "-select_streams", "a",
-                                   "-show_entries", "stream=codec_type", "-of", "csv=p=0", str(path)],
-                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                  stdin=subprocess.DEVNULL, creationflags=_flags())
-        if finished.returncode == 0:
+        try:
+            finished = subprocess.run([probe, "-v", "error", "-select_streams", "a",
+                                       "-show_entries", "stream=codec_type", "-of", "csv=p=0", str(path)],
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                      stdin=subprocess.DEVNULL, creationflags=_flags(), timeout=60)
+        except subprocess.TimeoutExpired:
+            finished = None
+        if finished is not None and finished.returncode == 0:
             return b"audio" in (finished.stdout or b"")
-    finished = _exec(["-v", "error", "-i", str(path), "-map", "0:a:0", "-c", "copy", "-f", "null", "-"])
+    finished = _exec(["-v", "error", "-i", str(path), "-map", "0:a:0", "-c", "copy", "-f", "null", "-"], timeout=60)
     return finished.returncode == 0
 
 
-def extract_audio(source, target):
+def extract_audio(source, target, *, timeline_samples=None):
     """把视频的音轨抽成 48 kHz WAV；成功返回 True。"""
     target.parent.mkdir(parents=True, exist_ok=True)
     log = target.with_suffix(".log")
-    finished = _run(["-v", "error", "-nostdin", "-n", "-i", str(source),
-                     "-vn", "-acodec", "pcm_s16le", "-ar", "48000", str(target)], log_path=log)
+    arguments = ["-v", "error", "-nostdin", "-n"]
+    if timeline_samples is not None:
+        arguments += ["-xerror", "-copyts", "-start_at_zero"]
+    arguments += ["-i", str(source), "-vn"]
+    if timeline_samples is not None:
+        # async=1 只对缺失/重叠的时间戳补静音/丢弃，禁止为追时钟拉伸有声采样。
+        arguments += ["-af", f"aresample=48000:async=1:min_hard_comp=0:first_pts=0,apad=whole_len={timeline_samples}"]
+    arguments += ["-acodec", "pcm_s16le", "-ar", "48000", str(target)]
+    finished = _run(arguments, log_path=log)
     if finished.returncode != 0 or not target.is_file() or target.stat().st_size == 0:
         target.unlink(missing_ok=True)
         return False
     return True
+
+
+def separate_timeline_audio(source, target, clip_end=None):
+    """保留源时间戳和采样节奏，补齐视频时间线上缺失的波形。"""
+    import math
+    import wave
+    from .audio import TIMELINE_RATE
+    from .timeline import HALF_FRAME, _finite
+
+    duration = probe_duration(source)
+    minimum_duration = duration or 0
+    if clip_end is not None:
+        # 视频导入探测在百分之一秒内取整，时间线编辑另有半帧容差。
+        if not _finite(clip_end) or (duration is not None and clip_end > duration + HALF_FRAME + 0.01):
+            raise ValueError("所选视频片段超出原素材范围，请检查视频片段的结束位置")
+        if duration is not None:
+            minimum_duration = max(duration, clip_end)
+    minimum_samples = math.ceil(minimum_duration * TIMELINE_RATE - 1e-7)
+    try:
+        if not extract_audio(source, target, timeline_samples=minimum_samples):
+            raise ValueError("音轨提取失败，请检查视频文件是否完好")
+        with wave.open(str(target), "rb") as audio:
+            samples = audio.getnframes()
+            if audio.getframerate() != TIMELINE_RATE or samples <= 0 or samples < minimum_samples:
+                raise ValueError("分离音轨的采样长度异常，请检查视频文件是否完好")
+        seconds = samples / TIMELINE_RATE
+        if duration is None and clip_end is not None and clip_end > seconds:
+            raise ValueError("无法读取原视频时长以对齐音轨，请检查视频文件是否完好")
+        return seconds
+    except Exception:
+        target.unlink(missing_ok=True)
+        raise
 
 
 def _source_roots(origin):

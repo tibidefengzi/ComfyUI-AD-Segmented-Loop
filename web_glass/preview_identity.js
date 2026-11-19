@@ -97,3 +97,24 @@ export function identityFields(record) {
     return Object.fromEntries(["version_id","trial_request","trial_session","trial_file","preview_origin","preview_file","result_aliases","reset_id","official_redraw_count"]
         .filter(key=>record[key]!=null).map(key=>[key,record[key]]));
 }
+
+export function preferPickedClips(latest, state, canUse) {
+    for (const [index, row] of (state?.segments || []).entries()) {
+        if (!row.valid || !row.accepted || !row.manual_version || row.selected !== row.manual_version) continue;
+        const version = row.versions?.find(item => item.id === row.manual_version);
+        if (!version?.file) continue;
+        const toClip = item => ({
+            origin: "session", file: `${state.id}/${item.file}`, kind: item.media_kind,
+            version_id: item.id, trial_request: item.trial_request,
+            trial_session: item.trial_session, trial_file: item.trial_file,
+            round_no: state.round_no, segment_index: index + 1,
+        });
+        const clip = toClip(version);
+        if (!canUse(clip)) continue;
+        const alternatives = row.versions.filter(item => item.file).map(toClip);
+        for (const [number, record] of latest) {
+            if (number !== index + 1 && alternatives.some(item => sameResult(record, item))) latest.delete(number);
+        }
+        latest.set(index + 1, clip);
+    }
+}

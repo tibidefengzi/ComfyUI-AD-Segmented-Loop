@@ -282,7 +282,7 @@ class SessionStore:
 
     @staticmethod
     def _carry_row(row, entry, signature, stale=False):
-        return {"entry": entry, "signature": signature,
+        carried = {"entry": entry, "signature": signature,
                 "segment_key": uuid.uuid4().hex if stale else row["segment_key"],
                 "versions": list(row.get("versions", [])),
                 "reroll": row.get("reroll", 0),
@@ -290,6 +290,9 @@ class SessionStore:
                 "valid": False if stale else bool(row.get("valid", False)),
                 "accepted": False if stale else bool(row.get("accepted", False)),
                 "boundary_changed": bool(stale or row.get("boundary_changed"))}
+        if not stale and row.get("manual_version"):
+            carried["manual_version"] = row["manual_version"]
+        return carried
 
     @staticmethod
     def _position(state, index):
@@ -350,17 +353,20 @@ class SessionStore:
             return 0
         return max(0, min(int((saved or {}).get("cursor", 0)), size - 1))
 
-    def sync(self, session_id, entries, signatures, template=None, keep_completed=False):
+    def sync(self, session_id, entries, signatures, template=None, keep_completed=False, *, candidate=None):
         if not entries:
             raise ValueError("请先在素材清单库加载素材，并设置总时长或段切分线")
         with self.lock(session_id):
-            try:
-                state = self._load(session_id)
-            except FileNotFoundError:
-                state = {"schema": 1, "id": session_id, "cursor": 0, "epoch": 0, "round_no": 1,
-                         "status": "ready", "auto": False, "pause_after": False,
-                         "relay_run_id": uuid.uuid4().hex,
-                         "segments": [], "active": None, "merged": None, "error": ""}
+            if candidate is not None:
+                state = copy.deepcopy(candidate)
+            else:
+                try:
+                    state = self._load(session_id)
+                except FileNotFoundError:
+                    state = {"schema": 1, "id": session_id, "cursor": 0, "epoch": 0, "round_no": 1,
+                             "status": "ready", "auto": False, "pause_after": False,
+                             "relay_run_id": uuid.uuid4().hex,
+                             "segments": [], "active": None, "merged": None, "error": ""}
             if (state.get("execution_round") and not keep_completed) or state.get("draft_trial"):
                 return copy.deepcopy(state)
             old = state["segments"]
@@ -458,7 +464,7 @@ class SessionStore:
                 state["template"] = template
             if keep_completed and completed_prefix == len(rows) and rows:
                 state.update(status="completed", cursor=len(rows)-1, active=None)
-            return self._save(state)
+            return state if candidate is not None else self._save(state)
 
     @staticmethod
     def _invalidate(state, start):
@@ -529,6 +535,7 @@ class SessionStore:
         for row in state["segments"]:
             row["selected"] = None
             row["reroll"] = 0
+            row.pop("manual_version", None)
             # 归档式重置（自动重置/新建一组/完成后再开始）后一切从零：旧版本归档，仅供预览/历史查看，不再参与新一轮生成与选用。
             for version in row.get("versions") or []:
                 if isinstance(version, dict):
@@ -590,7 +597,7 @@ class SessionStore:
 
             def _reserve_at_cursor(state):
                 index = state["cursor"]
-                if not state.get("preview_hold"):
+                if not state.get("preview_hold") or not row.get("manual_version"):
                     state.pop("sequential_stop", None)
                 fresh = uuid.uuid4().hex
                 try:
@@ -694,7 +701,8 @@ class SessionStore:
         if (0 <= target < len(rows) and
                 (not hold.get("target_key") or rows[target].get("segment_key") == hold["target_key"])):
             row = rows[target]
-            if successful and hold.get("select_on_success"):
+            pinned = hold.get("valid") and row.get("manual_version") == hold.get("selected") and hold.get("selected")
+            if successful and hold.get("select_on_success") and not pinned:
                 # 仅顺序运行主动停止后重抽停止段：保留成功的新选用，等待用户批准；
                 # 后续段结果不再失效（进度只增不减）。
                 row["accepted"] = False
@@ -734,6 +742,7 @@ class SessionStore:
                 return self._save(state)
             if self._restore_preview_hold(state, successful=True):
                 return self._save(state)
+            row.pop("manual_version", None)
             state["status"] = "review"
             if state.get("auto_accept") and not state.get("pause_after"):
                 # 生成即通过：新界面不再需要「同意批准」步骤，完成后自动通过并前进一段。
@@ -791,8 +800,8 @@ class SessionStore:
                 row["valid"] = True
                 row["accepted"] = bool(state.get("auto_accept"))
                 row["boundary_changed"] = False
-            if matched:
-                self._promote_relay_stage(state, row, version)
+                if not state.get("preview_hold"):
+                    self._promote_relay_stage(state, row, version)
             else:
                 # 停止/改参数/中断后才到达的结果：只登记为历史版本（可用“选用旧版本”手动改选）。
                 # 绝不改 selected/valid/accepted/状态/游标：否则用户“停止 → 改数值 → 重新开始”时，
@@ -807,6 +816,7 @@ class SessionStore:
             if matched:
                 state["active"] = None
                 if not self._restore_preview_hold(state, successful=True):
+                    row.pop("manual_version", None)
                     if state.get("auto_accept"):
                         current_row = state["segments"][state["cursor"]]
                         if current_row.get("valid") and current_row.get("selected"):
@@ -824,11 +834,10 @@ class SessionStore:
             return self._save(state)
 
 
-    def _promote_relay_stage(self, state, row, version=None):
+    def _promote_relay_stage(self, state, row, version=None, *, manual=False):
         """把被选中版本对应的潜桥 stage 提升到稳定 run_id 的当前段目录。
 
-        每次生成存盘使用唯一 save_run_id，避免重做覆盖旧版本的 latent；选中/批准时
-        再把该版本 stage 复制到稳定 run_id 的同一段号，下一段桥接总是读到当前选用。
+        手选旧版本时，历史链和段号只定位源文件，目标取当前会话链和行位置。
 
         失败不再静默：源文件缺失或复制失败都会打印明确原因并返回 False；
         复制使用“临时文件 + os.replace”原子替换，避免半截文件被下一段当父 latent。
@@ -841,7 +850,7 @@ class SessionStore:
             stage = int(version.get("relay_stage_index"))
         except (TypeError, ValueError):
             return False
-        if not target or not source or target == source:
+        if not target or not source:
             return False
         try:
             import folder_paths
@@ -851,9 +860,21 @@ class SessionStore:
                 print("[AD-潜桥] 提升失败：源 stage 不存在（%s）；本段 latent 尚未落盘或已被删除，"
                       "请重跑该段后再批准。" % (source_file,))
                 return False
+            if state.get("preview_parent"):
+                # 抽卡只写自己的版本，父轮选用由 finish_trial 决定。
+                return True
+            relay_id = state.get("relay_run_id")
+            index = stage
+            if relay_id and (manual or (row.get("manual_version") and row["manual_version"] == version.get("id"))):
+                target = "ad_%s_%s" % (state["id"], relay_id)
+                index = next((i for i, item in enumerate(state.get("segments") or []) if item is row), None)
+                if index is None:
+                    return False
             target_dir = root / target
             target_dir.mkdir(parents=True, exist_ok=True)
-            target_file = target_dir / source_file.name
+            target_file = target_dir / ("stage_%05d.safetensors" % index)
+            if target_file == source_file:
+                return True
             # 不对“大小+秒级 mtime”做去重：不同 latent 经常同大小、也可能落在同一秒，
             # 误判会静默沿用旧版本。每次提升都原子复制（单文件约 2MB，代价可忽略）。
             temporary = target_file.with_name(target_file.name + ".ad_tmp")
@@ -875,15 +896,15 @@ class SessionStore:
             stage = int(version.get("relay_stage_index"))
         except (TypeError, ValueError):
             return None
-        if not target or not source or target == source:
+        if not target or not source:
             return None
         return target, source, stage
 
-    def _ensure_relay_promoted(self, state, row, version, action="继续"):
+    def _ensure_relay_promoted(self, state, row, version, action="继续", *, manual=False):
         """relay 版本在选用/批准前必须成功提升稳定 latent；失败时阻止推进并明确报错。"""
         if self._relay_version_parts(version) is None:
             return True
-        if self._promote_relay_stage(state, row, version):
+        if self._promote_relay_stage(state, row, version, manual=manual):
             return True
         raise ValueError(
             "潜桥 latent 提升失败：该版本的 stage 文件缺失或复制失败，已阻止%s，"
@@ -1146,8 +1167,8 @@ class SessionStore:
                 # 进度只增不减：旧参数生成的版本仍可选用，后续段结果保留。
                 if version.get("archived"):
                     raise ValueError("该版本属于已重置的轮次，仅作历史查看；请用新一轮生成结果。")
-                self._ensure_relay_promoted(state, row, version, "选用该版本")
-                row.update(selected=version["id"], valid=True, accepted=False)
+                self._ensure_relay_promoted(state, row, version, "选用该版本", manual=True)
+                row.update(selected=version["id"], manual_version=version["id"], valid=True, accepted=False)
                 state.update(cursor=index, status="review", auto=False, active=None)
             elif command == "start":
                 if state["status"] in {"queued", "running", "merging"} and state.get("active"):

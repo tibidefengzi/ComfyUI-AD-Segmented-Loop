@@ -8,6 +8,7 @@ import re
 import shutil
 import uuid
 import hashlib
+from contextlib import suppress
 from pathlib import Path
 
 from .spec import relay_parent_stage, relay_reanchor_interval, relay_reanchors
@@ -86,7 +87,7 @@ def _validate_old_round_plan(origin_segments, child_segments, trial_round):
             raise ValueError("（第 %d 段）%s" % (index + 1, hint))
 
 
-def _version_from_preview(segments, preview):
+def _version_from_preview(segments, preview, owner=None):
     if not isinstance(preview, dict) or not preview.get("file"):
         return None
     name = str(preview.get("file") or "").replace("\\", "/")
@@ -98,15 +99,23 @@ def _version_from_preview(segments, preview):
             return None
     child = scope if scope.startswith("trial_") else (
         session_id if str(session_id or "").startswith("trial_") else "")
+    normal = owner is None or (scope in {"", owner} and session_id in {None, "", owner})
+    exact, aliases = [], []
+    version_id = preview.get("version_id")
     for row in segments or []:
         for version in row.get("versions") or []:
+            if version_id and version.get("id") != version_id:
+                continue
             file = str(version.get("file") or "").replace("\\", "/")
-            normal = file == name or file.rsplit("/", 1)[-1].endswith("_" + name.rsplit("/", 1)[-1])
             trial = (bool(child) and version.get("preview_only") and version.get("trial_request")
+                     and version.get("trial_session") in {None, child}
                      and file == "trial_" + str(version.get("trial_request")) + "_" + name)
-            if normal or trial:
-                return version
-    return None
+            if (normal and file == name) or trial:
+                exact.append(version)
+            elif normal and file.rsplit("/", 1)[-1].endswith("_" + name.rsplit("/", 1)[-1]):
+                aliases.append(version)
+    matches = exact or aliases
+    return matches[0] if len(matches) == 1 else None
 
 
 def _pick_parent_version(origin_segments, target, target_version):
@@ -264,19 +273,28 @@ def read_snapshot(state):
         return json.load(handle)
 
 
-def asset_manifest(graph):
-    """记录素材版本，不复制大文件；用户替换参考图会生成新文件，不改原文件。"""
+def scan_assets(graph):
+    """一次遍历：解析素材路径并记录大小/修改时间，同一路径只 stat 一次。
+
+    返回 (entries, missing)。缺失不再拦住提交，这里只如实记录；
+    由提交前的素材准入决定「跳过」还是「按段报错」，避免重复扫描与重复 stat。
+    """
     from .assets import resolve_source
     paths = set()
+
     def visit(value):
         if isinstance(value, dict):
             if value.get("origin") in {"input", "output", "media", "session"} and value.get("file"):
-                paths.add(resolve_source(value))
+                try:
+                    paths.add(str(resolve_source(value)))  # 已是绝对路径，不再重复 resolve/stat
+                except (ValueError, OSError):
+                    pass
             for item in value.values():
                 visit(item)
         elif isinstance(value, list):
             for item in value:
                 visit(item)
+
     for node in graph.values():
         if node["class_type"] == "AidenH3AudioQueue":
             raw = node.get("inputs", {}).get("queue_state", {})
@@ -284,16 +302,62 @@ def asset_manifest(graph):
         field = {"LoadImage": "image", "LoadAudio": "audio", "LoadVideo": "file"}.get(node["class_type"])
         if field and isinstance(node.get("inputs", {}).get(field), str):
             import folder_paths
-            paths.add(Path(folder_paths.get_annotated_filepath(node["inputs"][field])))
-    return [{"path": str(path.resolve()), "size": path.stat().st_size, "mtime_ns": path.stat().st_mtime_ns}
-            for path in sorted(paths)]
+            try:
+                paths.add(str(Path(folder_paths.get_annotated_filepath(node["inputs"][field]))))
+            except (OSError, ValueError):
+                pass
+
+    entries, missing = [], []
+    for raw in sorted(paths):
+        try:
+            stat = Path(raw).stat()
+        except OSError:
+            missing.append(raw)
+            continue
+        entries.append({"path": raw, "size": stat.st_size, "mtime_ns": stat.st_mtime_ns})
+    return entries, missing
+
+
+def asset_manifest(graph):
+    """只返回仍存在的素材条目（兼容旧调用）。"""
+    return scan_assets(graph)[0]
+
+
+def asset_changes(previous, current):
+    """同一路径的大小/修改时间变了：内容已换，沿用新内容继续，但提示接缝风险。"""
+    before = {item.get("path"): (item.get("size"), item.get("mtime_ns")) for item in previous or []}
+    changed = []
+    for item in current or []:
+        old = before.get(item.get("path"))
+        if old is not None and old != (item.get("size"), item.get("mtime_ns")):
+            changed.append(item.get("path"))
+    return changed
+
+
+def fingerprint_changes(before, current):
+    """按会话留存的上次素材指纹对比：同一路径内容/修改时间变了就记为变化。"""
+    changed = []
+    for item in current or []:
+        old = (before or {}).get(item.get("path"))
+        if old is not None and tuple(old) != (item.get("size"), item.get("mtime_ns")):
+            changed.append(item.get("path"))
+    return changed
 
 
 def validate_assets(snapshot):
-    for item in snapshot.get("assets", []):
-        path = Path(item["path"])
-        if not path.is_file() or (path.stat().st_size, path.stat().st_mtime_ns) != (item["size"], item["mtime_ns"]):
-            raise ValueError("本轮原始素材已在磁盘上被修改或移走，请恢复原素材或清空进度开始新一轮：" + path.name)
+    """素材被移走/改过时不拦截提交：剔除失效项，按现有素材继续本轮。"""
+    valid = []
+    for item in snapshot.get("assets", []) or []:
+        path = Path(item.get("path", ""))
+        try:
+            ok = path.is_file() and (path.stat().st_size, path.stat().st_mtime_ns) == (item.get("size"), item.get("mtime_ns"))
+        except OSError:
+            ok = False
+        if ok:
+            valid.append(item)
+    if "assets" in snapshot:
+        snapshot["assets"] = valid
+    return valid
 
 
 def seed_policies(graph, workflow):
@@ -406,10 +470,10 @@ def apply_materials(prompt, node_id, materials, fallback=None):
     return result
 
 
-def freeze(state, prompt, node_id, workflow=None, batch=False, materials=None):
+def freeze(state, prompt, node_id, workflow=None, batch=False, materials=None, *, pending=None):
     sid = state["id"]
     with STORE.lock(sid):
-        current = STORE._load(sid)
+        current = STORE._load(sid) if pending is None else state
         previous = read_snapshot(current)
         # 普通提交不继承旧组素材；显式materials仅保留为兼容适配工具。
         if materials is not None:
@@ -422,31 +486,53 @@ def freeze(state, prompt, node_id, workflow=None, batch=False, materials=None):
         graph[str(node_id)]["inputs"]["session_id"] = sid
         graph[str(node_id)]["inputs"].pop("run_token", None)
         material_state = copy.deepcopy(materials) if materials is not None else capture_materials(graph, node_id)
-        material_state.setdefault("assets", asset_manifest(graph))
+        # 素材清单只扫一次：快照、缺失记录、指纹变化都复用这一次结果。
+        manifest, absent = scan_assets(graph)
+        # 素材指纹按会话留存：上一轮的 execution_round 会在提交结束时清掉，
+        # 所以对比用会话里的指纹，而不是只依赖旧快照。
+        last = {str(path): tuple(value) for path, value in (current.get("asset_fingerprints") or {}).items()}
+        changes = fingerprint_changes(last, manifest)
+        if not last:
+            changes = asset_changes((previous or {}).get("assets"), manifest)
+        current["asset_fingerprints"] = {item["path"]: [item["size"], item["mtime_ns"]] for item in manifest}
+        material_state.setdefault("assets", manifest)
         snapshot = {"prompt": graph, "segment_node": str(node_id), "workflow": workflow or {},
-                    "assets": asset_manifest(graph), "seed_policies": seed_policies(graph, workflow),
+                    "assets": manifest, "missing_assets": absent,
+                    "asset_changes": changes,
+                    "seed_policies": seed_policies(graph, workflow),
                     "materials": material_state}
         rounds_dir = STORE.directory(sid) / "rounds"
         rounds_dir.mkdir(parents=True, exist_ok=True)
-        atomic_json(rounds_dir / (token + ".json"), snapshot)
-        # 旧快照可能正被另一线程 read_snapshot 读取：先写新快照，再按 mtime 只保留最近 2 份；
-        # 删除失败忽略，避免并发读取时瞬时找不到文件。
-        snapshots = []
-        for item in rounds_dir.glob("*.json"):
-            try:
-                snapshots.append((item.stat().st_mtime_ns, item.name, item))
-            except OSError:
-                continue
-        snapshots.sort(key=lambda entry: (entry[0], entry[1]), reverse=True)
-        for _, _, stale in snapshots[2:]:
-            try:
-                stale.unlink()
-            except OSError:
-                pass
+        snapshot_path = rounds_dir / (token + ".json")
+        atomic_json(snapshot_path, snapshot)
+        if pending is not None:
+            pending.callback(discard_pending_file, snapshot_path)
         current["execution_round"] = {"id": token, "file": "rounds/" + token + ".json",
                                       "segment_node": str(node_id), "batch": bool(batch)}
         current.pop("resume_round", None)
-        return STORE._save(current)
+        if pending is not None:
+            return current
+        saved = STORE._save(current)
+        prune_snapshots(saved)
+        return saved
+
+
+def discard_pending_file(path):
+    with suppress(OSError):
+        path.unlink()
+
+
+def prune_snapshots(state):
+    """只在进度提交后回收旧快照，保留当前指向的文件。"""
+    rounds_dir = STORE.directory(state["id"]) / "rounds"
+    current = ((state.get("execution_round") or {}).get("file") or "").rsplit("/", 1)[-1]
+    snapshots = []
+    with suppress(OSError):
+        for item in rounds_dir.glob("*.json"):
+            with suppress(OSError):
+                snapshots.append((item.name == current, item.stat().st_mtime_ns, item.name, item))
+    for _, _, _, stale in sorted(snapshots, reverse=True)[2:]:
+        discard_pending_file(stale)
 
 
 def resolve_resume_anchor(state, preview, fallback):
@@ -455,27 +541,17 @@ def resolve_resume_anchor(state, preview, fallback):
         return int(fallback)
     sid = state["id"]
     named = preview.get("session_id")
-    name = str(preview.get("file") or "").replace("\\", "/")
     scope = ""
     if preview.get("origin") == "session":
-        scope, separator, name = name.partition("/")
+        scope, separator, _ = str(preview.get("file") or "").replace("\\", "/").partition("/")
         if not separator:
             raise ValueError("所选预览缺少本轮文件身份，请重新选择分段预览")
     normal = scope in {"", sid} and named in {None, "", sid}
-    child = scope if scope.startswith("trial_") else (named if str(named or "").startswith("trial_") else "")
-    matches = []
-    for index, row in enumerate(state.get("segments") or []):
-        for version in row.get("versions") or []:
-            file = str(version.get("file") or "").replace("\\", "/")
-            matching = bool(file) and (file == name or file.rsplit("/", 1)[-1].endswith("_" + name.rsplit("/", 1)[-1]))
-            trial_match = (child and version.get("preview_only") and version.get("trial_request")
-                           and (not version.get("trial_session") or version["trial_session"] == child)
-                           and file == "trial_" + str(version["trial_request"]) + "_" + name)
-            if (normal and matching) or trial_match:
-                matches.append(index + 1)
-                break
-    if len(matches) == 1:
-        return matches[0]
+    rows = state.get("segments") or []
+    version = _version_from_preview(rows, preview, sid)
+    if version is not None:
+        return next(index + 1 for index, row in enumerate(rows)
+                    if any(item is version for item in row.get("versions") or []))
     key = preview.get("segment_key")
     if normal and named == sid and key:
         matches = [i + 1 for i, row in enumerate(state.get("segments") or []) if row.get("segment_key") == key]
@@ -489,24 +565,29 @@ def resolve_resume_anchor(state, preview, fallback):
 
 
 def accept_through(state, count):
-    """清空重置后从选中预览续跑：前 count 段按各自最后一次生成结果补成已通过，
-    第 count 段起标记待更新（旧版本保留为历史），游标停在第 count 段。"""
+    """保留前缀的选用，后一段起等待重新生成。"""
     rows = state.get("segments") or []
     count = int(count)
     if count <= 0:
         raise ValueError("请先在「分段生成」里选中要从其后续跑的预览卡")
     if count > len(rows):
         raise ValueError(f"本轮没有第 {count} 段，不能继续")
-    latest_prefix = []
+    prefix = []
     for index, row in enumerate(rows[:count]):
         versions = row.get("versions") or []
         if not versions:
             raise ValueError(f"第 {index + 1} 段没有已生成结果，不能从第 {count + 1} 段继续")
-        latest_prefix.append(max(versions, key=lambda version: float(version.get("created_at") or 0)))
+        selected = row.get("manual_version")
+        if not selected and row.get("valid") and not row.get("boundary_changed"):
+            selected = row.get("selected")
+        chosen = next((version for version in versions if version["id"] == selected), None)
+        newest = max(versions, key=lambda version: float(version.get("created_at") or 0))
+        if chosen and row.get("accepted") and chosen is not newest:
+            row["manual_version"] = chosen["id"]
+        prefix.append(chosen or newest)
     for index, row in enumerate(rows):
         if index < count:
-            latest = latest_prefix[index]
-            row["selected"] = latest.get("id")
+            row["selected"] = prefix[index]["id"]
             row["valid"] = True
             row["accepted"] = True
             row["boundary_changed"] = False
@@ -518,11 +599,151 @@ def accept_through(state, count):
     return state
 
 
+def select_resume_version(state, preview, anchor):
+    """把点选版本写入本轮选用，供后续接力和合并。"""
+    rows = state.get("segments") or []
+    try:
+        anchor = int(anchor)
+    except (TypeError, ValueError):
+        raise ValueError("所选段号无效，请重新选择预览卡") from None
+    if not 1 <= anchor <= len(rows):
+        raise ValueError("所选段号超出当前分段范围，请重新选择预览卡")
+    version = _version_from_preview(rows, preview, state.get("id"))
+    if version is None:
+        raise ValueError("所选卡片在本轮进度里找不到对应版本；请重新选择分段预览")
+    row = rows[anchor - 1]
+    if not any(item is version for item in row.get("versions") or []):
+        raise ValueError("所选卡片不属于第 %d 段，请重新选择" % anchor)
+    row["selected"] = version.get("id")
+    row["manual_version"] = version.get("id")
+    row["valid"] = True
+    row["accepted"] = True
+    row["boundary_changed"] = False
+    return version
+
+
+def _resume_stage_source(version):
+    source = str(version.get("relay_save_run_id") or "")
+    try:
+        stage = int(version.get("relay_stage_index"))
+    except (TypeError, ValueError):
+        return None
+    if source and stage >= 0:
+        # 链名是单个目录名。旧版本的 stage 编号只用于读源。
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", source):
+            raise ValueError("所选版本的潜桥存盘链无效，请重新生成该段。")
+        path = _stage_path(source, stage)
+        if path.is_file():
+            return path
+    return None
+
+
+def prepare_resume_relay_chain(state, prefix, pending, required=False):
+    """准备独立的续跑链，进度提交后下一段才会看见这条链。"""
+    anchor = prefix[-1]
+    if not (required or anchor.get("relay_run_id") or anchor.get("relay_save_run_id")):
+        return
+    parent = _resume_stage_source(anchor)
+    if parent is None:
+        raise ValueError(
+            f"第 {len(prefix)} 段所选预览的潜桥 latent 已不在或无法确认版本，"
+            "请重新生成该段或换一张有存盘的卡。")
+    suffix = uuid.uuid4().hex
+    run = _stable_run(state["id"], suffix)
+    directory = _stage_path(run, 0).parent
+    directory.mkdir(parents=True)
+
+    def discard_directory():
+        with suppress(OSError):
+            directory.rmdir()
+
+    pending.callback(discard_directory)
+    for index, version in enumerate(prefix):
+        source = parent if index == len(prefix) - 1 else _resume_stage_source(version)
+        if source is None:
+            continue
+        target = _stage_path(run, index)
+        pending.callback(discard_pending_file, target)
+        try:
+            # relay stage subsequent writes use atomic replacement, so the source link stays intact.
+            os.link(source, target)
+        except OSError:
+            try:
+                shutil.copy2(source, target)
+            except OSError as exc:
+                raise ValueError(f"无法准备第 {index + 1} 段的潜桥 latent，已保留原进度与接力链。") from exc
+    state["relay_run_id"] = suffix
+
+
+
+def _prompt_active(prompt_id):
+    """只看“本段自己那一单”还在不在队列/运行中，别人的任务不算。"""
+    if not prompt_id:
+        return False
+    try:
+        from server import PromptServer
+        queue = getattr(PromptServer.instance, "prompt_queue", None)
+        if queue is None:
+            return False
+        groups = queue.get_current_queue() or []
+    except Exception:
+        return False
+    for group in groups:
+        for item in group or []:
+            try:
+                if str(item[1]) == str(prompt_id):
+                    return True
+            except (TypeError, IndexError):
+                continue
+    return False
+
+
 def prepare(data):
     """由原生排队入口调用；只替换提交副本，从不写回画布。"""
+    try:
+        return _prepare(data)
+    except FileNotFoundError:
+        # 清空进度/新工作流/缓存被清理时还没有会话文件：按“没有进度”放行，不拦截排队。
+        return {"prompt": data.get("prompt") or {}, "workflow": data.get("workflow"), "rounds": [],
+                "warnings": []}
+
+
+def current_index(state):
+    """当前段号：优先正在执行的段，其次游标（与 execution_prompt 同一口径）。"""
+    try:
+        return int((state.get("active") or {}).get("index", state.get("cursor")))
+    except (TypeError, ValueError):
+        return int(state.get("cursor") or 0)
+
+
+def frozen_timeline(snapshot, node_id):
+    """冻结副本里的素材清单（原始 JSON）：只用于提交前素材准入，不参与生成。"""
+    graph = (snapshot or {}).get("prompt") or {}
+    link = ((graph.get(str(node_id)) or {}).get("inputs") or {}).get("queue")
+    if not (isinstance(link, list) and len(link) == 2 and str(link[0]) in graph):
+        return None
+    inputs = graph[str(link[0])].get("inputs") or {}
+
+    def parse(value):
+        try:
+            data = json.loads(value) if isinstance(value, str) else value
+        except (TypeError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    state = parse(inputs.get("queue_state"))
+    editor = parse(inputs.get("h3_editor_state"))
+    if not state.get("version") and editor.get("version"):
+        state = editor  # 与 AidenH3AudioQueue.build 的合并规则一致
+    return state if state.get("version") else None
+
+
+def _prepare(data):
     from .routes import sync_graph_now
     prompt = copy.deepcopy(data.get("prompt") or {})
     bindings = data.get("round_bindings") or []
+    warnings = []
+    skipped = []
     bound = {}
     for item in bindings:
         try:
@@ -553,7 +774,8 @@ def prepare(data):
         from .workflow_tasks import prompt_task
         task = prompt_task(prompt, node_id, data.get("workflow"))
         if task and (state or {}).get("workflow_task_id") not in {None, task}:
-            raise ValueError("当前进度属于其它工作流的任务，已拒绝混用；请重新打开本工作流后再试。")
+            # 换了工作流/换了素材：不复用旧任务进度，按新的一轮继续，而不是拦住用户。
+            state = None
         trial = (state or {}).get("draft_trial")
         if trial:
             state = STORE.read(trial["session_id"])
@@ -562,16 +784,14 @@ def prepare(data):
                 continue  # 已拆掉连线：本轮不生成这一段。
             active = (state or {}).get("active") or {}
             if (state or {}).get("status") in {"queued","running"} and active.get("prompt_id"):
-                raise ValueError("当前段仍在执行：请等待本段完成，或先点「停止」再提交，避免修改已提交的当前段。")
+                if _prompt_active(active.get("prompt_id")):
+                    raise ValueError("当前段仍在执行：请等待本段完成，或先点「停止」再提交，避免修改已提交的当前段。")
+                # 队列里已经没有这个任务：是上次中断留下的残留状态。清掉，按新的一轮继续。
+                state["status"] = "idle"
+                state["active"] = {}
+                STORE._save(state)
             # 下一段重新读取画布，不把旧组素材重新覆盖到最新编辑。
-            with STORE.lock(sid):
-                try:
-                    current = STORE._load(sid)
-                except FileNotFoundError:
-                    current = None
-                if current is not None:
-                    current.pop("execution_round", None)
-                    STORE._save(current)
+
             # 本轮绑定优先于画布 queue_state 里的旧会话名，避免改线后串到别的会话。
             queue_link = (draft.get(node_id) or {}).get("inputs", {}).get("queue")
             if isinstance(queue_link, list) and queue_link and str(queue_link[0]) in draft:
@@ -590,7 +810,31 @@ def prepare(data):
         snapshot = read_snapshot(state)
         if not snapshot:
             continue
-        validate_assets(snapshot)
+        index = current_index(state)
+        timeline = frozen_timeline(snapshot, node_id)
+        if timeline is not None:
+            from .material_guard import material_paths, required_paths
+            required = required_paths(timeline, index)
+            absent = set(snapshot.get("missing_assets") or [])
+            missing_required = [(label, path) for path, label in required.items() if path in absent]
+            if missing_required:
+                # 必需素材缺失：只跳过这一个循环并带段号提示，不再整次回退。
+                skipped.append((index, missing_required))
+                names = "、".join(sorted({label for label, _ in missing_required}))
+                warnings.append("第 %d 段缺 %d 个素材文件：%s，本段已跳过"
+                                % (index + 1, len(missing_required), names))
+                if node_id in draft:
+                    removed.update(component(draft, node_id))
+                continue
+            known = material_paths(timeline)
+            optional = sorted(path for path in absent if path in known and path not in required)
+            if optional:
+                warnings.append("第 %d 段可选素材缺失，已跳过：%s"
+                                % (index + 1, "、".join(Path(path).name for path in optional)))
+            for path in snapshot.get("asset_changes") or []:
+                label = required.get(str(path))
+                if label:
+                    warnings.append("%s 文件已变，第 %d 段起用新内容，接缝可能跳" % (label, index + 1))
         # 当前连线即使已拆开，也使用被冻结的端口编号和全部节点参数。
         if node_id in draft:
             removed.update(component(draft, node_id))
@@ -602,16 +846,35 @@ def prepare(data):
                 (state.get("active") or {}).get("index", state.get("cursor") or 0))
         except (TypeError, ValueError, AttributeError):
             pass
-        for key in set(frozen) & set(replacements):
-            if frozen[key] != replacements[key]:
-                raise ValueError("两套循环共享的节点设置不同，请分别运行，避免其中一轮被另一轮覆盖")
+        conflict = any(frozen[key] != replacements[key] for key in set(frozen) & set(replacements))
+        if conflict:
+            # 一个循环的冲突只跳过这个循环，不再让整次提交（含另一个循环）回退。
+            warnings.append("两套分段循环共享的节点设置不同，已跳过其中一个循环；请分别运行")
+            continue
         replacements.update(frozen)
         workflow = snapshot.get("workflow", workflow)
         rounds.append({"session_id": sid, "segment_node": node_id,
                        "id": (STORE.read(sid).get("execution_round") or {}).get("id")})
     prompt = {key: value for key, value in draft.items() if key not in removed}
     prompt.update(replacements)
-    return {"prompt": prompt, "rounds": rounds, "workflow": workflow}
+    if skipped and not rounds:
+        # 只提交一个循环且必需素材缺失：明确报到段与文件，不排队、不改动旧进度。
+        index, items = skipped[0]
+        names = "、".join(sorted({label for label, _ in items}))
+        raise ValueError("第 %d 段缺 %d 个素材文件：%s；请补回素材、调整分段或删除该段后再生成"
+                         % (index + 1, len(items), names))
+    # 所有校验都通过后才清旧轮次标记：被拒绝的提交不会改动任何旧进度。
+    for _node_id, sid in candidates:
+        if not sid:
+            continue
+        with STORE.lock(sid):
+            try:
+                current = STORE._load(sid)
+            except FileNotFoundError:
+                continue
+            if current is not None and current.pop("execution_round", None) is not None:
+                STORE._save(current)
+    return {"prompt": prompt, "rounds": rounds, "workflow": workflow, "warnings": warnings}
 
 
 def start_trial(data):
@@ -757,7 +1020,10 @@ def finish_trial(child_id, success=True):
                 version["draft_index"] = source["index"]
                 if not any(v.get("trial_request") == source["request_id"] for v in versions):
                     versions.append(version)
-                if parent.get("auto_accept") and row is not None and child.get("round_no")==destination.get("round_no"):
+                if (parent.get("auto_accept") and row is not None
+                        and child.get("round_no") == destination.get("round_no")
+                        and not (row.get("manual_version") and row["manual_version"] == row.get("selected")
+                                 and row.get("valid"))):
                     # 新界面生成即通过：最新抽卡结果直接成为该段当前选用/通过版本，不改变游标。
                     # 但潜桥 latent 提升必须成功才能选定；失败时不能带着旧父 latent 继续。
                     relay_version = bool(version.get("relay_run_id") and version.get("relay_save_run_id"))

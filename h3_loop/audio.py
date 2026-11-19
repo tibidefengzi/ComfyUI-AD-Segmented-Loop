@@ -146,10 +146,16 @@ def _piece_chunk(piece):
         first = max(0, min(round(src_in * rate), wave.shape[-1]))
         last = max(first, min(round(src_out * rate), wave.shape[-1]))
         chunk = wave[..., first:last]
-    if chunk.shape[-1] == 0:
+    pad_tail = piece.get("pad_silent_tail")
+    if chunk.shape[-1] == 0 and not pad_tail:
         return None
-    if rate != TIMELINE_RATE:
+    if rate != TIMELINE_RATE and chunk.shape[-1]:
         chunk = _resample_to_timeline(chunk, rate)
+    if pad_tail:
+        target_samples = round(src_out * TIMELINE_RATE) - round(src_in * TIMELINE_RATE)
+        if target_samples > chunk.shape[-1]:
+            import torch
+            chunk = torch.nn.functional.pad(chunk, (0, target_samples - chunk.shape[-1]))
     return chunk
 
 
@@ -170,8 +176,107 @@ def read_timeline_audio(entry):
                         lambda: _read_timeline_audio(entry))
 
 
-def _read_timeline_audio(entry):
-    """段音频：各音频轨在段区间内的片段按时间线位置混音，空缺补静音。"""
+def timeline_audio_gain(state):
+    """多轨混音的固定增益：按参与混音的轨道数平分，保证不削波且各段完全一致。
+
+    不按波形峰值算，避免“后面某段音量变化导致前面各段增益变化”却无法体现在签名里。
+    """
+    muted = (state.get("muted_tracks") or {}).get("audio_tracks") or []
+    count = sum(1 for index, lane in enumerate(state.get("audio_tracks") or [])
+                if lane and not (index < len(muted) and muted[index]))
+    return 1.0 / max(1, count)
+
+
+def read_timeline_window(state, start_seconds, seconds):
+    """潜桥 17n 累计网格：按时间线绝对范围取各音频轨混音。
+
+    按原段边界取会让每段音频比 17n 输出短 6~7 帧，尾部的静音补齐在拼接处形成
+    0.25~0.3 秒断音；这里直接按“第 N 段在输出时间线上的实际区间”连续取样（可跨片段）。
+    """
+    from .timeline import audio_pieces
+    total = max(1, round(float(seconds) * TIMELINE_RATE))
+    sources = {item["id"]: item for item in (state.get("sources") or []) if item.get("id")}
+    start, end = float(start_seconds), float(start_seconds) + float(seconds)
+    # 轨道静音与分段取音频的规则一致：被静音的轨道不参与本段音频（否则会漏出静音前的素材声）。
+    muted = (state.get("muted_tracks") or {}).get("audio_tracks") or []
+    lanes = []
+    for index, lane in enumerate(state.get("audio_tracks") or []):
+        if index < len(muted) and muted[index]:
+            lanes.append([])
+            continue
+        lanes.append(audio_pieces(lane, sources, start, end))
+    entry = {"seconds_float": float(seconds), "timeline_audio": {"tracks": lanes}}
+    result = _read_timeline_audio(entry, gain=timeline_audio_gain(state))
+    if int(result["waveform"].shape[-1]) != total:
+        result = {"waveform": result["waveform"][..., :total], "sample_rate": result["sample_rate"]}
+    return result
+
+
+def read_relay_audio(entries, start_frames, target_frames):
+    """潜桥取音：按段序列连续取音，自动跳过时间线里没有素材的空白。"""
+    import torch
+    from .spec import FPS
+    start_sample = max(0, int(round(float(start_frames) / float(FPS) * TIMELINE_RATE)))
+    total = max(1, int(round(float(target_frames) / float(FPS) * TIMELINE_RATE)))
+    if not entries:
+        return {"waveform": torch.zeros((1, 1, total)), "sample_rate": TIMELINE_RATE, "missing": []}
+    max_lanes = max((len((entry.get("timeline_audio") or {}).get("tracks") or []) for entry in entries), default=0)
+    lane_count = 0
+    for lane_index in range(max_lanes):
+        if any(len((entry.get("timeline_audio") or {}).get("tracks") or []) > lane_index
+               and entry["timeline_audio"]["tracks"][lane_index] for entry in entries):
+            lane_count += 1
+    buffers, cursor, missing = {}, 0, []
+    for entry in entries:
+        duration = max(1, int(round(float(entry.get("seconds_float") or 0.0) * TIMELINE_RATE)))
+        seg_start, seg_end = cursor, cursor + duration
+        cursor = seg_end
+        lo, hi = max(start_sample, seg_start), min(start_sample + total, seg_end)
+        if hi <= lo:
+            continue
+        for lane_index, pieces in enumerate((entry.get("timeline_audio") or {}).get("tracks") or []):
+            for piece in pieces:
+                try:
+                    chunk = _piece_chunk(piece)
+                except Exception:
+                    chunk = None
+                if chunk is None or chunk.shape[-1] == 0:
+                    try:
+                        seconds = max(0.0, float(piece.get("src_out") or 0) - float(piece.get("src_in") or 0))
+                    except (TypeError, ValueError):
+                        seconds = 0.0
+                    missing.append({"file": str(piece.get("file") or ""), "seconds": round(seconds, 3)})
+                    continue
+                offset = int(round(float(piece.get("at") or 0.0) * TIMELINE_RATE))
+                pos = seg_start + offset
+                src_lo, src_hi = max(lo, pos), min(hi, pos + chunk.shape[-1])
+                if src_hi <= src_lo:
+                    continue
+                dest, take = src_lo - start_sample, src_hi - src_lo
+                buffer = buffers.get(lane_index)
+                if buffer is None or buffer.shape[1] < chunk.shape[1]:
+                    channels = max(chunk.shape[1], buffer.shape[1] if buffer is not None else 1)
+                    grown = torch.zeros((1, channels, total))
+                    if buffer is not None:
+                        grown[:, :buffer.shape[1], :] = buffer
+                    buffer = grown
+                    buffers[lane_index] = buffer
+                buffer[0, :chunk.shape[1], dest:dest + take] += chunk[0, :, src_lo - pos:src_lo - pos + take]
+    if not buffers:
+        return {"waveform": torch.zeros((1, 1, total)), "sample_rate": TIMELINE_RATE, "missing": missing}
+    channels = max(buffer.shape[1] for buffer in buffers.values())
+    mixed = torch.zeros((1, channels, total))
+    for buffer in buffers.values():
+        mixed += _match_channels(buffer, channels)
+    mixed = mixed / float(max(1, lane_count))
+    return {"waveform": mixed, "sample_rate": TIMELINE_RATE, "missing": missing}
+
+
+def _read_timeline_audio(entry, gain=None):
+    """段音频：各音频轨在段区间内的片段按时间线位置混音，空缺补静音。
+
+    gain 给定时用统一系数（潜桥跨段一致）；不给时沿用“本段峰值 >1 才归一化”的旧行为。
+    """
     import torch
     spec = entry["timeline_audio"]
     total = max(1, round(entry["seconds_float"] * TIMELINE_RATE))
@@ -199,9 +304,13 @@ def _read_timeline_audio(entry):
     mixed = torch.zeros((1, channels, total))
     for buffer in track_buffers:
         mixed += _match_channels(buffer, channels)
-    peak = float(mixed.abs().max()) if mixed.numel() else 0.0
-    if peak > 1.0:
-        mixed = mixed / peak
+    if gain is not None:
+        # 潜桥跨段统一系数：所有段同一个增益，接缝不会出现电平台阶。
+        mixed = mixed * float(gain)
+    else:
+        peak = float(mixed.abs().max()) if mixed.numel() else 0.0
+        if peak > 1.0:
+            mixed = mixed / peak
     return {"waveform": mixed, "sample_rate": TIMELINE_RATE}
 
 

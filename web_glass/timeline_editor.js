@@ -757,7 +757,10 @@ export function mountTimelineEditor(node) {
         const hasPrompt=!!entry && Object.prototype.hasOwnProperty.call(entry,"prompt");
         const state=JSON.stringify(T.state);
         to.push(hasPrompt?{state,prompt:currentLinkedPrompt()}:groupMove?{state,groupMove:true}:state);
-        T.state=JSON.parse(entry?entry.state:saved);
+        let parsed;
+        try { parsed = JSON.parse(entry?entry.state:saved); }
+        catch { from.push(saved); hint("历史记录已损坏，无法撤销/重做这一步", true); return; }
+        T.state = parsed;
         if (hasPrompt) setLinkedPromptText(entry.prompt);
         afterEdit(true,true,groupMove);
     };
@@ -2037,14 +2040,20 @@ export function mountTimelineEditor(node) {
     };
     const relaySegmentsNeedAlign = () => {
         try {
-            const flags = (T.state.disabled_tracks || {}).video_tracks || [];
-            const clips = (T.state.video_tracks || []).flatMap((lane, index) => flags[index] ? [] : (lane || []));
+            const collect = key => {
+                const flags = (T.state.disabled_tracks || {})[key] || [];
+                return (T.state[key] || []).flatMap((lane, index) => flags[index] ? [] : (lane || []));
+            };
+            const clips = collect("video_tracks");
+            // 只有音频轨时不再拦截：音频常被当作参考音频使用，强制重切会破坏原有切点。
+            // 需要“音频/分镜/提示词严格对位”时，用户可自己点「应用分段」。
             if (!clips.length) return false;
             return clips.some(clip => Math.round((clipEnd(clip) - Number(clip.tl_start || 0)) * FPS) % 17 !== 0);
         } catch (_error) { return false; }
     };
     // 逐片段 17n 布局（合并/多源轨用）：片段不跨源拼接；返回新片段、每段目标帧、总帧。
     const relayGridLayout = (clips, options = {}) => {
+        const idPrefix = options.idPrefix || "v";
         const sorted = [...clips].sort((a, b) => Number(a.tl_start) - Number(b.tl_start));
         if (!sorted.length) throw new Error("没有可重排的视频片段");
         const eps = 0.5 / FPS;
@@ -2110,7 +2119,7 @@ export function mountTimelineEditor(node) {
             let sourceCursor = Number(clip.src_in);
             for (const frames of segmentTargets) {
                 targets.push(frames);
-                nextClips.push({...clip, id: uid("v"),
+                nextClips.push({...clip, id: uid(idPrefix),
                     tl_start: snapFrame(cursorFrames / FPS),
                     src_in: snapFrame(sourceCursor), src_out: snapFrame(sourceCursor + frames / FPS),
                     retained_src_in: undefined, retained_src_out: undefined});
@@ -2127,17 +2136,27 @@ export function mountTimelineEditor(node) {
         const fail = message => { if (autoState) autoState.problem = message; if (!auto) hint(message, true); return false; };
         const context = Math.max(0, Number(relayContext) || 0);
         if (!context) return false;
-        const lanes = T.state.video_tracks || [];
-        const disabled = (T.state.disabled_tracks || {}).video_tracks || [];
-        const active = lanes.map((lane, index) => ({ lane, index }))
-            .filter(item => item.lane?.length && !disabled[item.index]);
-        if (active.length !== 1) {
-            return fail("潜桥自动重排目前只支持一条可见视频轨道；请先合并/隐藏其它视频轨。");
+        const disabledOf = key => (T.state.disabled_tracks || {})[key] || [];
+        const lanesOf = key => T.state[key] || [];
+        const activeOf = key => lanesOf(key).map((lane, index) => ({ lane, index }))
+            .filter(item => item.lane?.length && !disabledOf(key)[item.index]);
+        const videoActive = activeOf("video_tracks");
+        const audioActive = activeOf("audio_tracks");
+        // 只有一条可见视频轨：按视频轨重排；没有视频轨但恰好一条可见音频轨（数字人/音频驱动）：
+        // 按音频轨重排。否则音频段不是 17n，后台按 17n 输出时本段音频会与提示词/参考图错位。
+        const audioOnly = videoActive.length === 0 && audioActive.length === 1;
+        if (!audioOnly) {
+            if (videoActive.length !== 1) {
+                return fail("潜桥自动重排目前只支持一条可见视频轨道；请先合并/隐藏其它视频轨。");
+            }
+            if (audioActive.length) {
+                return fail("潜桥自动重排暂不处理独立音频轨；请先把音频片段去掉或合并到视频轨。");
+            }
         }
-        const audioDisabled = (T.state.disabled_tracks || {}).audio_tracks || [];
-        if ((T.state.audio_tracks || []).some((lane, index) => lane?.length && !audioDisabled[index])) {
-            return fail("潜桥自动重排暂不处理独立音频轨；请先把音频片段去掉或合并到视频轨。");
-        }
+        const laneKey = audioOnly ? "audio_tracks" : "video_tracks";
+        const lanes = lanesOf(laneKey);
+        const active = audioOnly ? audioActive : videoActive;
+        const mediaName = audioOnly ? "音频" : "视频";
         const clips = [...active[0].lane].sort((a, b) => Number(a.tl_start) - Number(b.tl_start));
         if (!clips.length) return false;
         const eps = 0.5 / FPS;
@@ -2147,7 +2166,7 @@ export function mountTimelineEditor(node) {
                 return fail("潜桥自动重排发现片段缺少时间/源范围数值，已保留你的编辑。");
             if (index === 0) {
                 if (Math.abs(Number(clip.tl_start)) > eps)
-                    return fail("潜桥自动重排要求视频从时间线 0 开始；当前前面有空隙，已保留你的编辑。");
+                    return fail(`潜桥自动重排要求${mediaName}从时间线 0 开始；当前前面有空隙，已保留你的编辑。`);
                 continue;
             }
             if (Math.abs(Number(clip.tl_start) - clipEnd(clips[index - 1])) > eps)
@@ -2156,7 +2175,7 @@ export function mountTimelineEditor(node) {
         const totalEnd = Math.max(...clips.map(clip => clipEnd(clip)));
         const totalFrames = Math.max(0, Math.round(totalEnd * FPS));
         const units = Math.floor(totalFrames / 17);
-        if (units < 1) return fail(`源视频只有 ${totalFrames} 帧，潜桥至少需要 17 帧。`);
+        if (units < 1) return fail(`源${mediaName}只有 ${totalFrames} 帧，潜桥至少需要 17 帧。`);
         const maxWidget = (node.widgets || []).find(widget => widget.name === "max_frames");
         const maxRaw = Number(maxWidget?.value ?? maxWidget?.options?.default);
         const maxFrames = Number.isFinite(maxRaw) && maxRaw > 0 ? maxRaw : 0;
@@ -2178,7 +2197,7 @@ export function mountTimelineEditor(node) {
         let signatureSource;
         let count;
         if (singleSource && !sourceContinuous) {
-            return fail("潜桥自动重排要求源视频范围连续；当前片段之间跳源/有删减，已保留你的编辑。");
+            return fail(`潜桥自动重排要求源${mediaName}范围连续；当前片段之间跳源/有删减，已保留你的编辑。`);
         }
         if (singleSource && sourceContinuous) {
             // 单源连续：整轨分配（可跨片段边界切分）。
@@ -2198,7 +2217,7 @@ export function mountTimelineEditor(node) {
             } else {
                 count = requestCount >= 1 ? requestCount : (recipeCount >= 1 ? recipeCount : clips.length);
                 count = Math.max(1, count);
-                if (units < count) return fail(`源视频只有 ${totalFrames} 帧，潜桥至少需要 ${count * 17} 帧才能保持 ${count} 段。`);
+                if (units < count) return fail(`源${mediaName}只有 ${totalFrames} 帧，潜桥至少需要 ${count * 17} 帧才能保持 ${count} 段。`);
                 const base = Math.floor(units / count), extra = units % count;
                 targets = Array.from({ length: count }, (_, index) => (base + (index < extra ? 1 : 0)) * 17);
             }
@@ -2216,7 +2235,7 @@ export function mountTimelineEditor(node) {
                 const start = cursorFrames / FPS;
                 const end = (cursorFrames + frames) / FPS;
                 cursorFrames += frames;
-                return {...template, id: uid("v"),
+                return {...template, id: uid(audioOnly ? "a" : "v"),
                     tl_start: snapFrame(start), src_in: snapFrame(sourceStart + start), src_out: snapFrame(sourceStart + end),
                     retained_src_in: undefined, retained_src_out: undefined};
             });
@@ -2226,7 +2245,7 @@ export function mountTimelineEditor(node) {
             // 合并/多源：逐片段对齐 17n，片段不跨源拼接（逐片段尾部不足 17 帧的裁掉）。
             let layout;
             try {
-                layout = relayGridLayout(clips, {count: requestCount >= 1 ? requestCount : clips.length, step: requestStep});
+                layout = relayGridLayout(clips, {count: requestCount >= 1 ? requestCount : clips.length, step: requestStep, idPrefix: audioOnly ? "a" : "v"});
             } catch (error) {
                 return fail(String(error?.message || error));
             }
@@ -2254,10 +2273,10 @@ export function mountTimelineEditor(node) {
                               source: signatureSource, source_start: 0 } };
             return false;
         }
-        const otherEnd = Math.max(0, ...lanes.flatMap((lane, index) =>
-            index === active[0].index ? [] : (lane || []).map(clip => Number(clipEnd(clip)) || 0)));
+        const otherEnd = Math.max(0, ...["video_tracks", "audio_tracks"].flatMap(key => (T.state[key] || []).flatMap((lane, index) =>
+            (key === laneKey && index === active[0].index) ? [] : (lane || []).map(clip => Number(clipEnd(clip)) || 0))));
         pushUndo();
-        T.state.video_tracks = lanes.map((lane, index) => index === active[0].index ? nextClips : lane);
+        T.state[laneKey] = lanes.map((lane, index) => index === active[0].index ? nextClips : lane);
         T.state.duration = snapFrame(Math.max(cursorFrames / FPS, otherEnd));
         T.state.segmentation = "clips";
         T.state.split_points = [];
@@ -2922,18 +2941,28 @@ export function mountTimelineEditor(node) {
         if (!clips.length) { requireSelectedClips();return; }
         if (T.separating) return;
         const snapshot=JSON.stringify(T.state),planned=(T.state.audio_tracks||[]).map(lane=>[...lane]),placements=[];
+        const sourceEnds = new Map();
         for(const clip of clips){
             const index=planned.findIndex((lane,i)=>!trackDisabled(T.state,"audio_tracks",i)&&lane.every(item=>clipEnd(item)<=clip.tl_start+.5/FPS||item.tl_start>=clipEnd(clip)-.5/FPS));
             if(index<0){hint("可见音频轨没有足够空位，请先腾出音频轨道。",true);return;}
             planned[index].push(clip);placements.push(index);
+            sourceEnds.set(clip.source, Math.max(clip.src_out, sourceEnds.get(clip.source) || 0));
         }
         T.separating=true;
         try{
             const extracted=new Map();
-            for(const clip of clips)if(!extracted.has(clip.source)){
-                const source=sourcesOf()[clip.source];
-                const response=await api.fetchApi("/aiden_h3/separate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({origin:source.origin,file:source.file,name:source.name})});
-                const data=await response.json();if(!response.ok||data.error)throw Error(data.error||"分离失败");extracted.set(clip.source,{...data.source,id:uid("s")});
+            for(const [sourceId, clipEnd] of sourceEnds){
+                const source = sourcesOf()[sourceId];
+                const response = await api.fetchApi("/aiden_h3/separate", {
+                    method: "POST",
+                    headers: {"Content-Type": "application/json"},
+                    body: JSON.stringify({origin: source.origin, file: source.file, name: source.name, clip_end: clipEnd}),
+                });
+                const data = await response.json();
+                if (!response.ok || data.error) throw Error(data.error || "分离失败");
+                if (!Number.isFinite(data.source?.duration) || data.source.duration + 1e-9 < clipEnd)
+                    throw Error("分离音轨未对齐所选片段，请确认已加载新版插件");
+                extracted.set(sourceId, {...data.source, id: uid("s")});
             }
             if(snapshot!==JSON.stringify(T.state)||clips.some(clip=>!selectedEditableClips().some(item=>item.id===clip.id))){hint("所选片段已变化，分离结果未添加到时间线。",true);return;}
             pushUndo();T.state.sources.push(...extracted.values());
@@ -4417,10 +4446,10 @@ export function mountTimelineEditor(node) {
             };
             const selectedClips = selectedEditableClips();
             // v0.5.47：潜桥开启时「应用分段」= 把整条可见视频轨按 17n 网格重排（合并/多源片段也支持）。
-            if (hasClips && relayContextValue() > 0 && activeClips(T.state, "video_tracks").length) {
+            if (hasClips && relayContextValue() > 0 && (activeClips(T.state, "video_tracks").length || activeClips(T.state, "audio_tracks").length)) {
                 const result = node._adH3ApplyRelayLayout?.({ count: byCount ? count : 0, step: byCount ? 0 : frames, label: "应用分段" });
                 if (!result) { hint("潜桥自动对齐暂不可用：请保存工作流后按 Ctrl+F5 刷新页面。", true); return; }
-                if (!result.ok) hint(`潜桥自动对齐未生效：${result.problem || "请先确认只有一条可见视频轨、时间线从 0 开始且片段连续"}`, true);
+                if (!result.ok) hint(`潜桥自动对齐未生效：${result.problem || "请先确认只有一条可见视频/音频轨、时间线从 0 开始且片段连续"}`, true);
                 else if (!result.changed) hint("潜桥段长已经是 17 帧网格，无需重排。");
                 return;
             }

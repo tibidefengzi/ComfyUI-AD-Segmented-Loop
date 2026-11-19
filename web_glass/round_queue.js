@@ -23,8 +23,24 @@ export function installRoundQueue(api, app) {
             method:"POST", headers:{"Content-Type":"application/json"},
             body:JSON.stringify({prompt:serialized.output, workflow:serialized.workflow, round_bindings:bindings, client_id:api.clientId})
         });
+        if (response.status === 404) {
+            // 还没有进度/会话文件：不需要重写轮次，直接按原样排队。
+            return original.call(this, number, {...serialized, output:stopAtPreview(serialized?.output, targets),
+                workflow:stampTargets(serialized?.workflow)}, ...rest);
+        }
         const result = await response.json();
         if (!response.ok) throw new Error(result.error || "无法读取当前生成设置：请先点「停止」，确认当前段状态后重试。");
+        // 素材缺失/换内容只提醒，不拦本次排队；必需素材缺失会由后台直接返回 400。
+        const warnings = Array.isArray(result.warnings) ? result.warnings.filter(Boolean) : [];
+        if (warnings.length) {
+            const toast = app?.extensionManager?.toast;
+            if (toast?.add) {
+                toast.add({severity: "warn", summary: "AD-Segmented-Loop 素材提醒",
+                           detail: warnings.join("\n"), life: 9000});
+            } else {
+                console.warn("[AD-Segmented-Loop] " + warnings.join("；"));
+            }
+        }
         for (const round of result.rounds || []) {
             const submittedTask=serialized?.workflow?.extra?.ad_segmented_task?.id;
             if(submittedTask&&submittedTask!==currentTaskId(app.graph))continue;

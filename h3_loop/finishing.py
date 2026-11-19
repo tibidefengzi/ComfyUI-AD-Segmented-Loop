@@ -191,7 +191,7 @@ def prepare_merge(paths, versions, directory, output_dir, options):
 def _stream_copy_merge(paths, output):
     """所有分段编码参数一致时直接拼接视频流（不重编码，画质与速度最优）。"""
     import av
-    from .assets import ffmpeg_executable
+    from .assets import ffmpeg_executable, ffmpeg_watchdog
     executable = ffmpeg_executable()
     if executable is None or not paths or output.exists():
         return False
@@ -227,7 +227,7 @@ def _stream_copy_merge(paths, output):
             result = subprocess.run([executable, "-v", "error", "-nostdin", "-n", "-copyts", "-f", "concat", "-safe", "0",
                                      "-i", str(list_file), "-map", "0:v:0", "-c", "copy", "-an",
                                      "-movflags", "+faststart", str(output)],
-                                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=600,
                                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             if result.returncode or not output.is_file() or output.stat().st_size == 0:
                 output.unlink(missing_ok=True)
@@ -249,7 +249,7 @@ def _stream_copy_merge(paths, output):
 def concat_picture(paths, output):
     """逐帧管道输入 FFmpeg；不继承容器/AAC 时间戳，不增删任何画面帧。"""
     import av
-    from .assets import ffmpeg_executable
+    from .assets import ffmpeg_executable, ffmpeg_watchdog
     executable = ffmpeg_executable()
     if executable is None:
         raise ValueError("需要 FFmpeg 合并视频，请安装 imageio-ffmpeg 或将 FFmpeg 加入 PATH")
@@ -267,6 +267,7 @@ def concat_picture(paths, output):
             "-an","-c:v","libx264","-preset","fast","-crf","16","-pix_fmt","yuv420p",
             "-movflags","+faststart",str(output)], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
             stderr=handle, creationflags=getattr(subprocess,"CREATE_NO_WINDOW",0))
+        guard, guard_state = ffmpeg_watchdog(encoder, 3600)
         try:
             for path in paths:
                 with av.open(str(path)) as source:
@@ -281,6 +282,10 @@ def concat_picture(paths, output):
             if encoder.poll() is None: encoder.kill()
             encoder.wait()
             raise ValueError(f"画面合并失败，请检查分段文件和日志：{log.name}") from error
+        finally:
+            guard.cancel()
+        if guard_state["timeout"]:
+            raise ValueError("画面合并超时（超过 1 小时），已终止；请检查分段文件或缩短时长")
 
 
 def restore_audio(picture, output, directory, versions):
@@ -323,7 +328,7 @@ def restore_audio(picture, output, directory, versions):
             encoder.wait()
             raise
     result=subprocess.run([executable,"-v","error","-nostdin","-n","-i",str(picture),"-i",str(soundtrack),
-                           "-map","0:v:0","-map","1:a:0","-c","copy","-movflags","+faststart",str(output)],
+                           "-map","0:v:0","-map","1:a:0","-c","copy","-shortest","-movflags","+faststart",str(output)],
                           capture_output=True,creationflags=creationflags,timeout=120)
     if result.returncode:raise ValueError("最终音视频封装失败："+result.stderr.decode(errors="replace")[-1500:])
     return {"samples":samples,"sample_rate":48000,"channels":channels,"seconds":samples/48000}

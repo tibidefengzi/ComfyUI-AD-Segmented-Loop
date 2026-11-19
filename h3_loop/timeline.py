@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 
 from .spec import FPS, REVISION, snap_seconds, target_frames
 from .storage import digest
@@ -80,10 +81,16 @@ def clip_span(clip):
     return float(clip["tl_start"]), float(clip["tl_start"]) + (float(clip["src_out"]) - float(clip["src_in"]))
 
 
+def legacy_separated_audio(source):
+    # 旧分离接口只生成这种媒体文件；普通音频和新版分离音轨继续严格校验。
+    return (source.get("kind") == "audio" and source.get("origin") == "media"
+            and str(source.get("name", "")).endswith("·分离音轨")
+            and re.fullmatch(r"[0-9a-f]{32}\.wav", source.get("file", "")) is not None)
+
+
 def path_sources(raw_path):
     """「素材路径」输入框的内容：直接把该文件/文件夹作为唯一素材来源。"""
     import hashlib
-    import shutil
     from pathlib import Path
     from .storage import ROOT
     from .assets import AUDIO_EXTS, IMAGE_EXTS, VIDEO_EXTS, probe_duration
@@ -234,7 +241,8 @@ def validate_timeline(config):
                         or not _finite(clip.get("src_out")) \
                         or float(clip["src_out"]) <= float(clip["src_in"]):
                     raise ValueError("片段的时间范围无效，请重新拖动或裁剪")
-                if source["duration"] is not None and float(clip["src_out"]) > source["duration"] + HALF_FRAME:
+                legacy_audio = legacy_separated_audio(source)
+                if not legacy_audio and source["duration"] is not None and float(clip["src_out"]) > source["duration"] + HALF_FRAME:
                     raise ValueError(f"片段超出素材 {source['name']} 的长度")
                 clips.append({"id": str(clip.get("id") or digest([source["id"], clip])[0:16]),
                               "source": source["id"], "tl_start": float(clip["tl_start"]),
@@ -245,7 +253,7 @@ def validate_timeline(config):
                     lo, hi = clip.get("retained_src_in"), clip.get("retained_src_out")
                     if not _finite(lo, positive=False) or not _finite(hi) or hi <= lo \
                             or clip["src_in"] < lo - 1e-7 or clip["src_out"] > hi + 1e-7 \
-                            or (source["duration"] is not None and hi > source["duration"] + HALF_FRAME):
+                            or (not legacy_audio and source["duration"] is not None and hi > source["duration"] + HALF_FRAME):
                         raise ValueError("片段超出已裁剪保留范围，请撤销裁剪后再调整")
                     clips[-1].update(retained_src_in=float(lo), retained_src_out=float(hi))
             clips.sort(key=lambda item: item["tl_start"])
@@ -507,6 +515,13 @@ def output_timeline(state):
     return result
 
 
+def _audio_window_key(lanes):
+    """只按片段的来源/源范围比较取音窗口，忽略 at 的浮点尾差。"""
+    return [[[str(piece.get("origin")), str(piece.get("file")),
+              round(float(piece.get("src_in") or 0.0), 6), round(float(piece.get("src_out") or 0.0), 6)]
+             for piece in lane] for lane in lanes]
+
+
 def derive_segments(state):
     batch = priority_sources(state)
     if batch:
@@ -574,11 +589,34 @@ def derive_segments(state):
             "board_image": ({"id": raw_boards[index], **asset_version(board_sources[raw_boards[index]])}
                             if index < len(raw_boards) and raw_boards[index] in board_sources else None),
         })
+    # 潜桥计划：本段实际取音窗口可能跨到相邻片段。把窗口片段的素材并进 entry id，
+    # 这样替换下一段音频后，上一段（窗口跨到它）也会被判为需要重跑。
+    plan = (state.get("segment_recipe") or {}).get("relay_plan") if isinstance(state.get("segment_recipe"), dict) else None
+    targets = [int(value) for value in (plan or {}).get("targets") or []]
+    relay_windows = None
+    aligned = targets == [int(round(float(entry.get("seconds_float") or 0.0) * 24)) for entry in entries]
+    if targets and len(targets) == len(entries) and not aligned and all(value > 0 and value % 17 == 0 for value in targets):
+        relay_windows = []
+        cursor = 0.0
+        mute_flags = (state.get("muted_tracks") or {}).get("audio_tracks") or []
+        for target in targets:
+            lanes = []
+            for lane_index, lane in enumerate(state["audio_tracks"]):
+                if lane_index < len(mute_flags) and mute_flags[lane_index]:
+                    lanes.append([])
+                else:
+                    lanes.append(audio_pieces(lane, sources, cursor, cursor + target / FPS))
+            relay_windows.append(lanes)
+            cursor += target / FPS
     for index, entry in enumerate(entries):
         references = [sources[image["source"]] for image in state["images"] if image["segment"] in (-1, index + 1)]
         entry["reference_images"] = [{"segment": image["segment"], **versions[(sources[image["source"]]["origin"], sources[image["source"]]["file"])]}
                                      for image in state["images"] if image["segment"] in (-1, index + 1)]
+        if relay_windows is not None and _audio_window_key(relay_windows[index]) != _audio_window_key(entry["timeline_audio"]["tracks"]):
+            entry["relay_window"] = relay_windows[index]
         used = [piece for lane in entry["timeline_audio"]["tracks"] for piece in lane] + references
+        if entry.get("relay_window"):
+            used += [piece for lane in entry["relay_window"] for piece in lane]
         used += [source for lane in entry["reference_video_sources"] for source in lane]
         if entry["video_source"] is not None:
             used.append(entry["video_source"])
@@ -593,8 +631,17 @@ def derive_segments(state):
                    entry["timeline_audio"], entry["video_source"], entry["images"], entry["reference_images"], entry["source_versions"],
                    entry["muted_tracks"], entry["video_audio_muted"], entry.get("board_image")]
         content.append(entry["reference_video_sources"])
+        if entry.get("relay_window"):
+            content.append(entry["relay_window"])
         entry["id"] = digest(content)[:24]
     return {"entries": entries, "duration": duration, "bounds": bounds, "intervals": intervals}
+
+
+def audio_piece(source, start, end):
+    piece = {"origin": source["origin"], "file": source["file"], "src_in": float(start), "src_out": float(end)}
+    if legacy_separated_audio(source):
+        piece["pad_silent_tail"] = True
+    return piece
 
 
 def audio_pieces(lane, sources, start, end):
@@ -606,8 +653,7 @@ def audio_pieces(lane, sources, start, end):
             continue
         source = sources[clip["source"]]
         offset = float(clip["src_in"]) - clip_start
-        pieces.append({"origin": source["origin"], "file": source["file"], "at": lo - start,
-                       "src_in": offset + lo, "src_out": offset + hi,
+        pieces.append({**audio_piece(source, offset + lo, offset + hi), "at": lo - start,
                        **({"retained_range": [clip["retained_src_in"], clip["retained_src_out"]]} if "retained_src_in" in clip else {})})
     return pieces
 
@@ -692,11 +738,9 @@ def source_pieces(state, source_id):
         for clip in sorted(lane, key=lambda item: item["tl_start"]):
             if clip["source"] != source_id:
                 continue
-            pieces.append({"origin": source["origin"], "file": source["file"],
-                           "src_in": float(clip["src_in"]), "src_out": float(clip["src_out"])})
+            pieces.append(audio_piece(source, clip["src_in"], clip["src_out"]))
     if not pieces and source["duration"]:
-        pieces = [{"origin": source["origin"], "file": source["file"],
-                   "src_in": 0.0, "src_out": float(source["duration"])}]
+        pieces = [audio_piece(source, 0, source["duration"])]
     return pieces
 
 
