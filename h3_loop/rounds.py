@@ -8,7 +8,6 @@ import re
 import shutil
 import uuid
 import hashlib
-from contextlib import suppress
 from pathlib import Path
 
 from .spec import relay_parent_stage, relay_reanchor_interval, relay_reanchors
@@ -87,7 +86,7 @@ def _validate_old_round_plan(origin_segments, child_segments, trial_round):
             raise ValueError("（第 %d 段）%s" % (index + 1, hint))
 
 
-def _version_from_preview(segments, preview, owner=None):
+def _version_from_preview(segments, preview):
     if not isinstance(preview, dict) or not preview.get("file"):
         return None
     name = str(preview.get("file") or "").replace("\\", "/")
@@ -99,23 +98,15 @@ def _version_from_preview(segments, preview, owner=None):
             return None
     child = scope if scope.startswith("trial_") else (
         session_id if str(session_id or "").startswith("trial_") else "")
-    normal = owner is None or (scope in {"", owner} and session_id in {None, "", owner})
-    exact, aliases = [], []
-    version_id = preview.get("version_id")
     for row in segments or []:
         for version in row.get("versions") or []:
-            if version_id and version.get("id") != version_id:
-                continue
             file = str(version.get("file") or "").replace("\\", "/")
+            normal = file == name or file.rsplit("/", 1)[-1].endswith("_" + name.rsplit("/", 1)[-1])
             trial = (bool(child) and version.get("preview_only") and version.get("trial_request")
-                     and version.get("trial_session") in {None, child}
                      and file == "trial_" + str(version.get("trial_request")) + "_" + name)
-            if (normal and file == name) or trial:
-                exact.append(version)
-            elif normal and file.rsplit("/", 1)[-1].endswith("_" + name.rsplit("/", 1)[-1]):
-                aliases.append(version)
-    matches = exact or aliases
-    return matches[0] if len(matches) == 1 else None
+            if normal or trial:
+                return version
+    return None
 
 
 def _pick_parent_version(origin_segments, target, target_version):
@@ -470,10 +461,10 @@ def apply_materials(prompt, node_id, materials, fallback=None):
     return result
 
 
-def freeze(state, prompt, node_id, workflow=None, batch=False, materials=None, *, pending=None):
+def freeze(state, prompt, node_id, workflow=None, batch=False, materials=None):
     sid = state["id"]
     with STORE.lock(sid):
-        current = STORE._load(sid) if pending is None else state
+        current = STORE._load(sid)
         previous = read_snapshot(current)
         # 普通提交不继承旧组素材；显式materials仅保留为兼容适配工具。
         if materials is not None:
@@ -503,36 +494,25 @@ def freeze(state, prompt, node_id, workflow=None, batch=False, materials=None, *
                     "materials": material_state}
         rounds_dir = STORE.directory(sid) / "rounds"
         rounds_dir.mkdir(parents=True, exist_ok=True)
-        snapshot_path = rounds_dir / (token + ".json")
-        atomic_json(snapshot_path, snapshot)
-        if pending is not None:
-            pending.callback(discard_pending_file, snapshot_path)
+        atomic_json(rounds_dir / (token + ".json"), snapshot)
+        # 旧快照可能正被另一线程 read_snapshot 读取：先写新快照，再按 mtime 只保留最近 2 份；
+        # 删除失败忽略，避免并发读取时瞬时找不到文件。
+        snapshots = []
+        for item in rounds_dir.glob("*.json"):
+            try:
+                snapshots.append((item.stat().st_mtime_ns, item.name, item))
+            except OSError:
+                continue
+        snapshots.sort(key=lambda entry: (entry[0], entry[1]), reverse=True)
+        for _, _, stale in snapshots[2:]:
+            try:
+                stale.unlink()
+            except OSError:
+                pass
         current["execution_round"] = {"id": token, "file": "rounds/" + token + ".json",
                                       "segment_node": str(node_id), "batch": bool(batch)}
         current.pop("resume_round", None)
-        if pending is not None:
-            return current
-        saved = STORE._save(current)
-        prune_snapshots(saved)
-        return saved
-
-
-def discard_pending_file(path):
-    with suppress(OSError):
-        path.unlink()
-
-
-def prune_snapshots(state):
-    """只在进度提交后回收旧快照，保留当前指向的文件。"""
-    rounds_dir = STORE.directory(state["id"]) / "rounds"
-    current = ((state.get("execution_round") or {}).get("file") or "").rsplit("/", 1)[-1]
-    snapshots = []
-    with suppress(OSError):
-        for item in rounds_dir.glob("*.json"):
-            with suppress(OSError):
-                snapshots.append((item.name == current, item.stat().st_mtime_ns, item.name, item))
-    for _, _, _, stale in sorted(snapshots, reverse=True)[2:]:
-        discard_pending_file(stale)
+        return STORE._save(current)
 
 
 def resolve_resume_anchor(state, preview, fallback):
@@ -541,17 +521,27 @@ def resolve_resume_anchor(state, preview, fallback):
         return int(fallback)
     sid = state["id"]
     named = preview.get("session_id")
+    name = str(preview.get("file") or "").replace("\\", "/")
     scope = ""
     if preview.get("origin") == "session":
-        scope, separator, _ = str(preview.get("file") or "").replace("\\", "/").partition("/")
+        scope, separator, name = name.partition("/")
         if not separator:
             raise ValueError("所选预览缺少本轮文件身份，请重新选择分段预览")
     normal = scope in {"", sid} and named in {None, "", sid}
-    rows = state.get("segments") or []
-    version = _version_from_preview(rows, preview, sid)
-    if version is not None:
-        return next(index + 1 for index, row in enumerate(rows)
-                    if any(item is version for item in row.get("versions") or []))
+    child = scope if scope.startswith("trial_") else (named if str(named or "").startswith("trial_") else "")
+    matches = []
+    for index, row in enumerate(state.get("segments") or []):
+        for version in row.get("versions") or []:
+            file = str(version.get("file") or "").replace("\\", "/")
+            matching = bool(file) and (file == name or file.rsplit("/", 1)[-1].endswith("_" + name.rsplit("/", 1)[-1]))
+            trial_match = (child and version.get("preview_only") and version.get("trial_request")
+                           and (not version.get("trial_session") or version["trial_session"] == child)
+                           and file == "trial_" + str(version["trial_request"]) + "_" + name)
+            if (normal and matching) or trial_match:
+                matches.append(index + 1)
+                break
+    if len(matches) == 1:
+        return matches[0]
     key = preview.get("segment_key")
     if normal and named == sid and key:
         matches = [i + 1 for i, row in enumerate(state.get("segments") or []) if row.get("segment_key") == key]
@@ -565,29 +555,24 @@ def resolve_resume_anchor(state, preview, fallback):
 
 
 def accept_through(state, count):
-    """保留前缀的选用，后一段起等待重新生成。"""
+    """清空重置后从选中预览续跑：前 count 段按各自最后一次生成结果补成已通过，
+    第 count 段起标记待更新（旧版本保留为历史），游标停在第 count 段。"""
     rows = state.get("segments") or []
     count = int(count)
     if count <= 0:
         raise ValueError("请先在「分段生成」里选中要从其后续跑的预览卡")
     if count > len(rows):
         raise ValueError(f"本轮没有第 {count} 段，不能继续")
-    prefix = []
+    latest_prefix = []
     for index, row in enumerate(rows[:count]):
         versions = row.get("versions") or []
         if not versions:
             raise ValueError(f"第 {index + 1} 段没有已生成结果，不能从第 {count + 1} 段继续")
-        selected = row.get("manual_version")
-        if not selected and row.get("valid") and not row.get("boundary_changed"):
-            selected = row.get("selected")
-        chosen = next((version for version in versions if version["id"] == selected), None)
-        newest = max(versions, key=lambda version: float(version.get("created_at") or 0))
-        if chosen and row.get("accepted") and chosen is not newest:
-            row["manual_version"] = chosen["id"]
-        prefix.append(chosen or newest)
+        latest_prefix.append(max(versions, key=lambda version: float(version.get("created_at") or 0)))
     for index, row in enumerate(rows):
         if index < count:
-            row["selected"] = prefix[index]["id"]
+            latest = latest_prefix[index]
+            row["selected"] = latest.get("id")
             row["valid"] = True
             row["accepted"] = True
             row["boundary_changed"] = False
@@ -600,7 +585,12 @@ def accept_through(state, count):
 
 
 def select_resume_version(state, preview, anchor):
-    """把点选版本写入本轮选用，供后续接力和合并。"""
+    """把用户点选的那一版设为第 anchor 段的选用，作为下一段接力的父版本。
+
+    与 accept_through 的分工：前 1..anchor-1 段仍按各自最新版补成已通过；
+    第 anchor 段认用户点的这一版（不是最新版），下一段桥接读它的 latent，
+    最终合并也用这一版。
+    """
     rows = state.get("segments") or []
     try:
         anchor = int(anchor)
@@ -608,71 +598,40 @@ def select_resume_version(state, preview, anchor):
         raise ValueError("所选段号无效，请重新选择预览卡") from None
     if not 1 <= anchor <= len(rows):
         raise ValueError("所选段号超出当前分段范围，请重新选择预览卡")
-    version = _version_from_preview(rows, preview, state.get("id"))
+    version = _version_from_preview(rows, preview)
     if version is None:
         raise ValueError("所选卡片在本轮进度里找不到对应版本；请重新选择分段预览")
     row = rows[anchor - 1]
-    if not any(item is version for item in row.get("versions") or []):
+    if version.get("id") not in {item.get("id") for item in row.get("versions") or []}:
         raise ValueError("所选卡片不属于第 %d 段，请重新选择" % anchor)
     row["selected"] = version.get("id")
-    row["manual_version"] = version.get("id")
     row["valid"] = True
     row["accepted"] = True
     row["boundary_changed"] = False
     return version
 
 
-def _resume_stage_source(version):
+def promote_resume_stage(state, version, anchor):
+    """第 anchor 段的接力父 latent：把点选版本的潜桥 stage 提升到稳定链。
+
+    非潜桥版本无需提升；潜桥版本源 stage 缺失时明确报错，避免下一段接错版本。
+    """
+    if not isinstance(version, dict):
+        return False
+    target = str(version.get("relay_run_id") or "")
     source = str(version.get("relay_save_run_id") or "")
     try:
-        stage = int(version.get("relay_stage_index"))
+        int(version.get("relay_stage_index"))
     except (TypeError, ValueError):
-        return None
-    if source and stage >= 0:
-        # 链名是单个目录名。旧版本的 stage 编号只用于读源。
-        if not re.fullmatch(r"[A-Za-z0-9_-]+", source):
-            raise ValueError("所选版本的潜桥存盘链无效，请重新生成该段。")
-        path = _stage_path(source, stage)
-        if path.is_file():
-            return path
-    return None
-
-
-def prepare_resume_relay_chain(state, prefix, pending, required=False):
-    """准备独立的续跑链，进度提交后下一段才会看见这条链。"""
-    anchor = prefix[-1]
-    if not (required or anchor.get("relay_run_id") or anchor.get("relay_save_run_id")):
-        return
-    parent = _resume_stage_source(anchor)
-    if parent is None:
-        raise ValueError(
-            f"第 {len(prefix)} 段所选预览的潜桥 latent 已不在或无法确认版本，"
-            "请重新生成该段或换一张有存盘的卡。")
-    suffix = uuid.uuid4().hex
-    run = _stable_run(state["id"], suffix)
-    directory = _stage_path(run, 0).parent
-    directory.mkdir(parents=True)
-
-    def discard_directory():
-        with suppress(OSError):
-            directory.rmdir()
-
-    pending.callback(discard_directory)
-    for index, version in enumerate(prefix):
-        source = parent if index == len(prefix) - 1 else _resume_stage_source(version)
-        if source is None:
-            continue
-        target = _stage_path(run, index)
-        pending.callback(discard_pending_file, target)
-        try:
-            # relay stage subsequent writes use atomic replacement, so the source link stays intact.
-            os.link(source, target)
-        except OSError:
-            try:
-                shutil.copy2(source, target)
-            except OSError as exc:
-                raise ValueError(f"无法准备第 {index + 1} 段的潜桥 latent，已保留原进度与接力链。") from exc
-    state["relay_run_id"] = suffix
+        return False
+    if not target or not source or target == source:
+        return False  # 非潜桥或已经存在稳定链，无需复制
+    row = (state.get("segments") or [])[int(anchor) - 1]
+    if STORE._promote_relay_stage(state, row, version):
+        return True
+    raise ValueError(
+        "第 %d 段所选预览的潜桥 latent 已不在（可能已清理或未落盘），"
+        "无法作为下一段的接力；请重新生成该段或换一张卡。" % int(anchor))
 
 
 
@@ -1020,10 +979,7 @@ def finish_trial(child_id, success=True):
                 version["draft_index"] = source["index"]
                 if not any(v.get("trial_request") == source["request_id"] for v in versions):
                     versions.append(version)
-                if (parent.get("auto_accept") and row is not None
-                        and child.get("round_no") == destination.get("round_no")
-                        and not (row.get("manual_version") and row["manual_version"] == row.get("selected")
-                                 and row.get("valid"))):
+                if parent.get("auto_accept") and row is not None and child.get("round_no")==destination.get("round_no"):
                     # 新界面生成即通过：最新抽卡结果直接成为该段当前选用/通过版本，不改变游标。
                     # 但潜桥 latent 提升必须成功才能选定；失败时不能带着旧父 latent 继续。
                     relay_version = bool(version.get("relay_run_id") and version.get("relay_save_run_id"))

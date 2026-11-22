@@ -1,4 +1,4 @@
-import {resultAliases,sameResult,mergeResult,redrawKey,redrawBase,recordLabel,nextRedrawCount,normalizeRedrawCounts,identityFields,preferPickedClips} from "./preview_identity.js";
+import {resultAliases,sameResult,mergeResult,redrawKey,redrawBase,recordLabel,nextRedrawCount,normalizeRedrawCounts,identityFields} from "./preview_identity.js";
 import { bindWidgetWidth, fitPreviewContent, MIN_NODE_WIDTH } from "./dom_layout.js";
 import { retainedHistoryRoundsByStrip, previewHistoryGroups } from "./preview_history.js";
 import { interruptOwnedPrompt } from "./queue_runner.js";
@@ -1078,7 +1078,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         node.properties.ad_h3_hidden_strips = [...hiddenStrips];
     };
     const stripRecords = {segment: [], segmentB: [], merged: []};
-    // 「合并片段」Ctrl 多选：只合并选中的同来源片段；无多选时合并本轮各段。
+    // 「合并片段」Ctrl 多选：只合并选中的同来源片段；不选则按合并来源合并全部段最新结果。
     const mergeSelection = new Map();
     let processingRecord = null;  // 单选仅跟随手动点击，自动到达的新结果不抢目标。
     // 轮次：后端 state.round_no 是“逻辑轮次”（只有完成后再开始/清空重置才 +1；
@@ -1898,7 +1898,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
             redrawReview = null;
             previewPinned = false;  // 抽卡结果要自动显示
             if (typeof node._adH3Act === "function") {
-                node._adH3Hint?.(`正在重抽第 ${base} 段…`, false);
+                node._adH3Hint?.(`正在本段抽卡（第 ${base} 段，新结果将作为该段当前选用）…`, false);
                 Promise.resolve(node._adH3Act("redo_preview", targetIndex === null ? undefined : {index: targetIndex,preview:{...redoTarget},group_previews:[...Object.values(mediaRecords).flat(),...stripStore.segment].filter(r=>recordRoundNo(r)===recordRoundNo(redoTarget))}))
                     .then(result => { if(request!==redrawRequest)return; if (result === false && !node._adH3ActionCancelled) {
                         redrawPending = null; node._adH3RedoPending = false;
@@ -2419,7 +2419,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         let sourceTag = "";
         if (selected.length) {
             if (selected.length < 2) {
-                node._adH3Hint?.("Ctrl 已选 1 个片段；再选一个，或取消选中后合并当前轮全部片段。", true);
+                node._adH3Hint?.("Ctrl 已选 1 个片段；再选一个，或取消选中后点「合并片段」合并当前轮全部段最新结果。", true);
                 return;
             }
             const sources = new Set(selected.map(item => item.merge_source === "B" ? "B" : "A"));
@@ -2438,7 +2438,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
                 return;
             }
         } else {
-            // 默认合并当前轮；A 端手选版本按后台段位置接入。
+            // 没点选片段：按点击的 A合并/B合并，合并该端当前轮全部段的最新结果（按段号顺序）。
             sourceTag = chosenSource === "B" ? "B" : "A";
             const currentRound = activeRoundNo();
             const latest = new Map();
@@ -2447,10 +2447,6 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
                 if (currentRound > 0 && recordRoundNo(record) !== currentRound) continue;
                 const number = Number(record.segment_index) || 0;
                 if (number > 0) latest.set(number, record);
-            }
-            if (sourceTag === "A" && Number(latestSessionState?.round_no) === currentRound) {
-                preferPickedClips(latest, latestSessionState,
-                    clip => inferMediaKind(clip.file, clip.kind) === "video" && !hiddenResult(clip));
             }
             const total = Math.max(Number(latestSessionState?.segments?.length) || 0, ...latest.keys(), 0);
             const missing = [];
@@ -2665,7 +2661,7 @@ export function createNativePlayer(node, root, mediaUrl, thumbnailUrl, api = {fe
         item.label = recordLabel(item, 0);
         redrawReview = Number(record.segment_index) || pending.index;
         redrawPending = null;
-        node._adH3Hint?.(`第 ${base} 段已重抽完成（${item.label}）；可在预览中选择结果或点「开始」继续。`, false);
+        node._adH3Hint?.(`第 ${base} 段已重抽完成（${item.label}，已作为该段当前选用）；点「开始」继续下一段`, false);
         return true;
     }
     function receive(record) {

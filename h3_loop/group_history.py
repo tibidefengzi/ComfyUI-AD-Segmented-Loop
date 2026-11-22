@@ -66,18 +66,17 @@ def save_snapshot(store,state,number,snapshot):
     atomic_json(contained(store.directory(state['id']),path),snapshot)
     return True
 
-def archive(store,state,*,name=None):
+def archive(store,state):
     number=int(state.get('round_no',1) or 1)
     snapshot=copy.deepcopy(state)
     for key in ('group_snapshots','group_seq','active','execution_round','resume_round','draft_trial'):
         snapshot.pop(key,None)
-    name=name or f'groups/round_{number:06d}.json'
+    name=f'groups/round_{number:06d}.json'
     atomic_json(contained(store.directory(state['id']),name),snapshot)
     state.setdefault('group_snapshots',{})[str(number)]=name
     state['group_seq']=max(int(state.get('group_seq',number)),number)
 
 def version_match(sid,version,record):
-    if record.get('version_id') and record['version_id']!=version.get('id'):return False
     name=str(record.get('file') or '').replace('\\','/')
     named=record.get('session_id');scope=''
     if record.get('origin')=='session':
@@ -120,7 +119,6 @@ def legacy_group(state,number,records):
                        versions=list(match['versions'].values()))
         else:row['versions']=[]
         row.update(selected=None,valid=False,accepted=False)
-        row.pop('manual_version',None)
     candidate['retired_segments']=[]
     candidate['round_no']=number
     return candidate
@@ -139,8 +137,9 @@ def lookup(store,state,number,records):
 
 def restore(store,state,number,records):
     candidate=lookup(store,state,number,records)
+    archive(store,state)
     if not candidate.get("relay_run_id"):
-        candidate["relay_run_id"] = uuid.uuid4().hex
+        candidate["relay_run_id"] = state.get("relay_run_id") or uuid.uuid4().hex
     candidate.update(group_snapshots=copy.deepcopy(state.get('group_snapshots') or {}),
                      group_seq=max(int(state.get('group_seq',1)),int(state.get('round_no',1)),number),
                      epoch=int(state.get('epoch',0))+1,active=None,auto=False,pause_after=False,status='ready',error='')

@@ -12,7 +12,6 @@ import threading
 from urllib.parse import urlsplit
 import uuid
 from collections import OrderedDict
-from contextlib import ExitStack
 import copy
 
 from aiohttp import web
@@ -701,7 +700,7 @@ def _enable_auto_accept(session_id):
         return state
 
 
-def sync_graph_now(data, *, candidate=None):
+def sync_graph_now(data):
     # A 方案：不再因已有 execution_round 直接返回旧快照；每次都用当前画布重新同步，
     # 连线/参数变化从下一次生成起生效。进度由 STORE.sync 按源范围保留。
     prompt = data["prompt"]
@@ -720,8 +719,6 @@ def sync_graph_now(data, *, candidate=None):
         except Exception:
             session_raw = None
     session_id = identifier(session_raw or f"AD-H3-{node_id}")
-    if candidate is not None and session_id != candidate["id"]:
-        raise ValueError("当前页面提交的进度与后台不一致，本次操作已取消；请重新打开工作流后再试。")
     from .workflow_tasks import prompt_task
     task = prompt_task(prompt,node_id,data.get('workflow'))
     try:
@@ -758,11 +755,6 @@ def sync_graph_now(data, *, candidate=None):
     signature, template = template_for(prompt, node_id, {"workflow": data.get("workflow", {})})
     template["client_id"] = data.get("client_id")
     signatures = segment_signatures(prompt, node_id, entries, fps)
-    if candidate is not None:
-        state = STORE.sync(session_id, entries, signatures, template, keep_completed=True, candidate=candidate)
-        if task:
-            state["workflow_task_id"] = task
-        return state
     state = STORE.sync(session_id, entries, signatures, template, keep_completed=True)
     if task:
         with STORE.lock(session_id):
@@ -906,54 +898,6 @@ async def interrupt_prompt(request):
     return web.json_response({"stopped": True})
 
 
-def _resume_after(session_id, data, anchor):
-    from . import group_history, rounds
-
-    with STORE.lock(session_id), ExitStack() as pending:
-        original = STORE._load(session_id)
-        if original.get("status") in {"queued", "running", "merging"} or original.get("draft_trial"):
-            raise ValueError("当前有任务运行，请先停止或等待本段抽卡结束再续跑")
-        preview = data.get("preview") or {}
-        current_group = int(original.get("round_no", 1))
-        group = int(preview.get("round_no") or 0) if "round_no" in preview else current_group
-        if group == current_group:
-            candidate = copy.deepcopy(original)
-        else:
-            candidate = group_history.restore(STORE, original, group, data.get("group_previews") or [preview])
-        anchor = rounds.resolve_resume_anchor(candidate, preview, anchor)
-        rounds.accept_through(candidate, anchor)
-        rounds.select_resume_version(candidate, preview, anchor)
-        prefix = [STORE._selected_version(candidate, row) for row in candidate["segments"][:anchor]]
-        for version in prefix:
-            if not STORE.session_file(session_id, version["file"]).is_file():
-                raise ValueError("该组已通过的前段结果文件缺失，本次没有切换组或推进进度。请先恢复或重做该组前段。")
-        candidate.update(auto_accept=True, auto=False, pause_after=False, active=None, error="")
-        candidate.pop("execution_round", None)
-
-        if candidate["status"] != "completed":
-            candidate = sync_graph_now(data, candidate=candidate)
-            if [row.get("selected") for row in candidate["segments"][:anchor]] != [v["id"] for v in prefix]:
-                raise ValueError("当前分段已变化，无法确认已选版本的位置。请重新选择预览卡。")
-            if candidate["status"] != "completed":
-                # 下一段以保留前缀为准。编辑后旧游标对应的段可能已移位。
-                candidate["cursor"] = anchor
-                candidate = rounds.freeze(candidate, data["prompt"], str(data["segment_node"]),
-                                          data.get("workflow"), True, pending=pending)
-                relay = rounds._relay_choice(data["prompt"], data["segment_node"])
-                rounds.prepare_resume_relay_chain(candidate, prefix, pending, required=bool(relay))
-        if group != current_group:
-            # 当前组的检查点随新进度一起生效。失败时原有快照及其引用仍有效。
-            name = f"groups/round_{current_group:06d}_{uuid.uuid4().hex}.json"
-            group_history.archive(STORE, original, name=name)
-            pending.callback(rounds.discard_pending_file, STORE.directory(session_id) / name)
-            candidate["group_snapshots"] = original["group_snapshots"]
-        state = STORE._save(candidate)
-        pending.pop_all()
-        if state.get("execution_round"):
-            rounds.prune_snapshots(state)
-        return state
-
-
 @routes.post("/aiden_h3/action")
 @guarded
 async def action(request):
@@ -973,7 +917,7 @@ async def action(request):
     if command == "new_group" and not existing:
         state = await sync_from_graph(data)
         return web.json_response(public_state(state))
-    if command != "resume_after" and data.get("auto_accept") and existing and not existing.get("auto_accept"):
+    if data.get("auto_accept") and existing and not existing.get("auto_accept"):
         existing = _enable_auto_accept(session_id)
     if command == "redo_preview" and not data.get("prompt") and existing.get("execution_round"):
         raise ValueError("本段抽卡需要当前编辑内容，请从「分段预览」的「本段抽卡」按钮操作。")
@@ -1012,7 +956,39 @@ async def action(request):
             if anchor <= 0:
                 raise ValueError("请先在「分段生成」里选中要从其后续跑的预览卡")
         if command == "resume_after":
-            state = await asyncio.to_thread(_resume_after, session_id, data, anchor)
+            # 保留已通过前缀，后续段采用最新编辑；选中原末段只标完成。
+            with STORE.lock(session_id):
+                original = STORE._load(session_id)
+                candidate = copy.deepcopy(original)
+                preview=data.get("preview") or {}
+                group=int(preview.get("round_no") or 0) if "round_no" in preview else int(candidate.get("round_no",1))
+                if group!=int(candidate.get("round_no",1)):
+                    from .group_history import restore
+                    candidate=restore(STORE,candidate,group,data.get("group_previews") or [preview])
+                anchor = rounds.resolve_resume_anchor(candidate, data.get("preview"), anchor)
+                rounds.accept_through(candidate, anchor)
+                # 第 anchor 段认用户点选的那一版（不是最新版），作为下一段接力的父版本。
+                resume_version = rounds.select_resume_version(candidate, data.get("preview"), anchor)
+                from .storage import contained
+                for row in candidate["segments"][:anchor]:
+                    version=next(v for v in row["versions"] if v["id"]==row["selected"])
+                    if not contained(STORE.directory(session_id),version["file"]).is_file():
+                        raise ValueError("该组已通过的前段结果文件缺失，本次没有切换组或推进进度。请先恢复或重做该组前段。")
+                # 潜桥：把这一版的 latent 提升到稳定链，下一段才会真的接这一版。
+                # 选中的是最后一段时本轮直接完成，没有下一段，不需要提升。
+                if candidate["status"] != "completed":
+                    rounds.promote_resume_stage(candidate, resume_version, anchor)
+                candidate.update(auto_accept=True, auto=False, pause_after=False, active=None, error="")
+                candidate.pop("execution_round", None)
+                STORE._save(candidate)
+                if candidate["status"] == "completed":
+                    return web.json_response(public_state(candidate))
+                try:
+                    state = sync_graph_now(data)
+                    state = rounds.freeze(state, data["prompt"], str(data["segment_node"]), data.get("workflow"), True)
+                except Exception:
+                    STORE._save(original)
+                    raise
             return web.json_response(public_state(state))
         # 先解除旧轮快照与错误状态，再用最新编辑同步分段并重新冻结。
         with STORE.lock(session_id):

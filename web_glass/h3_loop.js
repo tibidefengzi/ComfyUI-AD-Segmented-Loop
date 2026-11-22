@@ -621,10 +621,6 @@ function mountReview(node) {
         }
         const finish=async({restart=false}={})=>{
             const batch=state.segments.some(row=>row.entry?.batch_source);
-            if(selectedSegment>0 && !batch){
-                say("续跑已完成，可以合并本轮已选用的片段。");
-                return null;
-            }
             try {
                 state=await request("/aiden_h3/action",{command:"clear",session_id:state.id,confirmed:true});
                 safeDraw(state);
