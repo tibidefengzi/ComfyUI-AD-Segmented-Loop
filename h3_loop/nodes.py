@@ -1929,7 +1929,9 @@ class AidenH3VideoPreview:
                 "optional": {"media": ("*",),
                              "对比媒体": ("*",),
                              "context": ("H3_LOOP_CONTEXT",),
-                             "video_oasis_ui": ("STRING", {"default":"{}"}),
+                             # video_oasis_ui 是早期 Video Oasis 播放器的 UI 状态槽，现已不用；
+                             # 不再声明为输入（否则会出现在「添加输入/转换控件」菜单里）。
+                             # preview() 仍保留同名参数默认值，旧工作流/旧提交带上的值照常忽略。
                              "save_config": ("STRING", {"default":"{}"})},
                 "hidden": {"prompt":"PROMPT", "extra_pnginfo":"EXTRA_PNGINFO"}}
 

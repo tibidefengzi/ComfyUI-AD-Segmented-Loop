@@ -822,7 +822,6 @@ export function mountTimelineEditor(node) {
 <div class="h3-recipe-meta"><span data-actual-count>实际 0 段</span><span data-recipe-preview class="h3-recipe-preview"></span></div>
 <div class="h3-smart-row" data-smart-row>
   <button type="button" data-run-affected class="primary" title="选中分段后仅运行所选段；未选择时重跑受影响段，完成后回原进度">运行此段</button>
-  <button type="button" data-new-group class="primary" title="新开一组并从第1段待命；素材、设置与旧成果保留，运行中请先停止">新建一组</button>
   <button type="button" data-import-timed class="primary" title="导入带时间行的文本：一块=一段；切选中的音频/视频轨，无音视频时按时间块建立生成段，并写入各段正向提示词（可撤销）">导入时间文本</button>
   <select data-smart-kind title="选择检测方式">
     <option value="beats-bar">踩节拍 I（小节）</option>
@@ -4946,17 +4945,6 @@ export function mountTimelineEditor(node) {
         syncButtons();
     };
     const runAffectedButton = $("[data-run-affected]");
-    $("[data-new-group]")?.addEventListener("click", async event => {
-        const segment=linkedSegment();
-        if (!segment?._adH3NewGroup) { hint("请先连接「分段生成」与「分段预览」后再新建一组。", true); return; }
-        const button=event.currentTarget;button.disabled=true;
-        try {
-            const state=await segment._adH3NewGroup();
-            if(state===false){hint("未新建一组，请查看「分段预览」中的提示。",true);return;}
-            hint(`已开启第 ${state?.round_no || "新"} 组，从第1段待命；旧成果保留。`);
-        } catch(error) { hint(error.message,true); }
-        finally { button.disabled=false; }
-    });
     if (runAffectedButton && !runAffectedButton.dataset.adH3Bound) {
         runAffectedButton.dataset.adH3Bound = "1";
         runAffectedButton.addEventListener("click", () => {

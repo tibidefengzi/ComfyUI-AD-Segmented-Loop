@@ -14,6 +14,7 @@ import { mountSelfLiftSwitch } from "./selflift_switch.js";
 import { bindTimedPromptInput } from "./timed_prompt_input.js";
 import { mountTimelineEditor, segmentRefCounts, updateSegmentMaterialOutputs, savedTimelineValue } from "./timeline_editor.js";
 import { mountNativePlayer } from "./native_player.js";
+import { migratePreviewWidgetValues } from "./preview_widgets.js";
 import { bindWidgetWidth, fitPreviewContent } from "./dom_layout.js";
 import { installVueNodesGuard } from "./compat_nodes2.js";
 import { mountNodeProgress, updateSessionProgress, installProgressEvents } from "./run_progress.js";
@@ -94,8 +95,11 @@ styles.textContent = `
 .ad-h3-video-actions{display:none;gap:8px;flex-wrap:wrap;align-items:center}
 .ad-h3-loop-hint{width:100%;font-size:12px;color:var(--ad-text-dim);white-space:pre-wrap}
 .ad-h3-loop-hint.error{color:#f87171}
-.ad-h3-loop-actions{display:flex;gap:8px;flex-wrap:wrap;margin:2px 0}
-.ad-h3-loop-actions button{padding:4px 14px;border-radius:6px;border:1px solid #4A80BF;background:#3B7DC4;color:#fff;cursor:pointer;font:600 13px var(--ad-font)}
+.ad-h3-loop-actions{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin:2px 0;align-items:stretch}
+.ad-h3-loop-actions>button,.ad-h3-loop-actions>.ad-h3-merge-wrap>button{padding:8px 18px;border-radius:10px;border:1px solid #4A80BF;background:#3B7DC4;color:#fff;cursor:pointer;font:600 26px var(--ad-font);line-height:1.2;min-height:50px;white-space:nowrap;display:inline-flex;align-items:center;justify-content:center;width:100%}
+.ad-h3-loop-actions>.ad-h3-merge-wrap{display:flex;min-width:0}
+.ad-h3-loop-actions>.ad-h3-merge-wrap>button{flex:1 1 auto}
+.ad-h3-loop-hint{grid-column:1/-1;width:auto}
 .ad-h3-loop-actions button:hover{background:#326BA8}
 .ad-h3-tabs{display:flex;gap:6px;margin:2px 0}
 .ad-h3-tabs button{padding:4px 16px;border-radius:6px;border:1px solid var(--ad-border);background:transparent;color:var(--ad-text-dim);cursor:pointer;font:600 13px var(--ad-font)}
@@ -1729,10 +1733,21 @@ function setupNode(node) {
       setTimeout(applyPreviewInputLabels, 0);
       setTimeout(applyPreviewInputLabels, 600);
       const previewConfigure=node.onConfigure;
-      node.onConfigure=function(){const out=previewConfigure?.apply(this,arguments);normalizePreviewInputs();applyPreviewInputLabels();return out;};
+      // 旧工作流：两个控件位置值是 [video_oasis_ui, save_config]；video_oasis_ui 已移除，
+      // 把第二个值挪回 save_config，避免保存目录/模板被旧 UI JSON 覆盖。
+      const migratePreviewWidgets=()=>{
+        const migrated=migratePreviewWidgetValues(node.widgets_values);
+        if(migrated===node.widgets_values) return;
+        node.widgets_values=migrated;
+        const widget=(node.widgets||[]).find(item=>item.name==="save_config");
+        if(widget&&migrated.length) widget.value=migrated[0];
+      };
+      node.onConfigure=function(){const out=previewConfigure?.apply(this,arguments);migratePreviewWidgets();normalizePreviewInputs();applyPreviewInputLabels();return out;};
       const saveWidget=node.widgets?.find(widget=>widget.name==="save_config");
       if(saveWidget){saveWidget.type="hidden";saveWidget.computeSize=()=>[0,-4];saveWidget.hidden=true;}
       mountNativePlayer(node,api);mountReview(node);
+      // 操作栏按钮加大后可能让内容比节点高：布局稳定后按内容补高一次（只增不减）。
+      requestAnimationFrame(() => { node._adH3FitHeight?.(); requestAnimationFrame(() => node._adH3FitHeight?.()); });
     }
     if(node.comfyClass==="AidenH3Segment"){
         const token=node.widgets?.find(widget=>widget.name==="run_token");
