@@ -461,7 +461,7 @@ def apply_materials(prompt, node_id, materials, fallback=None):
     return result
 
 
-def freeze(state, prompt, node_id, workflow=None, batch=False, materials=None):
+def freeze(state, prompt, node_id, workflow=None, batch=False, materials=None, scanned=None):
     sid = state["id"]
     with STORE.lock(sid):
         current = STORE._load(sid)
@@ -478,7 +478,7 @@ def freeze(state, prompt, node_id, workflow=None, batch=False, materials=None):
         graph[str(node_id)]["inputs"].pop("run_token", None)
         material_state = copy.deepcopy(materials) if materials is not None else capture_materials(graph, node_id)
         # 素材清单只扫一次：快照、缺失记录、指纹变化都复用这一次结果。
-        manifest, absent = scan_assets(graph)
+        manifest, absent = scanned if scanned is not None else scan_assets(graph)
         # 素材指纹按会话留存：上一轮的 execution_round 会在提交结束时清掉，
         # 所以对比用会话里的指纹，而不是只依赖旧快照。
         last = {str(path): tuple(value) for path, value in (current.get("asset_fingerprints") or {}).items()}
@@ -697,6 +697,43 @@ def frozen_timeline(snapshot, node_id):
     return state if state.get("version") else None
 
 
+def _segment_relay_context(graph, node_id):
+    """提取分段节点的潜桥上下文帧数；未启用潜桥时返回 0。"""
+    inputs = ((graph or {}).get(str(node_id)) or {}).get("inputs") or {}
+    mode = str(inputs.get("生成方式") or "").strip()
+    if not (("潜桥" in mode) or mode.startswith(("1", "2"))):
+        return 0
+    raw = str(inputs.get("潜桥上下文帧数") or "22").strip()
+    try:
+        value = int(raw.split()[0]) if raw else 22
+    except (TypeError, ValueError):
+        value = 22
+    return value if value > 0 else 22
+
+
+def _rollback_session_state(sid, prior_state, snapshot_file=None):
+    """必需素材缺失或循环冲突被跳过时，原样回滚本次提交前的会话进度与快照。"""
+    with STORE.lock(sid):
+        if snapshot_file:
+            try:
+                (STORE.directory(sid) / snapshot_file).unlink(missing_ok=True)
+            except OSError:
+                pass
+        if prior_state is not None:
+            atomic_json(STORE.directory(sid) / "progress.json", prior_state)
+        else:
+            directory = STORE.directory(sid)
+            try:
+                (directory / "progress.json").unlink(missing_ok=True)
+            except OSError:
+                pass
+            try:
+                if directory.is_dir() and not any(directory.iterdir()):
+                    directory.rmdir()
+            except OSError:
+                pass
+
+
 def _prepare(data):
     from .routes import sync_graph_now
     prompt = copy.deepcopy(data.get("prompt") or {})
@@ -727,17 +764,48 @@ def _prepare(data):
         if not sid:
             continue  # 无清单的独立模式保持原有行为。
         try:
-            state = STORE.read(sid)
+            disk_state = STORE.read(sid)
         except FileNotFoundError:
-            state = None
+            disk_state = None
+        prior_state = copy.deepcopy(disk_state)
+        state = disk_state
         from .workflow_tasks import prompt_task
         task = prompt_task(prompt, node_id, data.get("workflow"))
         if task and (state or {}).get("workflow_task_id") not in {None, task}:
             # 换了工作流/换了素材：不复用旧任务进度，按新的一轮继续，而不是拦住用户。
             state = None
         trial = (state or {}).get("draft_trial")
+        created_snapshot_file = None
         if trial:
             state = STORE.read(trial["session_id"])
+            snapshot = read_snapshot(state)
+            if not snapshot:
+                continue
+            index = current_index(state)
+            timeline = frozen_timeline(snapshot, node_id)
+            relay_ctx = _segment_relay_context(snapshot.get("prompt"), node_id)
+            if timeline is not None:
+                from .material_guard import material_paths, required_paths
+                required = required_paths(timeline, index, relay_context=relay_ctx)
+                absent = set(snapshot.get("missing_assets") or [])
+                missing_required = [(label, path) for path, label in required.items() if path in absent]
+                if missing_required:
+                    skipped.append((index, missing_required))
+                    names = "、".join(sorted({label for label, _ in missing_required}))
+                    warnings.append("第 %d 段缺 %d 个素材文件：%s，本段已跳过"
+                                    % (index + 1, len(missing_required), names))
+                    if node_id in draft:
+                        removed.update(component(draft, node_id))
+                    continue
+                known = material_paths(timeline)
+                optional = sorted(path for path in absent if path in known and path not in required)
+                if optional:
+                    warnings.append("第 %d 段可选素材缺失，已跳过：%s"
+                                    % (index + 1, "、".join(Path(path).name for path in optional)))
+                for path in snapshot.get("asset_changes") or []:
+                    label = required.get(str(path))
+                    if label:
+                        warnings.append("%s 文件已变，第 %d 段起用新内容，接缝可能跳" % (label, index + 1))
         else:
             if node_id not in prompt:
                 continue  # 已拆掉连线：本轮不生成这一段。
@@ -749,6 +817,7 @@ def _prepare(data):
                 state["status"] = "idle"
                 state["active"] = {}
                 STORE._save(state)
+                prior_state = copy.deepcopy(STORE.read(sid))
             # 下一段重新读取画布，不把旧组素材重新覆盖到最新编辑。
 
             # 本轮绑定优先于画布 queue_state 里的旧会话名，避免改线后串到别的会话。
@@ -765,35 +834,43 @@ def _prepare(data):
             else:
                 draft.setdefault(node_id, {}).setdefault("inputs", {})["session_id"] = sid
             state = sync_graph_now({**data, "prompt": draft, "segment_node": node_id})
-            state = freeze(state, draft, node_id, data.get("workflow"))
-        snapshot = read_snapshot(state)
-        if not snapshot:
-            continue
-        index = current_index(state)
-        timeline = frozen_timeline(snapshot, node_id)
-        if timeline is not None:
-            from .material_guard import material_paths, required_paths
-            required = required_paths(timeline, index)
-            absent = set(snapshot.get("missing_assets") or [])
-            missing_required = [(label, path) for path, label in required.items() if path in absent]
-            if missing_required:
-                # 必需素材缺失：只跳过这一个循环并带段号提示，不再整次回退。
-                skipped.append((index, missing_required))
-                names = "、".join(sorted({label for label, _ in missing_required}))
-                warnings.append("第 %d 段缺 %d 个素材文件：%s，本段已跳过"
-                                % (index + 1, len(missing_required), names))
-                if node_id in draft:
-                    removed.update(component(draft, node_id))
+            index = current_index(state)
+            graph_draft = component(draft, node_id)
+            scanned = scan_assets(graph_draft)
+            timeline = frozen_timeline({"prompt": graph_draft}, node_id)
+            relay_ctx = _segment_relay_context(graph_draft, node_id)
+            required = {}
+            if timeline is not None:
+                from .material_guard import material_paths, required_paths
+                required = required_paths(timeline, index, relay_context=relay_ctx)
+                absent = set(scanned[1] or [])
+                missing_required = [(label, path) for path, label in required.items() if path in absent]
+                if missing_required:
+                    # 必需素材缺失：不落盘新快照、不覆盖旧指纹、不改动旧进度，只跳过该循环。
+                    _rollback_session_state(sid, prior_state)
+                    skipped.append((index, missing_required))
+                    names = "、".join(sorted({label for label, _ in missing_required}))
+                    warnings.append("第 %d 段缺 %d 个素材文件：%s，本段已跳过"
+                                    % (index + 1, len(missing_required), names))
+                    if node_id in draft:
+                        removed.update(graph_draft)
+                    continue
+            state = freeze(state, draft, node_id, data.get("workflow"), scanned=scanned)
+            created_snapshot_file = (state.get("execution_round") or {}).get("file")
+            snapshot = read_snapshot(state)
+            if not snapshot:
                 continue
-            known = material_paths(timeline)
-            optional = sorted(path for path in absent if path in known and path not in required)
-            if optional:
-                warnings.append("第 %d 段可选素材缺失，已跳过：%s"
-                                % (index + 1, "、".join(Path(path).name for path in optional)))
-            for path in snapshot.get("asset_changes") or []:
-                label = required.get(str(path))
-                if label:
-                    warnings.append("%s 文件已变，第 %d 段起用新内容，接缝可能跳" % (label, index + 1))
+            if timeline is not None:
+                absent = set(snapshot.get("missing_assets") or [])
+                known = material_paths(timeline)
+                optional = sorted(path for path in absent if path in known and path not in required)
+                if optional:
+                    warnings.append("第 %d 段可选素材缺失，已跳过：%s"
+                                    % (index + 1, "、".join(Path(path).name for path in optional)))
+                for path in snapshot.get("asset_changes") or []:
+                    label = required.get(str(path))
+                    if label:
+                        warnings.append("%s 文件已变，第 %d 段起用新内容，接缝可能跳" % (label, index + 1))
         # 当前连线即使已拆开，也使用被冻结的端口编号和全部节点参数。
         if node_id in draft:
             removed.update(component(draft, node_id))
@@ -808,6 +885,8 @@ def _prepare(data):
         conflict = any(frozen[key] != replacements[key] for key in set(frozen) & set(replacements))
         if conflict:
             # 一个循环的冲突只跳过这个循环，不再让整次提交（含另一个循环）回退。
+            if not trial:
+                _rollback_session_state(sid, prior_state, created_snapshot_file)
             warnings.append("两套分段循环共享的节点设置不同，已跳过其中一个循环；请分别运行")
             continue
         replacements.update(frozen)

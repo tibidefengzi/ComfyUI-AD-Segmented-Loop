@@ -292,7 +292,7 @@ def restore_audio(picture, output, directory, versions):
     """按顺序恢复保存的音频采样，不用画面网格裁剪原始音频。"""
     if not all(v.get("audio_file") for v in versions):
         raise ValueError("旧结果缺少原始音频采样，请重做后再合并；不会静默裁剪或补齐音频")
-    from .assets import ffmpeg_executable
+    from .assets import ffmpeg_executable, ffmpeg_watchdog
     executable = ffmpeg_executable()
     if executable is None:
         raise ValueError("需要 FFmpeg 来封装音轨，请将 FFmpeg 加入 PATH 或安装 imageio-ffmpeg")
@@ -305,6 +305,7 @@ def restore_audio(picture, output, directory, versions):
         encoder=subprocess.Popen([executable,"-v","error","-nostdin","-n","-f","f32le","-ar","48000","-ac",str(channels),
                                   "-i","pipe:0","-c:a","aac","-b:a","192k",str(soundtrack)],
                                  stdin=subprocess.PIPE,stdout=subprocess.DEVNULL,stderr=log,creationflags=creationflags)
+        guard, guard_state = ffmpeg_watchdog(encoder, 3600)
         samples=0
         try:
             from scipy.signal import resample_poly
@@ -327,6 +328,10 @@ def restore_audio(picture, output, directory, versions):
             if encoder.poll() is None:encoder.kill()
             encoder.wait()
             raise
+        finally:
+            guard.cancel()
+        if guard_state["timeout"]:
+            raise ValueError("原始音轨封装超时（超过 1 小时），已终止；请检查分段文件或缩短时长")
     result=subprocess.run([executable,"-v","error","-nostdin","-n","-i",str(picture),"-i",str(soundtrack),
                            "-map","0:v:0","-map","1:a:0","-c","copy","-shortest","-movflags","+faststart",str(output)],
                           capture_output=True,creationflags=creationflags,timeout=120)

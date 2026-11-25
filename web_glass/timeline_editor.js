@@ -231,7 +231,7 @@ function migrateLegacy(config) {
 
     const tracks = (config.tracks || []).filter(track => track && track.editor?.exec?.track_file);  // v2
     if (!tracks.length) return empty;
-    if (tracks.length > 5) throw new Error(`旧清单有 ${tracks.length} 条音轨，超过当前 5 条上限，无法自动迁移；时间线暂显示为空，请不要保存覆盖原工作流，先备份并联系作者处理。`);
+    if (tracks.length > 3) throw new Error(`旧清单有 ${tracks.length} 条音轨，超过当前 3 条上限，无法自动迁移；时间线暂显示为空，请不要保存覆盖原工作流，先备份并联系作者处理。`);
     const parsed = tracks.map(track => {
         const exec = track.editor.exec, duration = Number(exec.duration) || 0;
         const start = Number(track.trim_start || 0), end = Number(track.trim_end ?? duration);
@@ -253,7 +253,7 @@ function migrateLegacy(config) {
     const grid = [];
     let cursor = 0;
     for (const [a, b] of parsed[primary].cuts) { cursor += b - a; grid.push(snapFrame(cursor)); }
-    const lanes = Array.from({length:Math.max(3,tracks.length)},()=>[]);
+    const lanes = Array.from({length:3},()=>[]);
     let companion = 0;
     const sources = parsed.map((item, i) => ({ id: uid("m"), kind: "audio", origin: "input", file: item.file, name: item.name, duration: item.duration }));
     parsed.forEach((item, i) => {

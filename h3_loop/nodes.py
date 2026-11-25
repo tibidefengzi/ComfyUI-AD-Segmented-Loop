@@ -733,7 +733,7 @@ def _relay_stage_file(run_id, stage_index):
 
 
 def _require_parent_relay_stage(run_id, index, label="", reanchor=False):
-    """普通续接使用上一段，重锚定使用该轮第 1 段。"""
+    """续接与软重置重锚定默认都读取上一段 latent；显式传入 reanchor=True 时兼容旧第 1 段校验。"""
     previous = relay_parent_stage(int(index), reanchor)
     if previous is None:
         return
@@ -833,12 +833,11 @@ def relay_plan(target, context, mode=None):
 
 
 def _effective_relay_context(relay_context, index, reanchor):
-    """第 1 段固定 5 帧；第 2 段起（含重锚定）统一按用户选择的 C 预卷/裁头。
+    """第 1 段固定 5 帧；第 2 段起（含软重置重锚定）统一按用户选择的 C 预卷/裁头。
 
-    v0.5.54：重锚定只改变“桥接方式”（桥 stage_index=0 直通，不读上一段/第 1 段 latent），
-    不再把预卷压到 5 帧。生成窗口同样前移 C 帧、输出时裁掉 C 帧——前 C 帧是模型自己
-    从源画面热身生成的画面，丢弃后成片从稳定帧开始（消除冷启动回闪），同时因为不继承
-    上一段生成 latent，不会出现“越跑越糊/质感复利”。第 1 段没有前序内容可预卷，仍固定 5。
+    重锚定采用软重置：仍接上一段 latent 保留运动与机位，把上下文视频流换成上一段成片尾 C 帧的
+    VAE 重编码（无 VAE 或成片不可读时退回直接 latent 续接），生成=输出+C、裁头 C，断掉画质复利。
+    第 1 段没有前序内容可预卷，仍固定 5。
     """
     context = int(relay_context or 0)
     if context <= 0:
@@ -999,9 +998,11 @@ def _chain_color_stats(entries):
         return None
     if not all((key[0], key[1])):
         return None
-    cached = _CHAIN_COLOR_CACHE.get(key)
-    if cached is not None:
-        return dict(cached)
+    with _CACHE_LOCK:
+        cached = _CHAIN_COLOR_CACHE.get(key)
+        if cached is not None:
+            _CHAIN_COLOR_CACHE.move_to_end(key)
+            return dict(cached)
     try:
         start = float(source.get("src_in") or 0.0)
         normalized = normalize_source({**source, "kind": "video"})
@@ -1010,9 +1011,11 @@ def _chain_color_stats(entries):
         if frame is None or len(frame) == 0:
             return None
         stats = reference_frame_stats(frame[0], normalized, round(start * FPS))
-        if len(_CHAIN_COLOR_CACHE) > 16:
-            _CHAIN_COLOR_CACHE.clear()
-        _CHAIN_COLOR_CACHE[key] = stats
+        with _CACHE_LOCK:
+            _CHAIN_COLOR_CACHE[key] = stats
+            _CHAIN_COLOR_CACHE.move_to_end(key)
+            while len(_CHAIN_COLOR_CACHE) > 16:
+                _CHAIN_COLOR_CACHE.popitem(last=False)
         return dict(stats)
     except Exception as exc:
         debug_log("[AD-颜色] 全链统一色彩目标读取失败：%r" % (exc,))
@@ -1414,7 +1417,7 @@ class AidenH3Segment:
                              "ref_counts": ("STRING", {"default": "{}", "tooltip": "动态参考口数量（前端自动写入）"}),
                              "潜桥模式": (list(RELAY_MODES), {"default": "关闭", "tooltip": "关闭=原有逐段生成；普通多参考=自选17倍数段长做潜桥；动作迁移预卷=源视频动作迁移/人物替换，前置预卷后裁头，保持65帧等任意目标帧数"}),
                              "潜桥上下文帧数": (list(RELAY_CONTEXTS), {"default": "22", "tooltip": "旧参数：兼容旧工作流，前端会自动迁移"}),
-                             "潜桥重锚定": (list(RELAY_REANCHOR_CHOICES), {"default": "0 · 不重锚定", "tooltip": "每 N 段按独立段重新生成（第 N、2N…段：桥不读上一段/第 1 段 latent，跳过外观/历史锚）；预卷/裁头与潜桥续接一致：生成=输出+C、裁头C（前 C 帧为模型热身，裁掉不进成片）。既不继承上一段 latent（不产生质感复利），又保留正常预卷（成片从稳定帧开始，接缝不闪跳）；第 1 段因无前序内容固定 5 帧。0=关闭"}),
+                             "潜桥重锚定": (list(RELAY_REANCHOR_CHOICES), {"default": "0 · 不重锚定", "tooltip": "每 N 段做一次软重置：仍接上一段 latent 保留运动与机位，把上下文视频流换成上一段成片尾 C 帧的 VAE 重编码（无 VAE 或成片不可读时退回直接 latent 续接），生成=输出+C、裁头 C，断掉逐段画质复利；第 1 段固定 +5 帧。0=关闭"}),
                          "参考首帧色彩匹配": (list(_COLOR_MATCH_CHOICES), {"default": "0 · 关闭", "tooltip": "关闭=不校正；跟随源片=逐段按本段参考首帧校正，并限制相邻段偏移（保留真实明暗/色温变化）；全链统一（第1段）=所有段固定往第1段参考首帧拉，仅适合光照固定的素材。整段固定偏移、不逐帧自动增益、不做 VAE 往返。"})},
                 "hidden": {"prompt": "PROMPT", "unique_id": "UNIQUE_ID", "extra_pnginfo": "EXTRA_PNGINFO"}}
 
@@ -1566,10 +1569,8 @@ class AidenH3Segment:
         relay_run_id = ""
         relay_target = 0
         relay_targets = []
-        # v0.5.51：重锚定=独立生成 + 正常预卷。预卷/裁头照常按潜桥续接 C 计算
-        # （第 1 段固定 5、第 2 段起=C）；重锚定只改变“桥接方式”（桥 stage_index=0
-        # 直通，不读上一段/第 1 段 latent），因此不会再出现“第 1 段画面串入”；
-        # 前 C 帧是模型自己热身生成的画面，输出时裁掉 ⇒ 成片首帧稳定、且质感不复利。
+        # v0.5.66：重锚定=软重置 + 正常预卷（第 1 段固定 5、第 2 段起=C）：
+        # 仍读上一段 latent 保留运动/机位，上下文视频流改用上一段成片尾 C 帧重编码，断掉逐段画质复利。
         color_match_cfg = _color_match_config(kwargs.get("参考首帧色彩匹配"))
         color_match_blend = float(color_match_cfg.get("blend") or 0.0)
         color_match_chain = bool(color_match_cfg.get("chain"))
@@ -2470,11 +2471,15 @@ NODE_DISPLAY_NAME_MAPPINGS = {
 #   · 声锚   = voice_anchor_stage=0，用第 1 段的音频 latent 作为音色锚。
 # v0.5.50：删除无效/未验证选项（锚定强度、历史锚、声锚）；保留实测有效的 外观锚/整段校正，
 # 新增 桥接模式（像素质量复位）与 质感还原。
+from collections import OrderedDict as _OrderedDict
+import threading as _threading
+
 ANCHOR_DEFAULTS = {"appearance": 3, "segment_correction": 0.0, "texture_restore": 0.0, "bridge_mode": 0, "reanchor_guide": 0}
 ANCHOR_APPEARANCE_STEPS = (0, 1, 2, 3, 5, 7, 10)
 ANCHOR_GUIDE_STEPS = (0, 5, 22, 39, 56)
-_CHAIN_COLOR_CACHE = {}
-_ANCHOR_STAGE_CACHE = {}
+_CACHE_LOCK = _threading.Lock()
+_CHAIN_COLOR_CACHE = _OrderedDict()
+_ANCHOR_STAGE_CACHE = _OrderedDict()
 
 
 def parse_anchor_config(raw):
@@ -2519,15 +2524,19 @@ def _anchor_stage_latent(run_id, stage_index, *, first_pass=False):
         raise FileNotFoundError(str(path))
     stat = path.stat()
     key = (str(path), int(stat.st_mtime_ns), int(stat.st_size), first_pass)
-    cached = _ANCHOR_STAGE_CACHE.get(key)
-    if cached is not None:
-        return cached
+    with _CACHE_LOCK:
+        cached = _ANCHOR_STAGE_CACHE.get(key)
+        if cached is not None:
+            _ANCHOR_STAGE_CACHE.move_to_end(key)
+            return cached
     from ._relay_vendor import relay_core as _relay_core
     latent = (_relay_core.load_av_latent(str(path), first_pass=True) if first_pass
               else _relay_core.load_av_latent(str(path)))
-    if len(_ANCHOR_STAGE_CACHE) >= 8:
-        _ANCHOR_STAGE_CACHE.clear()
-    _ANCHOR_STAGE_CACHE[key] = latent
+    with _CACHE_LOCK:
+        _ANCHOR_STAGE_CACHE[key] = latent
+        _ANCHOR_STAGE_CACHE.move_to_end(key)
+        while len(_ANCHOR_STAGE_CACHE) > 8:
+            _ANCHOR_STAGE_CACHE.popitem(last=False)
     return latent
 
 
@@ -3263,7 +3272,7 @@ def _apply_texture_restore(images, ctx, anchor_config="{}"):
     return corrected
 
 
-_SEAM_PREV_CACHE = {}
+_SEAM_PREV_CACHE = _OrderedDict()
 _SEAM_PREV_CACHE_LIMIT = 16
 _SEAM_LUMA_GAIN_MIN = 0.8
 _SEAM_LUMA_GAIN_MAX = 1.25
@@ -3273,18 +3282,20 @@ _SEAM_DEFLICKER_WINDOW = 48
 
 
 def _seam_cache_get(key):
-    """真 LRU：命中后把键移到末尾（dict 插入序）。"""
-    if key not in _SEAM_PREV_CACHE:
-        return None
-    value = _SEAM_PREV_CACHE.pop(key)
-    _SEAM_PREV_CACHE[key] = value
-    return value
+    """真 LRU：命中后把键移到末尾（加锁线程安全）。"""
+    with _CACHE_LOCK:
+        if key not in _SEAM_PREV_CACHE:
+            return None
+        _SEAM_PREV_CACHE.move_to_end(key)
+        return _SEAM_PREV_CACHE[key]
 
 
 def _seam_cache_put(key, value):
-    _SEAM_PREV_CACHE[key] = value
-    while len(_SEAM_PREV_CACHE) > _SEAM_PREV_CACHE_LIMIT:
-        _SEAM_PREV_CACHE.pop(next(iter(_SEAM_PREV_CACHE)))
+    with _CACHE_LOCK:
+        _SEAM_PREV_CACHE[key] = value
+        _SEAM_PREV_CACHE.move_to_end(key)
+        while len(_SEAM_PREV_CACHE) > _SEAM_PREV_CACHE_LIMIT:
+            _SEAM_PREV_CACHE.popitem(last=False)
 
 
 def _last_frame_channel_means(path, count=_SEAM_TARGET_FRAMES):

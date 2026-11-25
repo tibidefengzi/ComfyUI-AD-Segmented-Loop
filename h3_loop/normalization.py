@@ -7,12 +7,34 @@ from pathlib import Path
 import subprocess
 import threading
 import uuid
+import weakref
 
 from .storage import ROOT, atomic_json, contained, digest
 
 POLICY = "h3-24fps-video864-image2160-pad32-v1"
+
+
+class _WeakLock:
+    __slots__ = ("_lock", "__weakref__")
+
+    def __init__(self):
+        self._lock = threading.Lock()
+
+    def __enter__(self):
+        return self._lock.__enter__()
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        return self._lock.__exit__(exc_type, exc_val, exc_tb)
+
+    def acquire(self, *args, **kwargs):
+        return self._lock.acquire(*args, **kwargs)
+
+    def release(self):
+        return self._lock.release()
+
+
 _LOCK = threading.Lock()
-_LOCKS = {}
+_LOCKS: weakref.WeakValueDictionary[str, _WeakLock] = weakref.WeakValueDictionary()
 
 
 def normalized_root(origin: str) -> Path:
@@ -128,7 +150,10 @@ def normalize_source(source, progress=lambda fraction: None):
     stat = path.stat()
     key = digest([POLICY, str(path.resolve()), stat.st_size, stat.st_mtime_ns, kind])
     with _LOCK:
-        lock = _LOCKS.setdefault(key, threading.Lock())
+        lock = _LOCKS.get(key)
+        if lock is None:
+            lock = _WeakLock()
+            _LOCKS[key] = lock
     origin = source.get("origin") if source.get("origin") in {"input", "media"} else "media"
     root = normalized_root(origin)
     root.mkdir(parents=True, exist_ok=True)

@@ -54,7 +54,29 @@ def blocked_state_message(status) -> str:
     if status == "merging":
         return "片段正在合并，请等待合并完成；不会自动清空进度"
     return f"当前进度状态异常（{status or '未知'}），无法开始新的分段；请在「分段预览」点「彻底重置」或重新打开工作流后再试；不会自动清空进度"
-_LOCKS: dict[str, threading.RLock] = {}
+import weakref as _weakref
+
+
+class _WeakRLock:
+    __slots__ = ("_lock", "__weakref__")
+
+    def __init__(self):
+        self._lock = threading.RLock()
+
+    def __enter__(self):
+        return self._lock.__enter__()
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        return self._lock.__exit__(exc_type, exc_val, exc_tb)
+
+    def acquire(self, *args, **kwargs):
+        return self._lock.acquire(*args, **kwargs)
+
+    def release(self):
+        return self._lock.release()
+
+
+_LOCKS: _weakref.WeakValueDictionary[str, _WeakRLock] = _weakref.WeakValueDictionary()
 _GUARD = threading.Lock()
 _MIGRATING = False
 
@@ -177,7 +199,11 @@ class SessionStore:
     def lock(self, session_id):
         key = str(self.directory(session_id).resolve())
         with _GUARD:
-            return _LOCKS.setdefault(key, threading.RLock())
+            lock = _LOCKS.get(key)
+            if lock is None:
+                lock = _WeakRLock()
+                _LOCKS[key] = lock
+            return lock
 
     def state_path(self, session_id):
         path = self.directory(session_id) / "progress.json"

@@ -283,9 +283,27 @@ async def watch_prompt(session_id, token, prompt_id):
         print(f"AidenH3: 等待任务结果时出错，已停止监听本次任务：{exc}")
 
 
-def _discard_merge_intermediates(directory, merge_id):
-    """合并中间目录只服务本次合并，成功/失败都可回收，避免会话目录无限增长。"""
-    shutil.rmtree(Path(directory) / ("finishing_" + str(merge_id)), ignore_errors=True)
+def _discard_merge_intermediates(directory, merge_id, *, succeeded=False):
+    """合并中间产物只服务本次合并：成功时连同日志一并回收，失败时保留 .log 便于排查。"""
+    root = Path(directory)
+    mid = str(merge_id)
+    shutil.rmtree(root / ("finishing_" + mid), ignore_errors=True)
+    targets = [
+        root / f"picture_{mid}.mp4",
+        root / f"soundtrack_merged_{mid}.m4a",
+        root / f"soundtrack_{mid}.m4a",
+    ]
+    if succeeded:
+        targets.extend([
+            root / f"picture_{mid}.log",
+            root / f"soundtrack_merged_{mid}.log",
+            root / f"soundtrack_{mid}.log",
+        ])
+    for item in targets:
+        try:
+            item.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def merge_session(session_id):
@@ -306,6 +324,7 @@ def merge_session(session_id):
         STORE._save(state)
     directory = STORE.directory(session_id)
     merge_id = uuid.uuid4().hex
+    succeeded = False
     try:
         paths = prepare_merge(paths, versions, directory, directory/("finishing_"+merge_id), options)
         out = directory / ("merged_" + merge_id + ".mp4")
@@ -348,10 +367,12 @@ def merge_session(session_id):
         with STORE.lock(session_id):
             state = STORE._load(session_id)
             state.update(status="completed", auto=False, merged=out.name, manifest=manifest_name, error="")
-            return STORE._save(state)
+            saved = STORE._save(state)
+            succeeded = True
+            return saved
     except Exception as exc:
         STORE.fail(session_id, exc)
         raise
     finally:
-        # finishing_<id> 是本次合并的可重建中间产物：成功或失败都回收，避免会话目录无限增长。
-        _discard_merge_intermediates(directory, merge_id)
+        # finishing_<id> 与合并中间音视频文件为可重建产物：成功或失败都回收，避免会话目录膨胀。
+        _discard_merge_intermediates(directory, merge_id, succeeded=succeeded)

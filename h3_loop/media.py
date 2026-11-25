@@ -129,7 +129,7 @@ def normalize_video(video,context,state,directory,strict_sync=False):
     try:
         from .color_match import apply_reference_color_match
         color_mode=context.get("color_match_mode") or ("chain" if context.get("color_match_chain") else "follow")
-        previous_color=_previous_color_match(current,context.get("index")) if color_mode=="follow" else None
+        previous_color=_previous_color_match(state,context.get("index")) if color_mode=="follow" else None
         body,color_info=apply_reference_color_match(
             body,context.get("color_match_reference"),context.get("color_match_blend") or 0.0,
             previous=previous_color,smooth=(color_mode=="follow"))

@@ -773,23 +773,12 @@ def sync_graph_now(data):
 async def save_to_desktop(request):
     """兼容旧前端的“保存”入口：保存路径留空时按媒体类型归档到生成目录。"""
     import shutil
-    from pathlib import Path
     data = await request.json()
     origin = str(data.get("origin") or "media")
     name = str(data.get("file") or "")
     if not name:
         raise ValueError("缺少文件名")
-    import folder_paths
-    input_root = Path(folder_paths.get_input_directory())
-    output_root = Path(folder_paths.get_output_directory())
-    roots={"input":[input_root,input_root/layout.INPUT_LIBRARY,input_root/layout.LEGACY_INPUT_LIBRARY],"output":[output_root],
-           "media":[Path(ROOT)/"media",input_root/layout.INPUT_LIBRARY,input_root/layout.LEGACY_INPUT_LIBRARY],"session":[STORE.root]}
-    if origin not in roots:
-        raise ValueError("无法识别的素材来源，请重新导入或重新选择素材。")
-    candidates=[contained(root,name) for root in roots[origin]]
-    source = next((path for path in candidates if path.is_file()), None)
-    if source is None:
-        raise ValueError(f"找不到素材文件：{name}")
+    source = _resolve_media_path(origin, name)
     from .save_target import default_directory, kind_for_path
     target_dir = default_directory(kind_for_path(source))
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -1088,27 +1077,34 @@ async def recommend_cuts(request):
     return web.json_response({"suggestions":suggestions})
 
 
-def _resolve_media_path(origin: str, name: str):
+def _media_candidates(origin: str, name: str):
+    """按来源构造经过 contained 校验的候选路径（兼容新旧素材库与历史数据根）。"""
     from . import layout
-    if origin == "input":
-        path = layout.resolve_input_file(name)
-        if path is not None:
-            return path
-    elif origin == "output":
-        path = layout.resolve_output_file(name)
-        if path is not None:
-            return path
+    from .storage import data_roots
     import folder_paths
-    from pathlib import Path
     input_root = Path(folder_paths.get_input_directory())
     output_root = Path(folder_paths.get_output_directory())
-    roots = {"input": [input_root, input_root / layout.INPUT_LIBRARY, input_root / layout.LEGACY_INPUT_LIBRARY],
-             "output": [output_root],
-             "media": [Path(ROOT) / "media", input_root / layout.INPUT_LIBRARY, input_root / layout.LEGACY_INPUT_LIBRARY],
-             "session": [STORE.root]}
+    roots = {
+        "input": [input_root, input_root / layout.INPUT_LIBRARY, input_root / layout.LEGACY_INPUT_LIBRARY],
+        "output": [output_root],
+        "media": ([Path(root) / "media" for root in data_roots()]
+                  + [input_root / layout.INPUT_LIBRARY, input_root / layout.LEGACY_INPUT_LIBRARY]),
+        "session": [STORE.root] + [Path(root) / "sessions" for root in data_roots()[1:]],
+    }
     if origin not in roots:
         raise ValueError("无法识别的素材来源，请重新导入或重新选择素材。")
-    source = next((path for path in (contained(root, name) for root in roots[origin]) if path.is_file()), None)
+    resolved = None
+    if origin == "input":
+        resolved = layout.resolve_input_file(name)
+    elif origin == "output":
+        resolved = layout.resolve_output_file(name)
+    checked = [contained(root, name) for root in roots[origin]]
+    return ([resolved] + checked) if resolved is not None else checked
+
+
+def _resolve_media_path(origin: str, name: str):
+    candidates = _media_candidates(origin, name)
+    source = next((path for path in candidates if path.is_file()), None)
     if source is None:
         raise ValueError(f"找不到素材文件：{name}")
     return source
@@ -1345,24 +1341,8 @@ async def media(request):
     from .assets import AUDIO_EXTS, IMAGE_EXTS, VIDEO_EXTS
     origin = request.match_info["origin"]
     name = request.match_info["file"]
-    if origin == "output":
-        # 生成目录直读：优先按布局解析（新/旧生成库），找不到再回退 output 根目录，仍做 contained 校验。
-        path = layout.resolve_output_file(name)
-        if path is None:
-            import folder_paths
-            path = contained(Path(folder_paths.get_output_directory()), name)
-    elif origin == "input":
-        import folder_paths
-        root = Path(folder_paths.get_input_directory())
-        path = contained(root, name)
-    elif origin == "media":
-        root = ROOT / "media"
-        path = contained(root, name)
-    elif origin == "session":
-        root = STORE.root
-        path = contained(root, name)
-    else:
-        raise ValueError("无法识别的素材来源，请重新导入或重新选择素材。")
+    candidates = _media_candidates(origin, name)
+    path = next((candidate for candidate in candidates if candidate.is_file()), candidates[0])
     if path.suffix.lower() not in AUDIO_EXTS | VIDEO_EXTS | IMAGE_EXTS:
         raise ValueError("仅提供音频、视频与图片素材")
     from urllib.parse import quote
@@ -1374,7 +1354,27 @@ async def media(request):
     return response
 
 
-_PREVIEW_PROXY_LOCKS: dict[str, threading.Lock] = {}
+class _WeakLock:
+    __slots__ = ("_lock", "__weakref__")
+
+    def __init__(self):
+        self._lock = threading.Lock()
+
+    def __enter__(self):
+        return self._lock.__enter__()
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        return self._lock.__exit__(exc_type, exc_val, exc_tb)
+
+    def acquire(self, *args, **kwargs):
+        return self._lock.acquire(*args, **kwargs)
+
+    def release(self):
+        return self._lock.release()
+
+
+import weakref as _weakref
+_PREVIEW_PROXY_LOCKS: _weakref.WeakValueDictionary[str, _WeakLock] = _weakref.WeakValueDictionary()
 _PREVIEW_PROXY_LOCKS_GUARD = threading.Lock()
 _PREVIEW_PROXY_SEMAPHORE = threading.BoundedSemaphore(2)
 
@@ -1393,11 +1393,12 @@ def _preview_proxy_target(path: Path) -> Path:
     return folder / f"preview_{_preview_proxy_key(path)}.mp4"
 
 
-def _preview_proxy_lock(name: str) -> threading.Lock:
+def _preview_proxy_lock(name: str) -> _WeakLock:
     with _PREVIEW_PROXY_LOCKS_GUARD:
         lock = _PREVIEW_PROXY_LOCKS.get(name)
         if lock is None:
-            lock = _PREVIEW_PROXY_LOCKS[name] = threading.Lock()
+            lock = _WeakLock()
+            _PREVIEW_PROXY_LOCKS[name] = lock
         return lock
 
 

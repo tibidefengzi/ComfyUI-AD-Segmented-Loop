@@ -1,7 +1,7 @@
 // Nodes 2.0 / Vue 节点兼容守卫。
 // AD-分段循环的自定义界面基于 LiteGraph canvas + DOM widget；ComfyUI 的 Nodes 2.0（Vue 节点）
 // 渲染模式下这些界面不会显示，节点会退化成默认参数面板。这里检测并引导用户一键切回经典渲染。
-export const AD_NODE_CLASSES = ["AidenH3Segment", "AidenH3AudioQueue", "AidenH3VideoPreview"];
+export const AD_NODE_CLASSES = ["AidenH3Segment", "AidenH3AudioQueue", "AidenH3VideoPreview", "AD_FinalSave"];
 export const AD_VUE_SETTING = "Comfy.VueNodes.Enabled";
 const DISMISS_KEY = "ad_h3_nodes2_dismissed";
 
@@ -137,6 +137,7 @@ export function installVueNodesGuard({ app, win = globalThis } = {}) {
 
   let autoFixed = false;
   let sawVue = false;
+  let warnedConsole = false;
   const check = () => {
     try {
       const enabled = vueNodesEnabled(app, win);
@@ -149,6 +150,10 @@ export function installVueNodesGuard({ app, win = globalThis } = {}) {
         return;
       }
       if (!pluginNodesPresent(app.graph)) return;
+      if (!warnedConsole) {
+        warnedConsole = true;
+        try { console.warn("[AD-分段循环] 检测到 Nodes 2.0（Vue 节点）。本插件需要经典节点显示；请点击右下角提示切回，或在设置中关闭 Comfy.VueNodes.Enabled。"); } catch (_error) {}
+      }
       // 设置页显示关闭但实际渲染仍是 Vue（App Builder/旧页签）时，直接按实际模式修复一次。
       if (enabled && !autoFixed) {
         autoFixed = true;
@@ -166,7 +171,6 @@ export function installVueNodesGuard({ app, win = globalThis } = {}) {
   win.setTimeout(check, 400);
   win.setTimeout(check, 1500);
   win.setTimeout(check, 4000);
-  try { console.warn("[AD-分段循环] 检测到 Nodes 2.0（Vue 节点）。本插件需要经典节点显示；请点击右下角提示切回，或在设置中关闭 Comfy.VueNodes.Enabled。"); } catch (_error) {}
 
   const handle = { check, timer, banner, chip, dispose: () => win.clearInterval(timer) };
   win.__adH3Nodes2Guard = handle;

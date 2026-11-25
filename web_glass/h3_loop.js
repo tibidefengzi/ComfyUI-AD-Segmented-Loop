@@ -1379,19 +1379,6 @@ function mountPromptPrefix(node) {
     } catch {}
 }
 
-function mountPromptHint(node) {
-    if (!node || node._adH3PromptHintMounted) return;
-    node._adH3PromptHintMounted = true;
-    const el = document.createElement("div");
-    el.className = "ad-h3-prompt-hint";
-    el.textContent = "提示词规则：每行以 # 开头表示一段（第 1 段、第 2 段…）；不带 # 时整段提示词每轮复用；前缀/后缀会自动拼在每轮提示词前后。";
-    const widget = node.addDOMWidget("ad_h3_prompt_hint", "div", el, {
-        serialize: false, hideOnZoom: false, getHeight: () => 34,
-    });
-    widget.serialize = false;
-    widget.computeSize = width => [width, 34];
-}
-
 function reorderSegmentWidgets(node) {
     // 控件顺序由 INPUT_TYPES 与 adPinSegmentWidgetOrder 决定；这里不再搬动，避免 widgets_values 顺序漂移。
 }
@@ -1402,14 +1389,22 @@ function mountRelayAdvancedPanel(node) {
     const find = name => (node.widgets || []).find(w => w.name === name);
     const contextWidget = find("潜桥上下文帧数");
     const reanchorWidget = find("潜桥重锚定");
-    for (const w of [find("潜桥模式"), contextWidget, reanchorWidget, find("参考首帧色彩匹配")]) {
+    const colorWidget = find("参考首帧色彩匹配");
+    for (const w of [find("潜桥模式"), contextWidget, reanchorWidget, colorWidget]) {
         if (!w) continue;
         w.type = "hidden";
         w.hidden = true;
         try { w.computeSize = () => [0, 0]; } catch (_) {}
     }
+    const normalizeColorChoice = raw => {
+        if (typeof raw === "number") return raw > 0 ? "跟随源片" : "0 · 关闭";
+        const text = String(raw ?? "").trim();
+        if (text === "0.5 · 半强" || text === "1 · 全强" || text === "跟随源片") return "跟随源片";
+        if (text === "0.5 · 全链统一（第1段）" || text === "1 · 全链统一（第1段）" || text === "全链统一（第1段）") return "全链统一（第1段）";
+        return "0 · 关闭";
+    };
     const PANEL_CLOSED = 56;
-    const PANEL_OPEN = 222;   // 内容 219px（4 行）+ 3px 余量
+    const PANEL_OPEN = 262;   // 内容 259px（5 行）+ 3px 余量
     const panel = document.createElement("div");
     panel.style.cssText = "display:flex;flex-direction:column;gap:8px;width:100%;box-sizing:border-box;padding:3px 8px 6px";
     const toggle = document.createElement("button");
@@ -1474,6 +1469,9 @@ function mountRelayAdvancedPanel(node) {
                 node.graph?.change?.();
             } catch (_) {}
         });
+    addRow("color", "色彩匹配", [["0 · 关闭", "0 · 关闭"], ["跟随源片", "跟随源片"], ["全链统一（第1段）", "全链统一（第 1 段）"]],
+        () => normalizeColorChoice(colorWidget?.value), value => setWidget(colorWidget, value));
+    if (rows.color) rows.color.title = "关闭=不校正；跟随源片=逐段按本段参考首帧校正并限制相邻段偏移；全链统一=固定对齐第 1 段参考首帧（仅适合恒定光照）。";
     const render = () => {
         toggle.textContent = (open ? "▾ " : "▸ ") + "高级设置";
         body.style.display = open ? "flex" : "none";
@@ -1484,6 +1482,7 @@ function mountRelayAdvancedPanel(node) {
         try { rows.reanchor.value = String(reanchorWidget?.value ?? "0 · 不重锚定"); } catch (_) {}
         try { rows.appearance.value = String(anchorConfigOf(node).appearance ?? 3); } catch (_) {}
         try { rows.sharpen.value = String(anchorConfigOf(node).settle_sharpen ?? 0.5); } catch (_) {}
+        try { rows.color.value = normalizeColorChoice(colorWidget?.value); } catch (_) {}
         open = node.properties?.ad_h3_advanced === true;
         render();
         node.setDirtyCanvas?.(true, true);
@@ -1517,7 +1516,7 @@ function mountRelayAdvancedPanel(node) {
 }
 
 function mountRelayHint(node) {
-    // 潜桥高级设置面板：三项（上下文帧数 / 重锚定 / 沉降锐化），其余锚定项由节点 properties 控制。
+    // 潜桥高级设置面板：五项（上下文帧数 / 重锚定 / 外观锚 / 沉降锐化 / 色彩匹配），其余锚定项由节点 properties 控制。
     if (!node || node._adH3RelayHintMounted) return;
     node._adH3RelayHintMounted = true;
     mountRelayAdvancedPanel(node);
